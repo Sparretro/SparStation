@@ -31,6 +31,9 @@ static int ln, npolys;
 static u32 frame_no;
 int gx_display_dirty = 1;   // la zona mostrada de la VRAM cambió: hay que volver a copiarla al fondo
 int gx_bg_hidden;           // el 3D tapa toda la pantalla: no hace falta copiar el fondo
+// Depuración: en qué paso está gx (tools/dsbench lo enseña al final si encuentra la marca)
+GxDbg gx_dbg = { "SPDBGSTG", 0, 0, 0, 0 };
+#define STAGE(s) (gx_dbg.stage = (s), gx_dbg.n++)
 
 // ---- paletas: banco E (64 KB) ----
 #define PAL_HASH 512
@@ -54,6 +57,7 @@ static void pal_reset(void)
 // llevados a brillo máximo (para A3I5, donde el brillo va en el alfa de cada texel) y 16 negros.
 static u32 pal_get(int cx, int cy, int n, int *lum)
 {
+	STAGE(30);
 	u32 h = ((u32)cy * 64 + (u32)cx / 16 + (n == 256 ? 0x9e37 : n == 32 ? 0x4f1b : 0)) & (PAL_HASH - 1);
 	PalEnt *e = &pal[h];
 	u16 *dst;
@@ -118,6 +122,7 @@ static void tex_dirty(int x, int y, int w, int h)
 // Copia la página a los huecos desde u (en modo LCD los bancos B y D no son contiguos: por huecos)
 static void tex_upload(const TexEnt *t, int u, int row0, int row1)
 {
+	STAGE(20);
 	int tw = src_w(t->depth), rb = dst_row(t->depth);
 	u16 lut[256];   // A3I5: un byte de origen (2 texels) -> 2 bytes
 	if (t->depth == 4) {
@@ -220,6 +225,7 @@ static inline int mod5(int c) { c >>= 2; return c > 31 ? 31 : c; }   // color de
 
 static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 {
+	STAGE(40);
 	static const u8 alpha_of[5] = { 31, 16, 16, 14, 8 };   // opaco, B/2+F/2, B+F, B-F, B+F/4 (aproximados)
 	static const int order[4] = { 0, 1, 3, 2 };            // cuadrado de la PS1 -> perímetro de la DS
 	int w = gpu_disp.width, h = gpu_disp.height;
@@ -312,19 +318,23 @@ static u32 clear_next;   // color de fondo del 3D para el frame en curso (0 = tr
 
 static void gx_clear(u16 c)
 {
-	clear_next = (c & 0x7fffu) | (31u << 16) | (63u << 24);   // opaco: tapa el BG3, que ya no se borra
+	clear_next = c == 0xffff ? 0 : (c & 0x7fffu) | (31u << 16) | (63u << 24);   // opaco: tapa el BG3, que ya no se borra; 0xffff = transparente
 }
 
 static void gx_flip(int drawn)
 {
+	STAGE(10);
 	if (!drawn) return;   // frame saltado: se queda la imagen anterior
 	int opaque = clear_next != 0;
 	GFX_CLEAR_COLOR = opaque ? clear_next : 63u << 24;
 	clear_next = 0;
+	STAGE(11);
 	for (int i = 0; i < ln; i++) GFX_FIFO = list[i];
+	STAGE(12);
 	GFX_FLUSH = 1;   // orden manual de los semitransparentes; se cambia de buffer en la próxima vblank
 	ln = npolys = 0;
 	frame_no++;
+	STAGE(13);
 	if (!opaque) gx_display_dirty = 1;   // el fondo pasa a mostrar el otro buffer (si el 3D no lo tapa entero)
 	gx_bg_hidden = opaque;
 }
@@ -334,7 +344,7 @@ const GpuHw gx_hw = { gx_poly, gx_vram_written, gx_flip, gx_clear };
 void gx_init(void)
 {
 	glInit();
-	videoSetMode(MODE_5_3D);
+	videoSetMode(MODE_5_3D | DISPLAY_BG3_ACTIVE);   // el BG3 (VRAM de la PS1: vídeos, fondos) sigue detrás del 3D
 	REG_BG0CNT = BG_PRIORITY(0);
 	REG_BG3CNT = (REG_BG3CNT & ~3) | BG_PRIORITY(1);
 	vramSetBankB(VRAM_B_TEXTURE_SLOT0);

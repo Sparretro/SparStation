@@ -43,7 +43,7 @@ static void watchdog(void)
 	}
 }
 
-static void on_vblank(void) { vblanks++; flip_in_vblank(); watchdog(); }
+static void on_vblank(void) { vblanks++; gx_dbg.vbl++; flip_in_vblank(); watchdog(); }
 
 static int read_exe(void *user, u8 *dst, u32 len) { return fread(dst, 1, len, (FILE *)user) == len; }
 
@@ -343,7 +343,11 @@ static void present(void)
 	u32 *dst32;
 
 	if (gpu_disp.stale && !gpu_disp.disabled) return;   // el juego enseña un frame que no se dibujó: dejar el anterior
-	if (single_fb && (gx_bg_hidden || !gx_display_dirty) && !gpu_disp.disabled) return;   // GPU 3D: el fondo no se ve o no ha cambiado
+	if (single_fb) {   // en 24 bits (vídeos) no hay 3D: fuera la capa, que no tape el fondo
+		if (gpu_disp.color24) REG_DISPCNT &= ~DISPLAY_BG0_ACTIVE;
+		else REG_DISPCNT |= DISPLAY_BG0_ACTIVE;
+	}
+	if (single_fb && (gx_bg_hidden || !gx_display_dirty) && !gpu_disp.disabled && !gpu_disp.color24) return;   // GPU 3D: el fondo no se ve o no ha cambiado (en 24 bits, vídeos: siempre)
 	gx_display_dirty = 0;
 	while (flip_to >= 0) { }   // el cambio anterior aún no se ha hecho
 	if (single_fb) back = 0;
@@ -485,9 +489,12 @@ static void run_loop(const char *title, int use_log)
 		if (title) hud_input();
 		while (stop_at && bench.frames >= stop_at) swiWaitForVBlank();
 		psx_pad_buttons = npress ? script_pad(bench.frames + 1) : map_pad(keysHeld());
+		gx_dbg.stage = 1;
 		psx_run_frame();
 		frame_beat++;
+		gx_dbg.stage = 2;
 		{ PROF_BEGIN(); present(); PROF_END(PROF_PRESENT); }
+		gx_dbg.stage = 3;
 		t0 = fast_ticks() - t0;
 		psx_prof[PROF_FRAME] += t0;
 		hud_frame(t0);
@@ -512,6 +519,7 @@ int main(void)
 	char game[256];
 	int bg;
 
+	defaultExceptionHandler();   // un fallo del ARM9 enseña los registros en vez de quedarse en negro
 	videoSetMode(MODE_5_2D);
 	videoSetModeSub(MODE_0_2D);
 	vramSetBankA(VRAM_A_MAIN_BG_0x06000000);
@@ -524,7 +532,7 @@ int main(void)
 	fb[1] = fb[0] + 256 * 256;   // banco B, base de mapa 8
 	dmaFillHalfWords(0x8000, fb[0], 2 * 256 * 256 * 2);
 
-	printf("SparStation v4 - PS1 en DSi\nby Spar Retro\n\n");
+	printf("SparStation v5 - PS1 en DSi\nby Spar Retro\n\n");
 #ifdef PSX_SELFTEST
 	if (!nitroFSInit(NULL) || !pak_init() || !load_bios()) {
 		printf("Pruebas: falta nitro:/bios.bin\no el Expansion Pak.\n");

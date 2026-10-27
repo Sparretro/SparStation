@@ -88,6 +88,8 @@ void gpu_set_line(int line)
 	else g.odd_line = line & 1;
 }
 
+static void pend_keep(void);
+
 void gpu_vblank(void)
 {
 #ifdef PSX_GPU_REF
@@ -98,6 +100,7 @@ void gpu_vblank(void)
 	if (++vbl_since_flip > 8) {   // el juego no cambia de buffer (o se ha parado): dibujar siempre
 		skip_frame = 0;
 		gpu_disp.stale = 0;
+		if (gpu_hw) pend_keep();   // un borrado pendiente sigue tapando con el fondo del 3D
 		if (gpu_hw) gpu_hw->flip(1);
 	}
 }
@@ -784,7 +787,7 @@ static int buf_dist(int bx, int by)   // -1 si el área no empieza dentro del bu
 static int hw_screen(void)
 {
 	int a, b;
-	if (!gpu_hw) return 0;
+	if (!gpu_hw || gpu_disp.color24) return 0;   // en 24 bits (vídeos) lo que se dibuje va a la VRAM, como en la PS1
 	a = buf_dist(g.disp_x, g.disp_y);
 	b = buf_dist(prev_disp_x, prev_disp_y);
 	if (a < 0 && b < 0) return 0;
@@ -819,8 +822,11 @@ static void hw_send(const Vtx *v, int n, int tex, int gour, int semi_on, int raw
 	gpu_hw->poly(hv, n, &p);
 }
 
+static void pend_touch(int x, int y, int w, int h);
+
 static void hw_dirty_area(void)   // algo dibujado por software fuera de la pantalla
 {
+	if (gpu_hw) pend_touch(g.da_x1, g.da_y1, g.da_x2 - g.da_x1 + 1, g.da_y2 - g.da_y1 + 1);
 	if (gpu_hw) gpu_hw->vram_written(g.da_x1, g.da_y1, g.da_x2 - g.da_x1 + 1, g.da_y2 - g.da_y1 + 1);
 }
 
@@ -1027,19 +1033,52 @@ static void polyline_word(u32 v)
 	}
 }
 
+// Con dibujo por hardware, el borrado de un buffer de pantalla se queda pendiente y pasa a ser el color de
+// fondo del 3D (no escribe la VRAM). Si luego algo escribe en esa zona (un vídeo que se sube encima, por
+// ejemplo), entonces se borra de verdad y el fondo del 3D vuelve a ser transparente.
+static struct { int on, x, y, w, h; u16 c; } pend;
+
+static void fill_rect(int x0, int y0, int w, int h, u16 c)
+{
+	for (int y = 0; y < h; y++)
+		for (int x = 0; x < w; x++) VRAM(x0 + x, y0 + y) = c;
+}
+
+static void pend_touch(int x, int y, int w, int h)   // algo va a escribir en la VRAM
+{
+	if (!pend.on || x >= pend.x + pend.w || x + w <= pend.x || y >= pend.y + pend.h || y + h <= pend.y) return;
+	pend.on = 0;
+	fill_rect(pend.x, pend.y, pend.w, pend.h, pend.c);
+	gpu_hw->clear(0xffff);   // fondo transparente otra vez
+	gpu_hw->vram_written(pend.x, pend.y, pend.w, pend.h);
+}
+
+static void pend_keep(void)
+{
+	if (pend.on) gpu_hw->clear(pend.c);
+}
+
 static void fill(void)
 {
 	u16 c = rgb15(fifo[0] & 0xffffff);
 	int x0 = fifo[1] & 0x3f0, y0 = (fifo[1] >> 16) & 0x1ff;
 	int w = ((fifo[2] & 0x3ff) + 0xf) & ~0xf, h = (fifo[2] >> 16) & 0x1ff;
+	if (gpu_hw) pend_touch(x0, y0, w, h);
+#ifdef PSX_GPUSTAT
+	{ extern int gpudump; extern int printf(const char *, ...); if (gpudump) printf("FILL %d,%d %dx%d c=%04x\n", x0, y0, w, h, c); }
+#endif
 	if (gpu_hw && w >= gpu_disp.width - 16 && h >= gpu_disp.height * 3 / 4) {   // ¿borra un buffer de pantalla?
-		int sx = g.da_x1, sy = g.da_y1;
+		int sx = g.da_x1, sy = g.da_y1, scr;
 		g.da_x1 = x0; g.da_y1 = y0;
-		if (hw_screen()) { g.da_x1 = sx; g.da_y1 = sy; gpu_hw->clear(c); return; }
+		scr = hw_screen();
 		g.da_x1 = sx; g.da_y1 = sy;
+		if (scr) {
+			pend.on = 1; pend.x = x0; pend.y = y0; pend.w = w; pend.h = h; pend.c = c;
+			gpu_hw->clear(c);
+			return;
+		}
 	}
-	for (int y = 0; y < h; y++)
-		for (int x = 0; x < w; x++) VRAM(x0 + x, y0 + y) = c;
+	fill_rect(x0, y0, w, h, c);
 	if (gpu_hw) gpu_hw->vram_written(x0, y0, w, h);
 }
 
@@ -1048,6 +1087,7 @@ static void vram_copy(void)
 	int sx = fifo[1] & 0x3ff, sy = (fifo[1] >> 16) & 0x1ff;
 	int dx = fifo[2] & 0x3ff, dy = (fifo[2] >> 16) & 0x1ff;
 	int w = ((fifo[3] - 1) & 0x3ff) + 1, h = (((fifo[3] >> 16) - 1) & 0x1ff) + 1;
+	if (gpu_hw) pend_touch(dx, dy, w, h);
 	for (int y = 0; y < h; y++)
 		for (int x = 0; x < w; x++) {
 			u16 c = VRAM(sx + x, sy + y);
@@ -1105,6 +1145,10 @@ static void execute_cmd(void)
 		load_h = (((fifo[2] >> 16) - 1) & 0x1ff) + 1;
 		load_total = load_w * load_h;
 		STAT_ADD(vram_upload, load_total);
+		if (gpu_hw) pend_touch(load_x, load_y, load_w, load_h);
+#ifdef PSX_GPUSTAT
+		{ extern int gpudump; extern int printf(const char *, ...); if (gpudump) printf("LOAD %d,%d %dx%d\n", load_x, load_y, load_w, load_h); }
+#endif
 		if (gpu_hw) gpu_hw->vram_written(load_x, load_y, load_w, load_h);
 		load_i = 0;
 		mode = M_LOAD;
@@ -1168,6 +1212,7 @@ void gpu_write_gp1(u32 v)
 			prev_disp_y = g.disp_y;
 			prev_disp_x = g.disp_x;
 			if (rows_mode) need_rows = 1;
+			pend.on = 0;   // el borrado pendiente ya lo hizo el fondo del 3D
 			if (gpu_hw) gpu_hw->flip(!skip_frame);
 			gpu_disp.stale = skip_frame;   // se va a ver el buffer que no se dibujó
 			vbl_since_flip = 0;

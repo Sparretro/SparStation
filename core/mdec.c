@@ -33,12 +33,17 @@ void mdec_reset(void)
 	cmd = 0;
 }
 
-static void out_reserve(u32 n)
+// Sitio para n bytes más; 0 si no hay memoria (el bloque se descarta en vez de escribir fuera)
+static int out_reserve(u32 n)
 {
 	if (out_len + n > out_cap) {
-		out_cap = (out_len + n) * 2;
-		out_buf = realloc(out_buf, out_cap);
+		u32 cap = out_len + n < 320 * 256 * 3 ? 320 * 256 * 3 : out_len + n + 32 * 1024;   // un frame de vídeo de una vez (sin doblar: en el modo DS no cabría)
+		u8 *b = realloc(out_buf, cap);
+		if (!b) return 0;
+		out_buf = b;
+		out_cap = cap;
 	}
+	return 1;
 }
 
 static inline int s10(u16 v) { return ((s32)((u32)v << 22)) >> 22; }
@@ -200,11 +205,11 @@ static void decode(void)
 			yuv_block(blk[0], blk[1], blk[5], 8, 8, rgb);
 			if (!sign) for (int i = 0; i < 768; i++) rgb[i] ^= 0x80;
 			if (depth == 2) {
-				out_reserve(768);
+				if (!out_reserve(768)) break;
 				memcpy(out_buf + out_len, rgb, 768);
 				out_len += 768;
 			} else {
-				out_reserve(512);
+				if (!out_reserve(512)) break;
 				for (int i = 0; i < 256; i++) {
 					u16 c = (u16)((rgb[i * 3] >> 3) | ((rgb[i * 3 + 1] >> 3) << 5) | ((rgb[i * 3 + 2] >> 3) << 10) | (b15 << 15));
 					out_buf[out_len++] = (u8)c;
@@ -218,11 +223,11 @@ static void decode(void)
 			u8 yv[64];
 			for (int i = 0; i < 64; i++) yv[i] = (u8)(clamp8(blk[0][i]) ^ (sign ? 0 : 0x80));
 			if (depth == 1) {
-				out_reserve(64);
+				if (!out_reserve(64)) break;
 				memcpy(out_buf + out_len, yv, 64);
 				out_len += 64;
 			} else {
-				out_reserve(32);
+				if (!out_reserve(32)) break;
 				for (int i = 0; i < 64; i += 2) out_buf[out_len++] = (u8)((yv[i] >> 4) | (yv[i + 1] & 0xf0));
 			}
 		}
@@ -239,9 +244,9 @@ void mdec_write_cmd(u32 v)
 			state = DECODE;
 			words_left = v & 0xffff;
 			in_len = 0;
-			if (in_cap < words_left * 2) {
-				in_cap = words_left * 2;
-				in_buf = realloc(in_buf, in_cap * sizeof(u16));
+			if (in_cap < words_left * 2) {   // sin memoria (modo DS): se queda el búfer que hubiera y se descarta lo que no quepa
+				u16 *b = realloc(in_buf, words_left * 2 * sizeof(u16));
+				if (b) { in_buf = b; in_cap = words_left * 2; }
 			}
 			if (!words_left) { PROF_BEGIN(); decode(); PROF_END(PROF_MDEC); state = IDLE; }
 			break;
@@ -259,8 +264,10 @@ void mdec_write_cmd(u32 v)
 		}
 		break;
 	case DECODE:
-		in_buf[in_len++] = (u16)v;
-		in_buf[in_len++] = (u16)(v >> 16);
+		if (in_len + 2 <= in_cap) {
+			in_buf[in_len++] = (u16)v;
+			in_buf[in_len++] = (u16)(v >> 16);
+		}
 		if (--words_left == 0) { PROF_BEGIN(); decode(); PROF_END(PROF_MDEC); state = IDLE; dma_mdec_kick(); }
 		break;
 	case QUANT:

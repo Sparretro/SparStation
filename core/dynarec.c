@@ -258,12 +258,12 @@ int dyn_init(int big)
 		blk_arm = malloc(blk_max * 4);
 		blk_mips = malloc(blk_max * 4);
 		if (!blk_arm || !blk_mips) blk_max = 0;
-	} else {   // en modo DS la memoria va muy justa: lo que quede del montón, dejando 128 KB para lo demás
+	} else {   // en modo DS la memoria va muy justa: lo que quede del montón, dejando 704 KB para lo demás
 		code_size = 64 * 1024;
 #ifdef ARM9
 		{
 			extern char *fake_heap_end;
-			s32 room = (s32)(fake_heap_end - (char *)sbrk(0)) - 128 * 1024;
+			s32 room = (s32)(fake_heap_end - (char *)sbrk(0)) - 704 * 1024;   // lo demás: búfers del MDEC (hasta ~500 KB), el 3D, CD...
 			if (room > (s32)code_size) code_size = (u32)room & ~0x7fffu;
 		}
 #endif

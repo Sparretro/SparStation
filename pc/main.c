@@ -288,7 +288,7 @@ int main(int argc, char **argv)
 	t0 = clock();
 	for (int f = 1; f <= frames; f++) {
 		profiling = f > frames - 60;
-		{ extern int gpudump; gpudump = f > frames - 3; }
+		{ extern int gpudump; gpudump = f > frames - 6; }
 #ifdef PSX_OPSTAT
 		{ extern int psx_opstat_on; psx_opstat_on = profiling; }
 #endif
