@@ -1,0 +1,16 @@
+out/
+ds/build/
+ds/build_test/
+ds/*.elf
+ds/*.nds
+ds/nitro*/
+tests_dl/
+tests_own/*.exe
+tests_own/*.o
+tests_own/*.elf
+tests_own/fuzz.c
+tools/*.exe
+tools/*.pdb
+tools/melonds/
+bios/
+*.map

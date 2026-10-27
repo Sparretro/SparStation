@@ -1,0 +1,300 @@
+// Controlador de CD-ROM: comandos, respuestas con su retraso, lectura de sectores y FIFO de datos.
+#include "psx.h"
+#ifdef PSX_TRACE_IO
+#include <stdio.h>
+#endif
+
+enum { ST_ERROR = 1, ST_MOTOR = 2, ST_SHELL = 0x10, ST_READ = 0x20, ST_SEEK = 0x40, ST_PLAY = 0x80 };
+
+typedef struct { u8 irq, len; u8 data[12]; u32 delay; } Resp;
+
+static psx_sector_reader reader;
+static void *reader_user;
+static u32 disc_sectors;
+
+static u8 index_reg, int_enable, int_flag;
+static u8 params[16], nparams;
+static u8 resp[16], resp_len, resp_pos;
+static Resp queue[4];
+static int qn;
+static u32 q_due;
+
+static u8 mode, stat;
+static u32 seek_lba, cur_lba;
+static int seek_pending, reading;
+static u32 read_due;
+
+static u8 sector[2352];
+static u8 last_header[8];
+static u8 data_fifo[2352];
+static u32 data_len, data_pos;
+
+static u8 bcd(u32 v) { return (u8)(((v / 10) << 4) | (v % 10)); }
+static u32 unbcd(u8 v) { return (v >> 4) * 10 + (v & 0xf); }
+
+void cdrom_set_disc(psx_sector_reader rd, void *user, u32 sectors)
+{
+	reader = rd;
+	reader_user = user;
+	disc_sectors = sectors;
+}
+
+void cdrom_reset(void)
+{
+	index_reg = int_enable = int_flag = 0;
+	nparams = resp_len = resp_pos = 0;
+	qn = 0;
+	mode = 0;
+	stat = reader ? ST_MOTOR : ST_SHELL;
+	seek_lba = cur_lba = 0;
+	seek_pending = reading = 0;
+	data_len = data_pos = 0;
+}
+
+static void push(u8 irq, u32 delay, int n, const u8 *d)
+{
+	Resp *r;
+	if (qn == 4) return;
+	r = &queue[qn];
+	r->irq = irq;
+	r->len = (u8)n;
+	memcpy(r->data, d, n);
+	r->delay = delay;
+	if (qn == 0) { q_due = psx_cycles + delay; psx_schedule(q_due); }
+	qn++;
+}
+
+static void push_stat(u8 irq, u32 delay) { u8 s = stat; push(irq, delay, 1, &s); }
+
+static void error(u8 code)
+{
+	u8 d[2] = { (u8)(stat | ST_ERROR), code };
+	push(5, 25000, 2, d);
+}
+
+static u32 sector_time(void) { return (mode & 0x80) ? PSX_CPU_HZ / 150 : PSX_CPU_HZ / 75; }
+
+static void command(u8 cmd)
+{
+	switch (cmd) {
+	case 0x01: push_stat(3, 25000); stat &= ~ST_SHELL; if (reader) stat |= ST_MOTOR; break;   // Getstat
+	case 0x02:   // Setloc
+		seek_lba = (unbcd(params[0]) * 60 + unbcd(params[1])) * 75 + unbcd(params[2]);
+		seek_lba = seek_lba >= 150 ? seek_lba - 150 : 0;
+		seek_pending = 1;
+		push_stat(3, 25000);
+		break;
+	case 0x03: push_stat(3, 25000); break;   // Play: el audio CD todavía no suena
+	case 0x06: case 0x1b:                     // ReadN / ReadS
+		if (!reader) { error(0x80); break; }
+		if (seek_pending) { cur_lba = seek_lba; seek_pending = 0; }
+		stat = (stat & ~(ST_SEEK | ST_PLAY)) | ST_READ | ST_MOTOR;
+		push_stat(3, 25000);
+		reading = 1;
+		read_due = psx_cycles + sector_time() + 25000;
+		psx_schedule(read_due);
+		break;
+	case 0x07: push_stat(3, 25000); stat |= ST_MOTOR; push_stat(2, 400000); break;   // MotorOn
+	case 0x08:   // Stop
+		reading = 0;
+		stat &= ~(ST_READ | ST_SEEK | ST_PLAY);
+		push_stat(3, 25000);
+		stat &= ~ST_MOTOR;
+		push_stat(2, 200000);
+		break;
+	case 0x09:   // Pause
+		push_stat(3, 25000);
+		reading = 0;
+		stat &= ~(ST_READ | ST_SEEK | ST_PLAY);
+		push_stat(2, 70000);
+		break;
+	case 0x0a:   // Init
+		push_stat(3, 25000);
+		mode = 0;
+		reading = 0;
+		stat = reader ? ST_MOTOR : 0;
+		push_stat(2, 70000);
+		break;
+	case 0x0b: case 0x0c: case 0x0d: push_stat(3, 25000); break;   // Mute, Demute, Setfilter
+	case 0x0e: mode = params[0]; push_stat(3, 25000); break;      // Setmode
+	case 0x0f: { u8 d[5] = { stat, mode, 0, 0, 0 }; push(3, 25000, 5, d); break; }   // Getparam
+	case 0x10: push(3, 25000, 8, last_header); break;            // GetlocL
+	case 0x11: {   // GetlocP
+		u32 a = cur_lba + 150, r = cur_lba;
+		u8 d[8] = { 1, 1, bcd(r / 4500), bcd(r / 75 % 60), bcd(r % 75), bcd(a / 4500), bcd(a / 75 % 60), bcd(a % 75) };
+		push(3, 25000, 8, d);
+		break;
+	}
+	case 0x13: { u8 d[3] = { stat, 1, 1 }; push(3, 25000, 3, d); break; }   // GetTN
+	case 0x14: {   // GetTD
+		u32 a = (params[0] == 0) ? disc_sectors + 150 : 150;
+		u8 d[3] = { stat, bcd(a / 4500), bcd(a / 75 % 60) };
+		push(3, 25000, 3, d);
+		break;
+	}
+	case 0x15: case 0x16:   // SeekL / SeekP
+		reading = 0;
+		cur_lba = seek_lba;
+		seek_pending = 0;
+		stat = (stat & ~(ST_READ | ST_PLAY)) | ST_MOTOR;
+		push_stat(3, 25000);
+		push_stat(2, 100000);
+		break;
+	case 0x19:   // Test
+		if (params[0] == 0x20) { u8 d[4] = { 0x94, 0x09, 0x19, 0xc0 }; push(3, 25000, 4, d); }
+		else push_stat(3, 25000);
+		break;
+	case 0x1a:   // GetID
+		if (!reader) { u8 d[2] = { 0x11, 0x80 }; push(5, 25000, 2, d); break; }
+		push_stat(3, 25000);
+		{ u8 d[8] = { 0x02, 0x00, 0x20, 0x00, 'S', 'C', 'E', 'A' }; push(2, 30000, 8, d); }
+		break;
+	case 0x1e: push_stat(3, 25000); push_stat(2, 500000); break;   // ReadTOC
+	default: error(0x40); break;
+	}
+	nparams = 0;
+}
+
+static void fire(void)
+{
+	Resp *r = &queue[0];
+	memcpy(resp, r->data, r->len);
+	resp_len = r->len;
+	resp_pos = 0;
+	int_flag = r->irq;
+	if (int_flag & int_enable) psx_irq(PSX_IRQ_CDROM);
+	qn--;
+	memmove(queue, queue + 1, qn * sizeof(Resp));
+	if (qn) q_due = psx_cycles + queue[0].delay;
+}
+
+int cdrom_next_event(u32 *when)
+{
+	int have = 0;
+	if (qn && !int_flag) { *when = q_due; have = 1; }
+	if (reading && (!have || TIME_BEFORE(read_due, *when))) { *when = read_due; have = 1; }
+	return have;
+}
+
+void cdrom_tick(void)
+{
+	if (qn && !int_flag && !TIME_BEFORE(psx_cycles, q_due)) fire();
+	if (reading && !TIME_BEFORE(psx_cycles, read_due)) {
+		if (int_flag || qn) { read_due = psx_cycles + 2000; return; }   // la CPU aún no atendió la anterior
+		int ok;
+		{ PROF_BEGIN(); ok = cur_lba < disc_sectors && reader(reader_user, cur_lba, sector); PROF_END(PROF_DISC); }
+		STAT_ADD(cd_sectors, 1);
+		if (!ok) {
+			reading = 0;
+			error(0x10);
+			return;
+		}
+		memcpy(last_header, sector + 12, 8);
+#ifdef PSX_TRACE_IO
+		printf("CD INT1 sector %u\n", cur_lba);
+#endif
+#ifdef PSX_TRACE_PC
+		{ extern int trace_live; if (cur_lba == 133136) trace_live = 600; }
+#endif
+		cur_lba++;
+		read_due = psx_cycles + sector_time();
+		{ u8 s = stat; push(1, 0, 1, &s); }
+		q_due = psx_cycles;
+		fire();
+	}
+}
+
+static void load_data(void)
+{
+	if (mode & 0x20) {
+		memcpy(data_fifo, sector + 12, 0x924);
+		data_len = 0x924;
+	} else {
+		int off = sector[15] == 1 ? 16 : 24;
+		memcpy(data_fifo, sector + off, 0x800);
+		data_len = 0x800;
+	}
+	data_pos = 0;
+}
+
+static u8 read_data(void)
+{
+	if (data_pos < data_len) return data_fifo[data_pos++];
+	return data_len ? data_fifo[data_len - 8 + (data_pos++ & 7)] : 0;
+}
+
+u32 cdrom_dma_word(void)
+{
+	u32 v = read_data();
+	v |= read_data() << 8;
+	v |= read_data() << 16;
+	v |= (u32)read_data() << 24;
+	return v;
+}
+
+u32 cdrom_read(u32 reg)
+{
+	switch (reg & 3) {
+	case 0:
+		return index_reg | ((nparams == 0) << 3) | ((nparams < 16) << 4) | ((resp_pos < resp_len) << 5) |
+		       ((data_pos < data_len) << 6);
+	case 1:
+		if (resp_pos < resp_len) return resp[resp_pos++];
+		return 0;
+	case 2: return read_data();
+	case 3:
+		if (index_reg & 1) return int_flag | 0xe0;
+		return int_enable | 0xe0;
+	}
+	return 0;
+}
+
+void cdrom_write(u32 reg, u32 v)
+{
+#ifdef PSX_TRACE_IO
+	if ((reg & 3) == 1 && index_reg == 0) {
+		printf("CD cmd %02x", v);
+		for (int i = 0; i < nparams; i++) printf(" %02x", params[i]);
+		printf("  (mode=%02x lba=%u)\n", mode, cur_lba);
+	}
+	if ((reg & 3) == 3 && index_reg == 0) printf("CD req %02x (data_pos=%u/%u)\n", v, data_pos, data_len);
+#endif
+	switch (reg & 3) {
+	case 0: index_reg = v & 3; break;
+	case 1: if (index_reg == 0) command((u8)v); break;
+	case 2:
+		if (index_reg == 0) { if (nparams < 16) params[nparams++] = (u8)v; }
+		else if (index_reg == 1) {
+			int_enable = v & 0x1f;
+			if (int_flag & int_enable) psx_irq(PSX_IRQ_CDROM);
+		}
+		break;
+	case 3:
+		if (index_reg == 0) {
+			// pedir datos con el buffer ya cargado no lo reinicia: los juegos leen la cabecera y luego el resto
+			if (v & 0x80) { if (data_pos >= data_len) load_data(); }
+			else { data_len = data_pos = 0; }
+		} else if (index_reg == 1) {
+			int_flag &= ~(v & 0x1f);
+			if (v & 0x40) nparams = 0;
+			if (!int_flag && qn) {
+				if (TIME_BEFORE(q_due, psx_cycles + 1000)) q_due = psx_cycles + 1000;
+				psx_schedule(q_due);
+			}
+		}
+		break;
+	}
+}
+
+void cdrom_state(PsxState *s)
+{
+	STATE(s, index_reg); STATE(s, int_enable); STATE(s, int_flag);
+	STATE(s, params); STATE(s, nparams);
+	STATE(s, resp); STATE(s, resp_len); STATE(s, resp_pos);
+	STATE(s, queue); STATE(s, qn); STATE(s, q_due);
+	STATE(s, mode); STATE(s, stat);
+	STATE(s, seek_lba); STATE(s, cur_lba);
+	STATE(s, seek_pending); STATE(s, reading); STATE(s, read_due);
+	STATE(s, sector); STATE(s, last_header);
+	STATE(s, data_fifo); STATE(s, data_len); STATE(s, data_pos);
+}

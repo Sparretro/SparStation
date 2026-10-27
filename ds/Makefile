@@ -1,0 +1,80 @@
+#---------------------------------------------------------------------------------
+# SparStation para DSi: núcleo de ../core + frontend de source/. Usa el ARM7 por defecto de calico.
+#---------------------------------------------------------------------------------
+.SUFFIXES:
+ifeq ($(strip $(DEVKITARM)),)
+$(error "Please set DEVKITARM in your environment. export DEVKITARM=<path to>devkitARM")
+endif
+
+GAME_TITLE     := SparStation
+GAME_SUBTITLE1 := PlayStation en tu DSi
+GAME_SUBTITLE2 := by Spar Retro
+# make SELFTEST=1 [NITRODIR=carpeta] mete esa carpeta como NitroFS (selftest.exe o disco reducido) para probar en modo DS
+ifeq ($(SELFTEST),1)
+NITRODIR       ?= nitrofiles
+NITRO_FILES    := $(abspath $(dir $(firstword $(MAKEFILE_LIST))))/$(NITRODIR)
+endif
+
+include $(DEVKITARM)/ds_rules
+
+TARGET   := SparStation
+BUILD    := build
+SOURCES  := source ../core hot
+INCLUDES := ../core
+DATA     := data
+
+ARCH     := -marm -march=armv5te -mtune=arm946e-s
+CFLAGS   := -Wall -O2 -ffunction-sections -fdata-sections -fomit-frame-pointer $(ARCH) $(INCLUDE) -DARM9 -DPSX_PROFILE -DPSX_DYNAREC -DPSX_TTY
+ASFLAGS  := $(ARCH)
+LDFLAGS   = -specs=ds_arm9.specs $(ARCH) -Wl,-Map,$(notdir $*.map)
+LIBS     := -lfat -lnds9 -lm
+# Pruebas en melonDS (modo DS, 4 MB): la BIOS va en nitro:/bios.bin y se copia al Expansion Pak de la ranura
+# de GBA, que deja más memoria para la caché de código. Compila aparte (build_test, SparStation_test.nds).
+ifeq ($(SELFTEST),1)
+CFLAGS   += -DPSX_SELFTEST $(EXTRA)
+DATA     :=
+BUILD    := build_test
+TARGET   := SparStation_test
+endif
+LIBDIRS  := $(LIBNDS) $(PORTLIBS)
+
+ifneq ($(BUILD),$(notdir $(CURDIR)))
+
+export OUTPUT  := $(CURDIR)/$(TARGET)
+export VPATH   := $(foreach dir,$(SOURCES),$(CURDIR)/$(dir)) $(foreach dir,$(DATA),$(CURDIR)/$(dir))
+export DEPSDIR := $(CURDIR)/$(BUILD)
+
+HOT      := bus.c gte.c
+CFILES   := $(filter-out $(HOT),$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c))))
+BINFILES := $(foreach dir,$(DATA),$(notdir $(wildcard $(dir)/*.*)))
+
+export LD := $(CC)
+export OFILES_BIN     := $(addsuffix .o,$(BINFILES))
+export OFILES_SOURCES := $(CFILES:.c=.o)
+export OFILES         := $(OFILES_BIN) $(OFILES_SOURCES)
+export HFILES         := $(addsuffix .h,$(subst .,_,$(BINFILES)))
+export INCLUDE  := $(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) $(foreach dir,$(LIBDIRS),-I$(dir)/include) -I$(CURDIR)/$(BUILD)
+export LIBPATHS := $(foreach dir,$(LIBDIRS),-L$(dir)/lib)
+
+.PHONY: $(BUILD) clean
+
+$(BUILD):
+	@[ -d $@ ] || mkdir -p $@
+	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
+
+clean:
+	@rm -fr $(BUILD) $(TARGET).elf $(TARGET).nds
+
+else
+
+$(OUTPUT).nds: $(OUTPUT).elf
+$(OUTPUT).elf: $(OFILES)
+$(OFILES_SOURCES): $(HFILES)
+
+%.bin.o %_bin.h : %.bin
+	@echo $(notdir $<)
+	@$(bin2o)
+
+-include $(DEPSDIR)/*.d
+
+endif
