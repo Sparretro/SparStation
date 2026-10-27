@@ -33,6 +33,9 @@
 #endif
 
 #define MAX_BLOCK 64
+#ifndef DYN_DS_RESERVE_KB
+#define DYN_DS_RESERVE_KB 704   // modo DS: memoria que se deja fuera de la caché de código (los vídeos necesitan ~500 KB)
+#endif
 
 typedef u32 *block_fn;   // primera instrucción del bloque; la palabra anterior es el PC traducido
 
@@ -263,7 +266,7 @@ int dyn_init(int big)
 #ifdef ARM9
 		{
 			extern char *fake_heap_end;
-			s32 room = (s32)(fake_heap_end - (char *)sbrk(0)) - 704 * 1024;   // lo demás: búfers del MDEC (hasta ~500 KB), el 3D, CD...
+			s32 room = (s32)(fake_heap_end - (char *)sbrk(0)) - DYN_DS_RESERVE_KB * 1024;   // lo demás: búfers del MDEC (hasta ~500 KB), el 3D, CD...
 			if (room > (s32)code_size) code_size = (u32)room & ~0x7fffu;
 		}
 #endif

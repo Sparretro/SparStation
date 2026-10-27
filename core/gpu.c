@@ -35,6 +35,14 @@ static u32 gpuread;
 static unsigned ref_frames;   // para PSX_GPU_CHECK (ver pc/gpu_ref.inc)
 #endif
 
+// Los bucles de relleno por software iban en la ITCM; con la GPU 3D de la DS casi no se usan y ese sitio lo
+// aprovecha la GTE. Con -DGPU_SW_ITCM vuelven a la ITCM.
+#ifdef GPU_SW_ITCM
+#define GPU_ITCM PSX_ITCM
+#else
+#define GPU_ITCM __attribute__((noinline))
+#endif
+
 #define VRAM(x, y) psx_vram[((y) & 511) * 1024 + ((x) & 1023)]
 
 static inline int sx11(u32 v) { return ((s32)(v << 21)) >> 21; }
@@ -264,7 +272,7 @@ static inline __attribute__((always_inline)) void span_core(u16 *d, int n, s32 u
 
 typedef void (*span_fn)(u16 *d, int n, s32 u, s32 v, s32 r, s32 gg, s32 b);
 // los de 15 bits (poco usados en 3D) se quedan en la RAM normal: la ITCM no da para todos
-#define SPAN_ATTR_FAST PSX_ITCM
+#define SPAN_ATTR_FAST GPU_ITCM
 #define SPAN_ATTR_SLOW __attribute__((noinline))
 #define SPAN_AT(K, T, G, R, S) \
 	static SPAN_ATTR_##K void span_##T##G##R##S(u16 *d, int n, s32 u, s32 v, s32 r, s32 gg, s32 b) { span_core(d, n, u, v, r, gg, b, T, G, R, S); }
@@ -329,7 +337,7 @@ static inline void put2(u16 *d, u32 c0, u32 c1)
 #define TEX_UV4(u, v) tex_tab[(page[(((v) >> 6) & 0x3fc00) | (((u) >> 18) & 0x3f)] >> (((u) >> 14) & 12)) & 15]
 #define TEX_UV8(u, v) tex_tab[(page[(((v) >> 6) & 0x3fc00) | (((u) >> 17) & 0x7f)] >> (((u) >> 13) & 8)) & 255]
 #define SPAN_FAST(NAME, TEX, SEMI) \
-	static PSX_ITCM void NAME(u16 *d, int n, s32 u, s32 v, s32 r, s32 gg, s32 b) \
+	static GPU_ITCM void NAME(u16 *d, int n, s32 u, s32 v, s32 r, s32 gg, s32 b) \
 	{ \
 		const u16 *page = rs.page; \
 		const s32 du = rs.du, dv = rs.dv; \
@@ -374,7 +382,7 @@ static void mod_lut_init(void)
 }
 
 #define SPAN_GOUR(NAME, TEX, SEMI) \
-	static PSX_ITCM void NAME(u16 *d, int n, s32 u, s32 v, s32 r, s32 gg, s32 b) \
+	static GPU_ITCM void NAME(u16 *d, int n, s32 u, s32 v, s32 r, s32 gg, s32 b) \
 	{ \
 		const u16 *page = rs.page; \
 		const s32 du = rs.du, dv = rs.dv, dr = rs.dr, dg = rs.dg, db = rs.db; \
@@ -398,7 +406,7 @@ SPAN_GOUR(span_g8s, TEX_UV8, 1)
 
 // Sin textura con gouraud (degradados): el color de 8 bits por canal se queda en 5
 #define SPAN_COLOR(NAME, SEMI) \
-	static PSX_ITCM void NAME(u16 *d, int n, s32 u, s32 v, s32 r, s32 gg, s32 b) \
+	static GPU_ITCM void NAME(u16 *d, int n, s32 u, s32 v, s32 r, s32 gg, s32 b) \
 	{ \
 		const s32 dr = rs.dr, dg = rs.dg, db = rs.db; \
 		const int semi = rs.semi; \
@@ -419,7 +427,7 @@ SPAN_COLOR(span_cgs, 1)
 // uno en uno, así que basta con el índice dentro de la fila
 #define TEX_ROW(tu, PER, BITS) tex_tab[(row[((tu) & 0xff) / PER] >> (((tu) % PER) * BITS)) & ((1u << BITS) - 1)]
 #define RECT_FAST(NAME, PER, BITS, SEMI) \
-	static PSX_ITCM void NAME(u16 *d, int n, u32 tu, const u16 *row) \
+	static GPU_ITCM void NAME(u16 *d, int n, u32 tu, const u16 *row) \
 	{ \
 		const int semi = rs.semi; \
 		u32 c; \

@@ -177,16 +177,17 @@ int gte_reg_parts(int r, int write, GteRegPart p[2])
 }
 
 // ---- aritmética con banderas ----
-static s64 chk44(int i, s64 v)
+#define GTE_INL static inline __attribute__((always_inline))   // las pequeñas, integradas: se llaman muchísimo
+GTE_INL s64 chk44(int i, s64 v)
 {
 	if (v > 0x7ffffffffffLL) FLAG |= 1u << (31 - i);
 	else if (v < -0x80000000000LL) FLAG |= 1u << (28 - i);
 	return (v << 20) >> 20;
 }
 
-static void set_mac(int i, s64 v) { MAC[i] = (s32)(chk44(i, v) >> sf); }
+GTE_INL void set_mac(int i, s64 v) { MAC[i] = (s32)(chk44(i, v) >> sf); }
 
-static void set_ir(int i, s32 v, int lmv)
+GTE_INL void set_ir(int i, s32 v, int lmv)
 {
 	s32 lo = lmv ? 0 : -0x8000;
 	if (v < lo) { v = lo; FLAG |= 1u << (25 - i); }
@@ -194,9 +195,9 @@ static void set_ir(int i, s32 v, int lmv)
 	IR[i] = (s16)v;
 }
 
-static void mac_to_ir(void) { set_ir(1, MAC[1], lm); set_ir(2, MAC[2], lm); set_ir(3, MAC[3], lm); }
+GTE_INL void mac_to_ir(void) { set_ir(1, MAC[1], lm); set_ir(2, MAC[2], lm); set_ir(3, MAC[3], lm); }
 
-static void set_mac0(s64 v)
+GTE_INL void set_mac0(s64 v)
 {
 	if (v > 0x7fffffffLL) FLAG |= 1u << 16;
 	else if (v < -0x80000000LL) FLAG |= 1u << 15;
@@ -211,7 +212,7 @@ static void set_otz(s64 full)
 	OTZ = (u16)z;
 }
 
-static u8 col_sat(int i, s32 v)
+GTE_INL u8 col_sat(int i, s32 v)
 {
 	if (v < 0) { FLAG |= 1u << (22 - i); return 0; }
 	if (v > 255) { FLAG |= 1u << (22 - i); return 255; }
@@ -228,7 +229,7 @@ static void push_color(void)
 	CF[2][3] = RGBC[3];
 }
 
-static void push_sz(s32 z)
+GTE_INL void push_sz(s32 z)
 {
 	SZ[0] = SZ[1]; SZ[1] = SZ[2]; SZ[2] = SZ[3];
 	if (z < 0) { z = 0; FLAG |= 1u << 18; }
@@ -236,7 +237,7 @@ static void push_sz(s32 z)
 	SZ[3] = (u16)z;
 }
 
-static void push_sxy(s32 x, s32 y)
+GTE_INL void push_sxy(s32 x, s32 y)
 {
 	SX[0] = SX[1]; SY[0] = SY[1];
 	SX[1] = SX[2]; SY[1] = SY[2];
@@ -267,7 +268,7 @@ static u32 divide(void)
 // ---- operaciones ----
 // M*V + add<<12. Con |add| < 2^30 y factores de 16 bits la suma no pasa de 2^43: no puede desbordar
 // los 44 bits y no hace falta mirar las banderas en cada paso (el caso normal, mucho más rápido).
-static s64 mat_row(const s16 *m, const s32 *add, int i, s32 vx, s32 vy, s32 vz)
+GTE_INL s64 mat_row(const s16 *m, const s32 *add, int i, s32 vx, s32 vy, s32 vz)
 {
 	s64 t = add ? (s64)add[i] << 12 : 0;
 	if (add && (add[i] >= 0x40000000 || add[i] < -0x40000000)) {
