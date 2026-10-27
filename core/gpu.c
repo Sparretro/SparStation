@@ -3,9 +3,10 @@
 #include "psx.h"
 
 GpuDisplay gpu_disp;
+const GpuHw *gpu_hw;
 u8 gpu_frameskip, gpu_rows_on, gpu_row_draw[512];
 static int skip_frame, flip_n, vbl_since_flip;   // salto de frames: se cuenta por cambios del buffer mostrado
-static int prev_disp_y;   // origen del otro buffer (el juego alterna entre dos)
+static int prev_disp_y, prev_disp_x;   // origen del otro buffer (el juego alterna entre dos)
 static int need_rows, rows_mode, rows_lines;   // hay que recalcular gpu_row_draw (cambió el buffer o la resolución)
 static void rows_update(void);
 
@@ -97,6 +98,7 @@ void gpu_vblank(void)
 	if (++vbl_since_flip > 8) {   // el juego no cambia de buffer (o se ha parado): dibujar siempre
 		skip_frame = 0;
 		gpu_disp.stale = 0;
+		if (gpu_hw) gpu_hw->flip(1);
 	}
 }
 
@@ -765,6 +767,63 @@ static void triangle(Vtx *v0, Vtx *v1, Vtx *v2, int textured, int gouraud, int s
 	}
 }
 
+// ---- dibujo por hardware (gpu_hw) ----
+// ¿El área de dibujo está dentro de un buffer de pantalla (el mostrado o el otro)? Si es así, deja en
+// hw_ox/hw_oy la esquina de ese buffer (si cae en los dos, el de la esquina más cercana: la ventana
+// mostrada puede empezar unas filas antes que el área donde se dibuja). Lo demás (texturas que dibuja
+// el juego) va a la VRAM.
+static int hw_ox, hw_oy;
+
+static int buf_dist(int bx, int by)   // -1 si el área no empieza dentro del buffer
+{
+	int w = gpu_disp.width, h = gpu_disp.height;
+	if (g.da_x1 < bx || g.da_x1 >= bx + w || g.da_y1 < by || g.da_y1 >= by + h) return -1;
+	return (g.da_x1 - bx) + (g.da_y1 - by);
+}
+
+static int hw_screen(void)
+{
+	int a, b;
+	if (!gpu_hw) return 0;
+	a = buf_dist(g.disp_x, g.disp_y);
+	b = buf_dist(prev_disp_x, prev_disp_y);
+	if (a < 0 && b < 0) return 0;
+	if (b >= 0 && (a < 0 || b < a)) { hw_ox = prev_disp_x; hw_oy = prev_disp_y; }
+	else { hw_ox = g.disp_x; hw_oy = g.disp_y; }
+	return 1;
+}
+
+static void hw_send(const Vtx *v, int n, int tex, int gour, int semi_on, int raw)
+{
+	GpuHwVtx hv[4];
+	GpuHwPoly p;
+#ifdef PSX_GPUSTAT
+	{
+		extern int gpudump;
+		extern int printf(const char *, ...);
+		if (gpudump) printf("MASK set=%d check=%d semi=%d tex=%d\n", g.set_mask, g.check_mask, semi_on ? g.semi : -1, tex);
+	}
+#endif
+	for (int k = 0; k < n; k++) {
+		hv[k].x = (s16)v[k].x; hv[k].y = (s16)v[k].y;
+		hv[k].r = (u8)v[k].r; hv[k].g = (u8)v[k].g; hv[k].b = (u8)v[k].b;
+		hv[k].u = (s16)v[k].u; hv[k].v = (s16)v[k].v;
+	}
+	p.tex = tex ? (u8)(t_depth > 2 ? 3 : t_depth + 1) : 0;
+	p.raw = (u8)(raw != 0);
+	p.gouraud = (u8)(gour != 0);
+	p.semi = semi_on ? (u8)(g.semi + 1) : 0;
+	p.mask = (u8)(g.check_mask && g.set_mask);
+	p.tpx = (s16)t_px; p.tpy = (s16)t_py; p.cx = (s16)t_cx; p.cy = (s16)t_cy;
+	p.ox = (s16)hw_ox; p.oy = (s16)hw_oy;
+	gpu_hw->poly(hv, n, &p);
+}
+
+static void hw_dirty_area(void)   // algo dibujado por software fuera de la pantalla
+{
+	if (gpu_hw) gpu_hw->vram_written(g.da_x1, g.da_y1, g.da_x2 - g.da_x1 + 1, g.da_y2 - g.da_y1 + 1);
+}
+
 static void polygon(void)
 {
 	u32 cmd = fifo[0] >> 24;
@@ -794,6 +853,36 @@ static void polygon(void)
 	if (tex) use_texture(clut);
 	if (!gour) for (int k = 1; k < nv; k++) { v[k].r = v[0].r; v[k].g = v[0].g; v[k].b = v[0].b; }
 	if (tex && !gour && raw) raw = 1;
+#ifdef PSX_GPUSTAT
+	{   // PC: qué usan los polígonos (colores por encima de 1.0, modos de mezcla)
+		extern u32 gpustat[16];
+		int mx = 0;
+		for (int k = 0; k < nv; k++) { if (v[k].r > mx) mx = v[k].r; if (v[k].g > mx) mx = v[k].g; if (v[k].b > mx) mx = v[k].b; }
+		gpustat[0]++;
+		if (tex && !raw && mx > 128) gpustat[1]++;
+		if (semi_on) gpustat[2 + g.semi]++;
+		if (tex) gpustat[6 + t_depth]++;
+		if (gour) gpustat[10]++;
+		if (tex && semi_on) gpustat[11]++;
+		{
+			extern int gpudump;
+			extern int printf(const char *, ...);
+			int a = (v[1].x - v[0].x) * (v[2].y - v[0].y) - (v[2].x - v[0].x) * (v[1].y - v[0].y);
+			if (a < 0) a = -a;
+			if (gpudump && a > 300 && v[0].x < 168 && v[0].x > 100 && v[0].y > 40 && v[0].y < 210)
+				printf("POLY nv=%d tex=%d d=%d semi=%d raw=%d gour=%d xy=%d,%d %d,%d %d,%d uv=%d,%d %d,%d col=%d,%d,%d clut=%d,%d tp=%d,%d\n",
+				       nv, tex, t_depth, g.semi, raw, gour, v[0].x, v[0].y, v[1].x, v[1].y, v[2].x, v[2].y, v[0].u, v[0].v,
+				       v[2].u, v[2].v, v[0].r, v[0].g, v[0].b, t_cx, t_cy, t_px, t_py);
+		}
+		if (tex && semi_on && t_depth == 0) {
+			int s = 0, nz = 0;
+			for (int i = 0; i < 16; i++) { u16 c = VRAM(t_cx + i, t_cy); if (c) { nz++; if (c & 0x8000) s++; } }
+			gpustat[12 + (s == 0 ? 0 : s == nz ? 2 : 1)]++;
+		}
+	}
+#endif
+	if (hw_screen()) { hw_send(v, nv, tex, gour, semi_on, raw); return; }
+	hw_dirty_area();
 
 	{
 		Vtx a = v[0], b = v[1], c = v[2];
@@ -832,6 +921,29 @@ static void rectangle(void)
 	else if (size == 2) w = h = 8;
 	else w = h = 16;
 	if (tex) use_texture(uv >> 16);
+#ifdef PSX_GPUSTAT
+	{
+		extern int gpudump;
+		extern int printf(const char *, ...);
+		if (gpudump && w * h > 200)
+			printf("RECT xy=%d,%d wh=%d,%d tex=%d d=%d semi=%d/%d raw=%d uv=%d,%d col=%06x clut=%d,%d tp=%d,%d\n", x0, y0, w, h, tex,
+			       t_depth, semi_on, g.semi, raw, uv & 0xff, (uv >> 8) & 0xff, col, t_cx, t_cy, t_px, t_py);
+	}
+#endif
+	if (hw_screen()) {
+		Vtx q[4];
+		int u0 = uv & 0xff, v0 = (uv >> 8) & 0xff;
+		for (int k = 0; k < 4; k++) {   // orden de la PS1 para un cuadrado: arriba izq., arriba der., abajo izq., abajo der.
+			q[k].x = x0 + ((k & 1) ? w : 0);
+			q[k].y = y0 + ((k & 2) ? h : 0);
+			q[k].u = u0 + ((k & 1) ? w : 0);
+			q[k].v = v0 + ((k & 2) ? h : 0);
+			q[k].r = col & 0xff; q[k].g = (col >> 8) & 0xff; q[k].b = (col >> 16) & 0xff;
+		}
+		hw_send(q, 4, tex, 0, semi_on, raw);
+		return;
+	}
+	hw_dirty_area();
 
 	// columnas dentro del área de dibujo
 	lo = g.da_x1 - x0; if (lo < 0) lo = 0;
@@ -922,6 +1034,7 @@ static void fill(void)
 	int w = ((fifo[2] & 0x3ff) + 0xf) & ~0xf, h = (fifo[2] >> 16) & 0x1ff;
 	for (int y = 0; y < h; y++)
 		for (int x = 0; x < w; x++) VRAM(x0 + x, y0 + y) = c;
+	if (gpu_hw) gpu_hw->vram_written(x0, y0, w, h);
 }
 
 static void vram_copy(void)
@@ -936,6 +1049,7 @@ static void vram_copy(void)
 			if (g.check_mask && (*d & 0x8000)) continue;
 			*d = c | (g.set_mask << 15);
 		}
+	if (gpu_hw) gpu_hw->vram_written(dx, dy, w, h);
 }
 
 static void load_pixel(u16 c)
@@ -985,6 +1099,7 @@ static void execute_cmd(void)
 		load_h = (((fifo[2] >> 16) - 1) & 0x1ff) + 1;
 		load_total = load_w * load_h;
 		STAT_ADD(vram_upload, load_total);
+		if (gpu_hw) gpu_hw->vram_written(load_x, load_y, load_w, load_h);
 		load_i = 0;
 		mode = M_LOAD;
 		return;
@@ -1045,7 +1160,9 @@ void gpu_write_gp1(u32 v)
 		if ((v & 0x3fe) != (u32)g.disp_x || ((v >> 10) & 0x1ff) != (u32)g.disp_y) {
 			STAT_ADD(disp_flips, 1);
 			prev_disp_y = g.disp_y;
+			prev_disp_x = g.disp_x;
 			if (rows_mode) need_rows = 1;
+			if (gpu_hw) gpu_hw->flip(!skip_frame);
 			gpu_disp.stale = skip_frame;   // se va a ver el buffer que no se dibujó
 			vbl_since_flip = 0;
 			skip_frame = gpu_frameskip && ++flip_n % (gpu_frameskip + 1) != 0;

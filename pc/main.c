@@ -275,6 +275,9 @@ int main(int argc, char **argv)
 	if (argc >= 4) frames = atoi(argv[3]);
 	if (argc >= 5 && strncmp(argv[4], "--", 2)) out = argv[4];
 
+#ifdef PSX_GPUSTAT
+	{ extern const GpuHw dbg_hw; if (getenv("HWDBG")) gpu_hw = &dbg_hw; }
+#endif
 	psx_reset();
 	for (int i = 1; i + 1 < argc; i++)   // --load archivo: empieza desde un estado guardado
 		if (!strcmp(argv[i], "--load")) {
@@ -285,6 +288,7 @@ int main(int argc, char **argv)
 	t0 = clock();
 	for (int f = 1; f <= frames; f++) {
 		profiling = f > frames - 60;
+		{ extern int gpudump; gpudump = f > frames - 3; }
 #ifdef PSX_OPSTAT
 		{ extern int psx_opstat_on; psx_opstat_on = profiling; }
 #endif
@@ -348,6 +352,12 @@ int main(int argc, char **argv)
 	for (int i = 1; i + 1 < argc; i++)
 		if (!strcmp(argv[i], "--ref")) printf("VRAM_DIFF %d\n", vram_diff(argv[i + 1]));
 	if (want_prof) report_profile();
+#ifdef PSX_GPUSTAT
+	{
+		extern u32 gpustat[16];
+		printf("GPUSTAT polis=%u brillo>1=%u semi0=%u semi1=%u semi2=%u semi3=%u t4=%u t8=%u t15=%u gour=%u tex+semi=%u clut_sin_bit15=%u mezcla=%u todo_bit15=%u\n", gpustat[0], gpustat[1], gpustat[2], gpustat[3], gpustat[4], gpustat[5], gpustat[6], gpustat[7], gpustat[8], gpustat[10], gpustat[11], gpustat[12], gpustat[13], gpustat[14]);
+	}
+#endif
 #ifdef PSX_OPSTAT
 	{   // instrucciones por frame en los 60 últimos frames, por tipo
 		extern u32 psx_opstat[18];
@@ -378,3 +388,23 @@ int main(int argc, char **argv)
 		}
 	return 0;
 }
+u32 gpustat[16];
+int gpudump;
+#ifdef PSX_GPUSTAT
+// receptor de prueba del dibujo por hardware: cuenta orígenes y áreas en el último frame
+static void dbg_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
+{
+	extern int gpudump;
+	int x0 = 9999, x1 = -9999, y0 = 9999, y1 = -9999;
+	for (int k = 0; k < n; k++) {
+		if (v[k].x < x0) x0 = v[k].x; if (v[k].x > x1) x1 = v[k].x;
+		if (v[k].y < y0) y0 = v[k].y; if (v[k].y > y1) y1 = v[k].y;
+	}
+	if (gpudump && x0 <= 160 && x1 >= 160 && y0 <= 376 && y1 >= 376)
+		printf("HW bbox=%d,%d-%d,%d tex=%d semi=%d raw=%d g=%d c1=%d c2=%d c3=%d col=%d,%d,%d uv=%d,%d clut=%d,%d tp=%d,%d\n", x0, y0, x1, y1, p->tex, p->semi,
+		       p->raw, p->gouraud, v[1].r, v[2].r, n > 3 ? v[3].r : -1, v[0].r, v[0].g, v[0].b, v[0].u, v[0].v, p->cx, p->cy, p->tpx, p->tpy);
+}
+static void dbg_written(int x, int y, int w, int h) { (void)x; (void)y; (void)w; (void)h; }
+static void dbg_flip(int d) { extern int gpudump; if (gpudump) printf("HW flip %d\n", d); }
+const GpuHw dbg_hw = { dbg_poly, dbg_written, dbg_flip };
+#endif

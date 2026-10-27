@@ -197,9 +197,27 @@ int main(int argc, char **argv)
 		uint32_t *bench = NULL;
 #define BENCH_N 6 + 8 + 28
 		if (retro_get_memory_data && retro_get_memory_size) { ram = retro_get_memory_data(2); ramn = retro_get_memory_size(2); }
+		// DSB_PROF=archivo: desde el frame DSB_SNAP, las muestras del perfilador (ds/source/prof.c, marca
+		// «SPPROFRG»): pares (dirección ARM, PC MIPS del bloque) tras una cabecera con las zonas del dynarec
+		const char *prof_path = getenv("DSB_PROF");
+		FILE *prof_f = NULL;
+		uint32_t *prof = NULL, prof_r = 0;
 		for (int i = 0; i < frames; i++) {
 			cur_frame = i;
 			retro_run();
+			if (prof_path && ram && i >= (snap > 0 ? snap : 0)) {
+				if (!prof) {
+					for (size_t o = 0; o + 64 <= ramn; o += 4)
+						if (!memcmp(ram + o, "SPPROFRG", 8)) { prof = (uint32_t *)(ram + o + 8); break; }
+					if (prof && (prof_f = fopen(prof_path, "wb"))) { fwrite(prof + 1, 4, 6, prof_f); prof_r = prof[0]; }
+					else prof = NULL;
+				}
+				if (prof) {
+					uint32_t w = prof[0], *ring = prof + 7;
+					if (w - prof_r > 2048) prof_r = w - 2048;
+					for (; prof_r != w; prof_r++) fwrite(&ring[(prof_r & 2047) * 2], 4, 2, prof_f);
+				}
+			}
 			if (every && i && i % every == 0 && frame) {
 				char name[1024];
 				snprintf(name, sizeof name, "%.*s_%05d.png", (int)(strlen(argv[4]) - 4), argv[4], i);

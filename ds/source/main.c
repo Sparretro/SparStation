@@ -8,6 +8,10 @@
 #include <dirent.h>
 #include "psx.h"
 #include "hud.h"
+#include "gx.h"
+#ifdef SPAR_PROF
+#include "prof.h"
+#endif
 #ifndef PSX_SELFTEST
 #include "openbios_bin.h"
 #endif
@@ -121,6 +125,7 @@ static int open_disc(const char *path)
 // Ajustes de velocidad: se eligen en la lista de juegos y se guardan en la SD
 #define CFG_PATH GAMES_DIR "/sparstation.cfg"
 static int opt_quality, opt_skip, opt_cpu;   // calidad 0-3, frames saltados 0-3, CPU 0-2
+static int opt_hw = 1;                       // GPU: 1 = motor 3D de la DS (gx.c), 0 = por software
 static const char *const quality_name[4] = { "normal", "rapida", "muy rapida", "baja res" };
 static const int cpu_pct[3] = { 100, 85, 70 };
 
@@ -129,6 +134,8 @@ static void load_cfg(void)
 	FILE *f = fopen(CFG_PATH, "r");
 	if (!f) return;
 	if (fscanf(f, "calidad=%d saltar=%d cpu=%d", &opt_quality, &opt_skip, &opt_cpu) != 3) opt_quality = opt_skip = opt_cpu = 0;
+	if (fscanf(f, " gpu3d=%d", &opt_hw) != 1) opt_hw = 1;
+	opt_hw = opt_hw != 0;
 	fclose(f);
 	if (opt_quality < 0 || opt_quality > 3) opt_quality = 0;
 	if (opt_skip < 0 || opt_skip > 3) opt_skip = 0;
@@ -143,8 +150,15 @@ static void save_cfg(void)
 	fclose(f);
 }
 
+static int single_fb;   // con la GPU 3D el banco B es de texturas: un solo buffer de fondo
+
 static void apply_cfg(void)
 {
+	if (opt_hw && !gpu_hw) {
+		gx_init();
+		gpu_hw = &gx_hw;
+		single_fb = 1;
+	}
 	gpu_rows_for(opt_quality > 2 ? 2 : opt_quality, 192);
 	gpu_half_x = opt_quality == 3;   // baja res: además, la mitad de los píxeles de cada línea
 	gpu_frameskip = (u8)opt_skip;
@@ -174,7 +188,8 @@ static int pick_game(char *out, size_t outlen)
 		printf("L/R    calidad: %s\n", quality_name[opt_quality]);
 		printf("SELECT saltar frames: %d\n", opt_skip);
 		printf("Y      CPU PS1: %d%%\n", cpu_pct[opt_cpu]);
-		printf("\x1b[37mrapida: solo lo visible. muy\nrapida: 1/2 lineas. baja res:\ntambien 1/2 de cada linea 3D.\x1b[37;1m\n");
+		printf("X      GPU: %s\n", opt_hw ? "3D de la DS (rapida)" : "software (exacta)");
+		printf("\x1b[37mcalidad solo cuenta con la GPU\npor software.\x1b[37;1m\n");
 		printf("\nA: jugar");
 		fflush(stdout);
 		do { swiWaitForVBlank(); scanKeys(); keys = keysDown(); } while (!keys);
@@ -184,6 +199,7 @@ static int pick_game(char *out, size_t outlen)
 		if (keys & KEY_L) opt_quality = (opt_quality + 3) % 4;
 		if (keys & KEY_SELECT) opt_skip = (opt_skip + 1) % 4;
 		if (keys & KEY_Y) opt_cpu = (opt_cpu + 1) % 3;
+		if (keys & KEY_X) opt_hw ^= 1;
 		if (keys & KEY_A) break;
 	}
 	save_cfg();
@@ -327,7 +343,10 @@ static void present(void)
 	u32 *dst32;
 
 	if (gpu_disp.stale && !gpu_disp.disabled) return;   // el juego enseña un frame que no se dibujó: dejar el anterior
+	if (single_fb && !gx_display_dirty && !gpu_disp.disabled) return;   // GPU 3D: el fondo no ha cambiado
+	gx_display_dirty = 0;
 	while (flip_to >= 0) { }   // el cambio anterior aún no se ha hecho
+	if (single_fb) back = 0;
 	dst32 = (u32 *)fb[back];
 	if (gpu_disp.disabled) {
 		dmaFillWords(0x80008000, dst32, 256 * 192 * 2);
@@ -359,12 +378,34 @@ static void present(void)
 		}
 	}
 	flip_to = back;
-	back ^= 1;
+	if (!single_fb) back ^= 1;
+}
+
+// Reloj de 32 bits a 33,51 MHz con los temporizadores 0 y 1 encadenados (calico no los usa: sus ticks van
+// en el 2 y el 3). cpuGetTiming pasa por los ticks de calico y cuesta mucho más: se llama miles de veces.
+static void fast_timer_start(void)
+{
+	TIMER_CR(0) = 0;
+	TIMER_CR(1) = 0;
+	TIMER_DATA(0) = 0;
+	TIMER_DATA(1) = 0;
+	TIMER_CR(1) = TIMER_ENABLE | TIMER_CASCADE;
+	TIMER_CR(0) = TIMER_ENABLE | ClockDivider_1;
+}
+
+u32 fast_ticks(void)
+{
+	u32 hi, lo;
+	do {
+		hi = TIMER_DATA(1);
+		lo = TIMER_DATA(0);
+	} while (hi != TIMER_DATA(1));
+	return (hi << 16) | lo;
 }
 
 #ifdef PSX_PROFILE
 u32 psx_prof[PROF_N];
-u32 psx_prof_ticks(void) { return cpuGetTiming(); }
+u32 psx_prof_ticks(void) { return fast_ticks(); }
 #endif
 
 // Totales desde el arranque para el banco de pruebas del PC (tools/dsbench los busca en la RAM por la marca)
@@ -429,14 +470,17 @@ static void run_loop(const char *title, int use_log)
 {
 	int frames = 0;
 	u32 last = vblanks;
-	cpuStartTiming(0);
+	fast_timer_start();
+#if defined(SPAR_PROF) && defined(PSX_SELFTEST)
+	prof_start("");   // melonDS: dsbench lee las muestras de la RAM (DSB_PROF)
+#endif
 	if (title) {
 		char info[48];
 		snprintf(info, sizeof info, "%s, salto %d, CPU %d%%", quality_name[opt_quality], opt_skip, cpu_pct[opt_cpu]);
 		hud_start(title, use_log, info);
 	}
 	for (;;) {
-		u32 t0 = cpuGetTiming();
+		u32 t0 = fast_ticks();
 		scanKeys();
 		if (title) hud_input();
 		while (stop_at && bench.frames >= stop_at) swiWaitForVBlank();
@@ -444,7 +488,7 @@ static void run_loop(const char *title, int use_log)
 		psx_run_frame();
 		frame_beat++;
 		{ PROF_BEGIN(); present(); PROF_END(PROF_PRESENT); }
-		t0 = cpuGetTiming() - t0;
+		t0 = fast_ticks() - t0;
 		psx_prof[PROF_FRAME] += t0;
 		hud_frame(t0);
 		frames++;
@@ -472,7 +516,9 @@ int main(void)
 	videoSetModeSub(MODE_0_2D);
 	vramSetBankA(VRAM_A_MAIN_BG_0x06000000);
 	vramSetBankB(VRAM_B_MAIN_BG_0x06020000);
-	consoleDemoInit();
+	// consola de abajo en el banco H (32 KB): el C queda libre para texturas del 3D (gx.c)
+	vramSetBankH(VRAM_H_SUB_BG);
+	consoleInit(NULL, 0, BgType_Text4bpp, BgSize_T_256x256, 15, 0, false, true);
 	bg = bgInit(3, BgType_Bmp16, BgSize_B16_256x256, 0, 0);
 	fb[0] = bgGetGfxPtr(bg);
 	fb[1] = fb[0] + 256 * 256;   // banco B, base de mapa 8
@@ -520,6 +566,9 @@ int main(void)
 			load_script("nitro:/press.txt");
 #ifdef BENCH_QUALITY
 			opt_quality = BENCH_QUALITY;   // make SELFTEST=1 EXTRA=-DBENCH_QUALITY=n: medir con esa calidad
+#ifdef BENCH_SKIP
+			opt_skip = BENCH_SKIP;   // y saltando frames (EXTRA=-DBENCH_SKIP=n)
+#endif
 			apply_cfg();
 #endif
 		}

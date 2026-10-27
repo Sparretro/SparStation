@@ -111,6 +111,24 @@ extern GpuDisplay gpu_disp;
 // ajustes de velocidad (los pone el frontend)
 extern u8 gpu_frameskip;       // 0 = dibujar todo; N = de cada N+1 frames del juego, dibujar 1
 extern u8 gpu_half_x;          // triángulos a media resolución horizontal (un píxel calculado por par)
+
+// Dibujo por hardware (opcional, lo pone el frontend): los polígonos y sprites que van a la pantalla se
+// le pasan en vez de dibujarlos en la VRAM. Lo que se dibuja fuera (texturas hechas por el juego) sigue
+// por software.
+typedef struct { s16 x, y, u, v; u8 r, g, b; } GpuHwVtx;   // x, y absolutos en la VRAM (con el desplazamiento); u, v pueden pasar de 255 (sprites)
+typedef struct {
+	u8 tex;                  // 0 = sin textura; 1/2/3 = 4/8/15 bits
+	u8 raw, gouraud, semi;   // raw: textura sin modular; semi: 0 = opaco, si no modo de mezcla + 1
+	u8 mask;                 // no pinta sobre píxeles con el bit de máscara (y lo pone): cada píxel una sola vez
+	s16 tpx, tpy, cx, cy;    // página de textura y paleta en la VRAM
+	s16 ox, oy;              // origen del área de dibujo (esquina del buffer)
+} GpuHwPoly;
+typedef struct {
+	void (*poly)(const GpuHwVtx *v, int n, const GpuHwPoly *p);   // n = 3 o 4 (cuadrado: 0,1,2 y 1,2,3)
+	void (*vram_written)(int x, int y, int w, int h);              // para invalidar texturas y la imagen
+	void (*flip)(int drawn);   // el juego cambia el buffer mostrado; drawn = 0 si ese frame se saltó
+} GpuHw;
+extern const GpuHw *gpu_hw;
 extern u8 gpu_rows_on;         // 1 = dibujar solo las filas marcadas en gpu_row_draw
 extern u8 gpu_row_draw[512];   // por fila de la VRAM (lo rellena gpu_rows_for)
 extern u16 psx_cpu_scale;      // coste de cada ciclo en 1/256: 256 = CPU al 100%, más = CPU más lenta

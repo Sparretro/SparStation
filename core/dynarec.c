@@ -269,6 +269,14 @@ int dyn_init(int big)
 #endif
 		code_buf = malloc(code_size);
 	}
+#ifdef PSX_BLKTAB
+	if (!big) {   // perfilador en el modo DS: tabla de bloques pequeña
+		blk_max = 8192;
+		blk_arm = malloc(blk_max * 4);
+		blk_mips = malloc(blk_max * 4);
+		if (!blk_arm || !blk_mips) blk_max = 0;
+	}
+#endif
 	if (!code_buf || !slots || !links) return 0;
 	slot_mask = nslots - 1;
 	code_end = code_buf + code_size / 4;

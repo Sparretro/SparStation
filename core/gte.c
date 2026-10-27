@@ -513,8 +513,7 @@ void gte_state(PsxState *s)
 
 void gte_command(u32 op)
 {
-	PROF_BEGIN();
+	// sin PROF_BEGIN/END: se llama miles de veces por frame y medir costaba casi tanto como calcular
 	STAT_ADD(gte_ops, 1);
 	gte_exec(op);
-	PROF_END(PROF_GTE);
 }
