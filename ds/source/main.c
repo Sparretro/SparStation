@@ -371,6 +371,7 @@ struct {
 	char magic[8];
 	u32 frames, vblanks, pc;
 	u8 *ram;   // la RAM de la PS1, para volcarla desde el PC
+	u32 code, code_used;   // caché del dynarec (dirección y bytes usados), para desensamblarla desde el PC
 	u32 prof[PROF_N];
 	PsxStats stat;
 } bench = { "SPBENCH" };
@@ -450,6 +451,7 @@ static void run_loop(const char *title, int use_log)
 		bench.vblanks = vblanks;
 		bench.pc = cpu.pc;
 		bench.ram = psx_ram;
+		{ u32 used, size; extern u32 *dyn_code_base(void); dyn_cache_use(&used, &size); bench.code = (u32)dyn_code_base(); bench.code_used = used; }
 		if (vblanks - last >= 60) {   // un segundo real
 			bench_second();
 			if (title) hud_second(frames, vblanks - last);
@@ -475,7 +477,7 @@ int main(void)
 	fb[1] = fb[0] + 256 * 256;   // banco B, base de mapa 8
 	dmaFillHalfWords(0x8000, fb[0], 2 * 256 * 256 * 2);
 
-	printf("SparStation v2 - PS1 en DSi\nby Spar Retro\n\n");
+	printf("SparStation v3 - PS1 en DSi\nby Spar Retro\n\n");
 #ifdef PSX_SELFTEST
 	if (!nitroFSInit(NULL) || !pak_init() || !load_bios()) {
 		printf("Pruebas: falta nitro:/bios.bin\no el Expansion Pak.\n");

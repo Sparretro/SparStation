@@ -31,7 +31,7 @@
 typedef u32 *block_fn;   // primera instrucción del bloque; la palabra anterior es el PC traducido
 
 u32 *emit_ptr;
-u8 dyn_pages[512];
+u8 dyn_pages[DYN_NPAGES];
 static u32 *code_buf, *code_end, *code_start, code_size;
 // Tabla hash de bloques: la entrada apunta al código y la palabra anterior guarda el PC traducido
 static block_fn *slots;
@@ -39,7 +39,7 @@ static u32 slot_mask;
 
 // Código fijo al principio de la caché: entrar desde C, salir a C, enlazar y despachar
 static void (*dyn_enter)(Cpu *c, u8 *ram, u8 *pages, block_fn body);
-static u32 *stub_exit, *stub_link, *stub_dispatch, *stub_exit_pc;
+static u32 *stub_exit, *stub_link, *stub_dispatch, *stub_exit_pc, *stub_sp_fail;
 static u32 gen;              // sube en cada vaciado: un enlace pendiente de una caché vieja no se parchea
 u8 dyn_chain;                // 0 = volver a C en cada bloque (psx_hook_pc); 1 = salvo vectores A0/B0/C0 (psx_tty)
 PSX_FAST static u32 dyn_tmp; // condición o destino de salto guardado cuando el delay slot pisa sus registros
@@ -47,7 +47,7 @@ PSX_FAST static u32 dyn_tmp; // condición o destino de salto guardado cuando el
 // Enlaces parcheados, por página de 4 KB del destino, para deshacerlos si el juego reescribe ese código
 typedef struct { u32 *site; u32 lin; s32 next; } Link;
 static Link *links;
-static s32 link_head[512], link_n, link_max;
+static s32 link_head[DYN_NPAGES], link_n, link_max;
 
 #define RCPU R11
 #define RRAM R10
@@ -107,6 +107,12 @@ static void emit_stubs(void)
 	stub_exit_pc = emit_ptr;
 	a_ldr(R0, LR, 0);
 	a_str(R0, RCPU, OFF_PC);
+	a_b(C_AL, 0, stub_exit);
+	// sp no apunta a la RAM al entrar en un bloque con el atajo de la pila: apuntarlo y salir (se retraduce)
+	stub_sp_fail = emit_ptr;
+	a_ldr(R0, LR, 0);
+	a_str(R0, RCPU, OFF_PC);
+	{ extern void dyn_sp_fail(u32 pc); a_b(C_AL, 1, (const void *)dyn_sp_fail); }
 	a_b(C_AL, 0, stub_exit);
 	// enlazar: se llega con BL desde el final de un bloque; la palabra siguiente al BL es el PC destino
 	stub_link = emit_ptr;
@@ -192,6 +198,8 @@ int dyn_init(int big)
 	return 1;
 }
 
+u32 *dyn_code_base(void) { return code_buf; }
+
 void dyn_cache_use(u32 *used, u32 *size)
 {
 	*used = (u32)(emit_ptr - code_buf) * 4;
@@ -243,26 +251,26 @@ static void unlink_page(u32 page, u32 first, u32 last)
 
 void dyn_smc(u32 off)
 {
-	u32 page = (off >> 12) & 511;
+	u32 page = (off >> DYN_PAGE_BITS) & (DYN_NPAGES - 1);
 	if (!dyn_pages[page]) return;
 	dyn_pages[page] = 0;
 	STAT_ADD(dyn_smc, 1);
 	// la página entera y el final de la anterior (bloques que la cruzan)
 	{
-		u32 first = page * 4096, last = first + 4096;
+		u32 first = page << DYN_PAGE_BITS, last = first + (1u << DYN_PAGE_BITS);
 		if (page) first -= MAX_BLOCK * 4;
 		for (u32 a = first; a < last; a += 4) {
 			block_fn *s = &slots[(a >> 2) & slot_mask];
 			if (*s && lin((*s)[-1]) == a) *s = NULL;
 		}
-		unlink_page(page, page * 4096, last);
-		if (page) unlink_page(page - 1, first, page * 4096);
+		unlink_page(page, page << DYN_PAGE_BITS, last);
+		if (page) unlink_page(page - 1, first, page << DYN_PAGE_BITS);
 	}
 }
 
 void dyn_ram_written(u32 off, u32 len)
 {
-	for (u32 a = off & ~0xfffu; a < off + len; a += 4096) DYN_CHECK_WRITE(a);
+	for (u32 a = off & ~((1u << DYN_PAGE_BITS) - 1); a < off + len; a += 1u << DYN_PAGE_BITS) DYN_CHECK_WRITE(a);
 }
 
 // ---- servicios llamados desde el código traducido ----
@@ -294,6 +302,23 @@ static void h_divu(u32 n, u32 d)
 static struct { s8 host; u8 valid, stale, isconst; u32 k; } rg[32];
 static const int host_pool[6] = { R4, R5, R6, R7, R8, R12 };
 static int save_r12;   // r12 está asignado: hay que guardarlo alrededor de las llamadas a C
+
+// Pila: si un bloque accede a memoria con sp, se comprueba una vez al entrar que sp apunta a la RAM y
+// r8 guarda su dirección real en la DS; así «lw s0, 20(sp)» es una sola instrucción ARM. Si no apunta
+// a la RAM (pila en la scratchpad, por ejemplo), ese bloque se vuelve a traducir sin el atajo.
+// Las escrituras por sp no miran si había código en esa página (nadie ejecuta código de la pila).
+#define RHSP R8
+static int use_hsp, hsp_ok;            // el bloque usa el atajo; r8 vale ahora (sp no ha cambiado de otra forma)
+static u32 *sp_fail[2];               // saltos de la comprobación de entrada que fallan
+static u32 sp_unsafe[256];             // PC de bloques donde falló (tabla abierta)
+static int sp_unsafe_n;
+
+static int sp_is_unsafe(u32 pc)
+{
+	for (u32 i = (pc >> 2) & 255, k = 0; k < 256 && sp_unsafe[i]; i = (i + 1) & 255, k++)
+		if (sp_unsafe[i] == pc) return 1;
+	return sp_unsafe_n >= 200;   // tabla casi llena: este juego no usa la pila en la RAM
+}
 
 static void call(const void *fn) { a_b(C_AL, 1, fn); }
 
@@ -334,6 +359,7 @@ static u32 stale_mask;   // registros con stale = 1
 static void put(int mr, int r)
 {
 	if (!mr) return;
+	if (mr == 29) hsp_ok = 0;
 	rg[mr].isconst = 0;
 	if (rg[mr].host >= 0) {
 		rg[mr].valid = 1;
@@ -349,6 +375,7 @@ static void put(int mr, int r)
 static void put_const(int mr, u32 k)
 {
 	if (!mr) return;
+	if (mr == 29) hsp_ok = 0;
 	rg[mr].isconst = 1;
 	rg[mr].k = k;
 	rg[mr].stale = 1;
@@ -375,6 +402,7 @@ static void flush_regs(void)
 static int r12_owner;   // registro MIPS que vive en r12 (0 = ninguno)
 static void forget(u32 written_mask, int lost_r12)
 {
+	if (written_mask & (1u << 29)) hsp_ok = 0;
 	written_mask &= ~1u;
 	stale_mask &= ~written_mask;
 	while (written_mask) {
@@ -533,6 +561,7 @@ static int scratch_const(u32 a, u32 *off)
 static void load_to(int size, int rs, u32 simm, int d)
 {
 	static const int hsh[5] = { 0, 3, 1, 2, 0 };
+	if (rs == 29 && hsp_ok) { mem_off(C_AL, 1, size, d, RHSP, (s32)simm); return; }   // pila (ver RHSP)
 	if (is_const(rs)) {
 		u32 a = const_of(rs) + simm, off;
 		if (ram_const(a, &off)) mem_off(C_AL, 1, size, d, RRAM, (int)off);
@@ -565,12 +594,13 @@ static void emit_load(int size, int rs, int rt, u32 simm)
 // Escribe el registro ARM v (r2 o uno asignado) en rs + simm. size: M_W, M_HU, M_BU
 static void store_from(int size, int rs, u32 simm, int v)
 {
+	if (rs == 29 && hsp_ok) { mem_off(C_AL, 0, size, v, RHSP, (s32)simm); return; }
 	if (is_const(rs)) {
 		u32 a = const_of(rs) + simm, off;
 		if (ram_const(a, &off)) {
 			u32 *skip;
 			mem_off(C_AL, 0, size, v, RRAM, (int)off);
-			a_mem_imm(C_AL, 1, 1, R3, RPAGES, (int)(off >> 12));
+			a_mem_imm(C_AL, 1, 1, R3, RPAGES, (int)(off >> DYN_PAGE_BITS));
 			a_dp_imm(C_AL, OP_CMP, 1, 0, R3, 0);
 			skip = fwd(C_EQ);
 			a_movi(R0, off);
@@ -592,7 +622,7 @@ static void store_from(int size, int rs, u32 simm, int v)
 		a_dp_reg(C_EQ, OP_MOV, 0, R3, 0, R1, SH_LSR, 11);
 		a_memh_reg(C_EQ, 0, 1, v, RRAM, R3);
 	}
-	a_mem_regsh(C_EQ, 1, 1, R3, RPAGES, R1, SH_LSR, 23);   // ¿había código traducido en esa página?
+	a_mem_regsh(C_EQ, 1, 1, R3, RPAGES, R1, SH_LSR, 11 + DYN_PAGE_BITS);   // ¿había código traducido en esa página?
 	a_b(C_NE, 1, st_handler[size][v]);                     // (vuelve con r3 = 0)
 	a_dp_imm(C_AL, OP_CMP, 1, 0, R3, 0);
 	a_b(C_NE, 1, smc_handler);
@@ -678,12 +708,20 @@ static u32 fetch_op(u32 pc)
 	return *(u32 *)(psx_bios + (p & 0x7fffc));
 }
 
+// ¿Carga o escritura (de las que van en línea) con base sp?
+static int sp_mem_op(u32 op)
+{
+	u32 o = op >> 26;
+	return ((op >> 21) & 31) == 29 && (o == 0x20 || o == 0x21 || o == 0x23 || o == 0x24 || o == 0x25 || o == 0x28 || o == 0x29 || o == 0x2b);
+}
+
 // Elige qué registros MIPS van en registros ARM: los más usados del bloque (al menos dos veces)
 static void alloc_regs(u32 pc)
 {
 	u8 uses[32] = { 0 };
 	u32 seen = 0;
 	int n = 0;
+	int sp_ops = 0;
 	for (u32 cur = pc;; cur += 4) {
 		u32 op = fetch_op(cur), r, w, m;
 		int last = 0;
@@ -691,10 +729,12 @@ static void alloc_regs(u32 pc)
 		if (is_branch(op)) {   // con su delay slot
 			u32 r2, w2;
 			op_regs(fetch_op(cur + 4), &r2, &w2);
+			sp_ops += sp_mem_op(fetch_op(cur + 4));
 			for (m = r2 | w2; m; m &= m - 1) uses[__builtin_ctz(m)] += 1;
 			seen |= r2 | w2;
 			last = 1;
 		}
+		sp_ops += sp_mem_op(op);
 		op_regs(op, &r, &w);
 		for (m = r; m; m &= m - 1) uses[__builtin_ctz(m)]++;
 		for (m = w; m; m &= m - 1) uses[__builtin_ctz(m)]++;
@@ -706,7 +746,9 @@ static void alloc_regs(u32 pc)
 	save_r12 = 0;
 	r12_owner = 0;
 	stale_mask = 0;
+	use_hsp = hsp_ok = sp_ops >= 2 && lin(pc) < 0x200000 && !sp_is_unsafe(pc);
 	for (int h = 0; h < 6 && seen; h++) {
+		if (use_hsp && host_pool[h] == RHSP) continue;
 		int best = 0;
 		for (u32 m = seen; m; m &= m - 1) {
 			int i = __builtin_ctz(m);
@@ -865,6 +907,12 @@ static int emit_op(u32 op, u32 pc, int ninstr)
 		a = get(rs, R0);
 		d = dst(rt, R0);
 		a_addi(d, a, simm, R1);
+		if (rt == 29 && rs == 29 && hsp_ok) {   // addiu sp, sp, n: la dirección real de la pila se mueve igual
+			put(rt, d);
+			a_addi(RHSP, RHSP, simm, R1);
+			hsp_ok = 1;
+			return 1;
+		}
 		put(rt, d);
 		return 1;
 	}
@@ -1060,7 +1108,7 @@ static void mark_pages(u32 start, u32 end)
 {
 	u32 p0 = start & 0x1fffffff, p1 = end & 0x1fffffff;
 	if (p0 >= 0x800000) return;
-	for (u32 p = (p0 & 0x1fffff) >> 12; p <= ((p1 & 0x1fffff) >> 12) && p < 512; p++) dyn_pages[p] = 1;
+	for (u32 p = (p0 & 0x1fffff) >> DYN_PAGE_BITS; p <= ((p1 & 0x1fffff) >> DYN_PAGE_BITS) && p < DYN_NPAGES; p++) dyn_pages[p] = 1;
 }
 
 // Compara los operandos de un salto condicional (b < 0: con cero) y devuelve la condición ARM de «se salta»
@@ -1097,6 +1145,18 @@ static block_fn compile(u32 pc, block_fn *s)
 	alloc_regs(pc);
 	emit(pc);   // cabecera: el PC virtual con el que se tradujo
 	entry = emit_ptr;
+	if (use_hsp) {   // atajo de la pila: sp en la RAM (y no en los primeros 32 KB) -> r8 = su dirección en la DS
+		int sp = get(29, R0);
+		u32 *fail1, *fail2;
+		a_dp_imm(C_AL, OP_TST, 1, 0, sp, arm_imm(0x1f800000));
+		fail1 = fwd(C_NE);
+		a_dp_reg(C_AL, OP_MOV, 0, R0, 0, sp, SH_LSL, 11);
+		a_dp_imm(C_AL, OP_CMP, 1, 0, R0, arm_imm(0x04000000));
+		fail2 = fwd(C_CC);
+		a_dp_reg(C_AL, OP_ADD, 0, RHSP, RRAM, R0, SH_LSR, 11);
+		sp_fail[0] = fail1;
+		sp_fail[1] = fail2;
+	}
 
 	for (;;) {
 		u32 op = fetch_op(cur);
@@ -1209,12 +1269,31 @@ static block_fn compile(u32 pc, block_fn *s)
 		cur += 4;
 	}
 
+	if (use_hsp) {   // salida de los fallos de la comprobación de entrada
+		land(sp_fail[0]);
+		land(sp_fail[1]);
+		a_b(C_AL, 1, stub_sp_fail);
+		emit(pc);
+	}
 	mark_pages(pc, cur);
 	STAT_ADD(dyn_mips, (cur - pc) / 4 + 1);
 	STAT_ADD(dyn_arm, (u32)(emit_ptr - start));
 	sync_code(start, (u32)((u8 *)emit_ptr - (u8 *)start));
 	*s = entry;
 	return entry;
+}
+
+// Lo llama stub_sp_fail: el bloque de pc supuso que sp apuntaba a la RAM y no era así
+void dyn_sp_fail(u32 pc)
+{
+	block_fn *s = slot(pc);
+	u32 l = lin(pc), i;
+	if (sp_unsafe_n < 256) {
+		for (i = (pc >> 2) & 255; sp_unsafe[i] && sp_unsafe[i] != pc; i = (i + 1) & 255) { }
+		if (!sp_unsafe[i]) { sp_unsafe[i] = pc; sp_unsafe_n++; }
+	}
+	if (s && *s && (*s)[-1] == pc) *s = NULL;
+	if (l < 0x200000) unlink_page(l >> DYN_PAGE_BITS, l, l + 4);   // los saltos ya parcheados hacia él, también
 }
 
 // Lo llama el enlazador (stub_link) desde el final de un bloque: busca o traduce el destino y, si
@@ -1238,8 +1317,8 @@ block_fn dyn_link(u32 target, u32 *site)
 		if (link_n >= link_max) return f;
 		links[link_n].site = site;
 		links[link_n].lin = l;
-		links[link_n].next = link_head[l >> 12];
-		link_head[l >> 12] = link_n++;
+		links[link_n].next = link_head[l >> DYN_PAGE_BITS];
+		link_head[l >> DYN_PAGE_BITS] = link_n++;
 	}
 	*site = b_enc(C_AL, 0, site, f);
 	sync_code(site, 4);

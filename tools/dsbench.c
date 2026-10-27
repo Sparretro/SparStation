@@ -195,7 +195,7 @@ int main(int argc, char **argv)
 		uint8_t *ram = NULL;
 		size_t ramn = 0;
 		uint32_t *bench = NULL;
-#define BENCH_N 4 + 8 + 28
+#define BENCH_N 6 + 8 + 28
 		if (retro_get_memory_data && retro_get_memory_size) { ram = retro_get_memory_data(2); ramn = retro_get_memory_size(2); }
 		for (int i = 0; i < frames; i++) {
 			cur_frame = i;
@@ -213,14 +213,20 @@ int main(int argc, char **argv)
 			}
 		}
 		if (bench) {
-			// tras la cabecera: frames, vblanks, pc, ram, tiempos[7], contadores[19]
-			enum { B_PROF = 4, B_STAT = 12 };
+			// tras la cabecera: frames, vblanks, pc, ram, código, código usado, tiempos, contadores
+			enum { B_PROF = 6, B_STAT = 14 };
 			static const char *pn[8] = { "cpu", "gpu", "present", "frame", "disc", "mdec", "compile", "gte" };
 			static const char *sn[28] = { "gpu_cmds", "tris", "rects", "lines", "fills", "copies", "vram_up", "gpu_px", "flips",
 			                              "cd_sect", "mdec_blk", "compiled", "flushes", "smc", "interp_ops", "interp_steps", "idle", "mips", "arm", "gte_ops", "io", "sio_b", "sio_ack", "sio_poll", "tri_rapido", "tri_otro", "rect_rapido", "rect_otro" };
 			uint32_t d[BENCH_N];
 			double secs;
 			const char *dump = getenv("DSB_PSXMEM");   // DSB_PSXMEM=desplazamiento:bytes:archivo vuelca RAM de la PS1
+			const char *code = getenv("DSB_CODE");     // DSB_CODE=archivo vuelca la caché del dynarec (dirección en el nombre .addr)
+			if (code && bench[4] >= 0x02000000u && bench[4] - 0x02000000u + bench[5] <= ramn) {
+				FILE *cf = fopen(code, "wb");
+				if (cf) { fwrite(ram + bench[4] - 0x02000000u, 1, bench[5], cf); fclose(cf); }
+				printf("CODE %08x %u\n", bench[4], bench[5]);
+			}
 			for (int k = 0; k < BENCH_N; k++) d[k] = bench[k] - b0[k];
 			secs = d[1] / 60.0;
 			if (secs <= 0) secs = 1;

@@ -74,13 +74,15 @@ void cpu_dyn_exception(u32 code, u32 pc);
 int cpu_dyn_irq(void);
 void cpu_interp_step(void);
 #ifdef PSX_DYNAREC
-extern u8 dyn_pages[512];          // páginas de 4 KB de RAM con código traducido
+#define DYN_PAGE_BITS 10                              // trozos de 1 KB: una escritura de datos cerca del código borra poco
+#define DYN_NPAGES (0x200000 >> DYN_PAGE_BITS)
+extern u8 dyn_pages[DYN_NPAGES];   // trozos de RAM con código traducido
 void dyn_smc(u32 ram_off);         // la RAM cambió en una página con código: invalidarla
 void dyn_ram_written(u32 ram_off, u32 len);
 int dyn_init(int big);
 void dyn_run(u32 until);
 void dyn_cache_use(u32 *used, u32 *size);   // bytes de la caché de código ocupados / total
-#define DYN_CHECK_WRITE(off) do { if (dyn_pages[((off) & 0x1fffff) >> 12]) dyn_smc((off) & 0x1fffff); } while (0)
+#define DYN_CHECK_WRITE(off) do { if (dyn_pages[((off) & 0x1fffff) >> DYN_PAGE_BITS]) dyn_smc((off) & 0x1fffff); } while (0)
 #else
 #define DYN_CHECK_WRITE(off) do { } while (0)
 #endif
