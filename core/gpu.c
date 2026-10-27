@@ -1032,6 +1032,12 @@ static void fill(void)
 	u16 c = rgb15(fifo[0] & 0xffffff);
 	int x0 = fifo[1] & 0x3f0, y0 = (fifo[1] >> 16) & 0x1ff;
 	int w = ((fifo[2] & 0x3ff) + 0xf) & ~0xf, h = (fifo[2] >> 16) & 0x1ff;
+	if (gpu_hw && w >= gpu_disp.width - 16 && h >= gpu_disp.height * 3 / 4) {   // ¿borra un buffer de pantalla?
+		int sx = g.da_x1, sy = g.da_y1;
+		g.da_x1 = x0; g.da_y1 = y0;
+		if (hw_screen()) { g.da_x1 = sx; g.da_y1 = sy; gpu_hw->clear(c); return; }
+		g.da_x1 = sx; g.da_y1 = sy;
+	}
 	for (int y = 0; y < h; y++)
 		for (int x = 0; x < w; x++) VRAM(x0 + x, y0 + y) = c;
 	if (gpu_hw) gpu_hw->vram_written(x0, y0, w, h);
@@ -1143,7 +1149,7 @@ void gpu_write_gp0(u32 v)
 	if (fifo_n == 0) fifo_need = cmd_len(v >> 24);
 	fifo[fifo_n++] = v;
 	if (fifo_n >= fifo_need) {
-		{ PROF_BEGIN(); STAT_ADD(gpu_cmds, 1); execute_cmd(); PROF_END(PROF_GPU); }
+		{ STAT_ADD(gpu_cmds, 1); execute_cmd(); }   // el tiempo de la GPU se mide en la DMA (dma.c): medir cada comando costaba mucho
 		fifo_n = 0;
 	}
 }

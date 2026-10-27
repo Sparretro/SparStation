@@ -406,5 +406,6 @@ static void dbg_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 }
 static void dbg_written(int x, int y, int w, int h) { (void)x; (void)y; (void)w; (void)h; }
 static void dbg_flip(int d) { extern int gpudump; if (gpudump) printf("HW flip %d\n", d); }
-const GpuHw dbg_hw = { dbg_poly, dbg_written, dbg_flip };
+static void dbg_clear(u16 c) { (void)c; }
+const GpuHw dbg_hw = { dbg_poly, dbg_written, dbg_flip, dbg_clear };
 #endif

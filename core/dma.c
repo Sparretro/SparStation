@@ -76,12 +76,14 @@ static void run(int ch)
 
 	if (sync == 2) {   // lista enlazada (GPU)
 		int guard = 0x80000;
+		PROF_BEGIN();
 		for (;;) {
 			u32 hdr = *ram32(addr), n = hdr >> 24;
 			for (u32 i = 1; i <= n; i++) gpu_write_gp0(*ram32(addr + i * 4));
 			if ((hdr & 0x800000) || --guard == 0) break;
 			addr = hdr & 0xfffffc;
 		}
+		PROF_END(PROF_GPU);
 		madr[ch] = 0xffffff;
 		finish(ch);
 		return;

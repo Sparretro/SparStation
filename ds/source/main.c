@@ -343,7 +343,7 @@ static void present(void)
 	u32 *dst32;
 
 	if (gpu_disp.stale && !gpu_disp.disabled) return;   // el juego enseña un frame que no se dibujó: dejar el anterior
-	if (single_fb && !gx_display_dirty && !gpu_disp.disabled) return;   // GPU 3D: el fondo no ha cambiado
+	if (single_fb && (gx_bg_hidden || !gx_display_dirty) && !gpu_disp.disabled) return;   // GPU 3D: el fondo no se ve o no ha cambiado
 	gx_display_dirty = 0;
 	while (flip_to >= 0) { }   // el cambio anterior aún no se ha hecho
 	if (single_fb) back = 0;
@@ -566,6 +566,9 @@ int main(void)
 			load_script("nitro:/press.txt");
 #ifdef BENCH_QUALITY
 			opt_quality = BENCH_QUALITY;   // make SELFTEST=1 EXTRA=-DBENCH_QUALITY=n: medir con esa calidad
+#ifdef BENCH_HW
+			opt_hw = BENCH_HW;   // EXTRA=-DBENCH_HW=0: GPU por software
+#endif
 #ifdef BENCH_SKIP
 			opt_skip = BENCH_SKIP;   // y saltando frames (EXTRA=-DBENCH_SKIP=n)
 #endif

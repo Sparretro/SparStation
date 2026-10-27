@@ -127,6 +127,7 @@ typedef struct {
 	void (*poly)(const GpuHwVtx *v, int n, const GpuHwPoly *p);   // n = 3 o 4 (cuadrado: 0,1,2 y 1,2,3)
 	void (*vram_written)(int x, int y, int w, int h);              // para invalidar texturas y la imagen
 	void (*flip)(int drawn);   // el juego cambia el buffer mostrado; drawn = 0 si ese frame se saltó
+	void (*clear)(u16 color);  // relleno de casi todo un buffer de pantalla: en vez de escribir la VRAM
 } GpuHw;
 extern const GpuHw *gpu_hw;
 extern u8 gpu_rows_on;         // 1 = dibujar solo las filas marcadas en gpu_row_draw

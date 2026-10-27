@@ -30,6 +30,7 @@ static u32 list[LIST_WORDS];
 static int ln, npolys;
 static u32 frame_no;
 int gx_display_dirty = 1;   // la zona mostrada de la VRAM cambió: hay que volver a copiarla al fondo
+int gx_bg_hidden;           // el 3D tapa toda la pantalla: no hace falta copiar el fondo
 
 // ---- paletas: banco E (64 KB) ----
 #define PAL_HASH 512
@@ -307,17 +308,28 @@ static void gx_vram_written(int x, int y, int w, int h)
 	if (x < gpu_disp.disp_x + gpu_disp.width && x + w > gpu_disp.disp_x) gx_display_dirty = 1;   // basta con mirar columnas
 }
 
+static u32 clear_next;   // color de fondo del 3D para el frame en curso (0 = transparente: se ve el fondo BG3)
+
+static void gx_clear(u16 c)
+{
+	clear_next = (c & 0x7fffu) | (31u << 16) | (63u << 24);   // opaco: tapa el BG3, que ya no se borra
+}
+
 static void gx_flip(int drawn)
 {
 	if (!drawn) return;   // frame saltado: se queda la imagen anterior
+	int opaque = clear_next != 0;
+	GFX_CLEAR_COLOR = opaque ? clear_next : 63u << 24;
+	clear_next = 0;
 	for (int i = 0; i < ln; i++) GFX_FIFO = list[i];
 	GFX_FLUSH = 1;   // orden manual de los semitransparentes; se cambia de buffer en la próxima vblank
 	ln = npolys = 0;
 	frame_no++;
-	gx_display_dirty = 1;   // el fondo pasa a mostrar el otro buffer
+	if (!opaque) gx_display_dirty = 1;   // el fondo pasa a mostrar el otro buffer (si el 3D no lo tapa entero)
+	gx_bg_hidden = opaque;
 }
 
-const GpuHw gx_hw = { gx_poly, gx_vram_written, gx_flip };
+const GpuHw gx_hw = { gx_poly, gx_vram_written, gx_flip, gx_clear };
 
 void gx_init(void)
 {
