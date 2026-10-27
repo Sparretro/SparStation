@@ -53,6 +53,8 @@ static void transfer(u8 v)
 	case 3: resp = psx_pad_buttons & 0xff; will_ack = 1; seq = 4; break;
 	case 4: resp = psx_pad_buttons >> 8; seq = 0; break;
 	}
+	STAT_ADD(sio_bytes, 1);
+	if (seq == 2) STAT_ADD(sio_polls, 1);
 	rx_next = resp;
 	transferring = 1;
 	xfer_end = psx_cycles + transfer_cycles();
@@ -85,6 +87,7 @@ void sio_tick(void)
 		ack_pending = 0;
 		ack_line = 1;
 		ack_end = ack_time + ACK_LEN;
+		STAT_ADD(sio_acks, 1);
 		SIO_LOG("    ACK%s (t=%u)\n", (ctrl & 0x1000) ? " + IRQ7" : "", psx_cycles);
 		if (ctrl & 0x1000) {
 			stat_irq = 1;

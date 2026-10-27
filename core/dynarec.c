@@ -1252,6 +1252,9 @@ void dyn_run(u32 until)
 {
 	psx_run_until = until;
 	dyn_chain = psx_hook_pc ? 0 : psx_tty ? 1 : 2;
+#ifdef DYN_NOCHAIN
+	dyn_chain = DYN_NOCHAIN;   // pruebas: 0 = volver a C tras cada bloque, 1 = sin vectores de la BIOS
+#endif
 	while (TIME_BEFORE(psx_cycles, psx_run_until)) {
 		block_fn *s, f;
 		if (psx_hook_pc && cpu.pc == psx_hook_pc) psx_hook();

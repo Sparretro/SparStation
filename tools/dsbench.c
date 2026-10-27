@@ -195,7 +195,7 @@ int main(int argc, char **argv)
 		uint8_t *ram = NULL;
 		size_t ramn = 0;
 		uint32_t *bench = NULL;
-#define BENCH_N 4 + 8 + 25
+#define BENCH_N 4 + 8 + 28
 		if (retro_get_memory_data && retro_get_memory_size) { ram = retro_get_memory_data(2); ramn = retro_get_memory_size(2); }
 		for (int i = 0; i < frames; i++) {
 			cur_frame = i;
@@ -216,8 +216,8 @@ int main(int argc, char **argv)
 			// tras la cabecera: frames, vblanks, pc, ram, tiempos[7], contadores[19]
 			enum { B_PROF = 4, B_STAT = 12 };
 			static const char *pn[8] = { "cpu", "gpu", "present", "frame", "disc", "mdec", "compile", "gte" };
-			static const char *sn[25] = { "gpu_cmds", "tris", "rects", "lines", "fills", "copies", "vram_up", "gpu_px", "flips",
-			                              "cd_sect", "mdec_blk", "compiled", "flushes", "smc", "interp_ops", "interp_steps", "idle", "mips", "arm", "gte_ops", "io", "tri_rapido", "tri_otro", "rect_rapido", "rect_otro" };
+			static const char *sn[28] = { "gpu_cmds", "tris", "rects", "lines", "fills", "copies", "vram_up", "gpu_px", "flips",
+			                              "cd_sect", "mdec_blk", "compiled", "flushes", "smc", "interp_ops", "interp_steps", "idle", "mips", "arm", "gte_ops", "io", "sio_b", "sio_ack", "sio_poll", "tri_rapido", "tri_otro", "rect_rapido", "rect_otro" };
 			uint32_t d[BENCH_N];
 			double secs;
 			const char *dump = getenv("DSB_PSXMEM");   // DSB_PSXMEM=desplazamiento:bytes:archivo vuelca RAM de la PS1
@@ -234,7 +234,7 @@ int main(int argc, char **argv)
 				       d[B_PROF + 5] / f, d[B_PROF + 2] / f, d[B_PROF + 3] / f);
 			}
 			printf("\n  por s:");
-			for (int k = 0; k < 25; k++) printf(" %s=%.0f", sn[k], d[B_STAT + k] / secs);
+			for (int k = 0; k < 28; k++) printf(" %s=%.0f", sn[k], d[B_STAT + k] / secs);
 			printf("\n");
 			if (dump) {
 				unsigned off, len;

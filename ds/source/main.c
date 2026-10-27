@@ -195,6 +195,7 @@ static int pick_game(char *out, size_t outlen)
 #define MAX_PRESS 64
 static struct { u32 at, len; u16 bit; } press[MAX_PRESS];
 static int npress;
+static u32 stop_at;   // «--stop F»: parar la emulación tras el frame F (para comparar con el PC)
 
 static void load_script(const char *path)
 {
@@ -211,6 +212,7 @@ static void load_script(const char *path)
 		unsigned at, len = 6;
 		char btn[16];
 		if (!strcmp(tok, "--press")) continue;
+		if (!strcmp(tok, "--stop") && fscanf(f, "%u", &stop_at) == 1) continue;
 		if (sscanf(tok, "%u:%15[a-z0-9]:%u", &at, btn, &len) < 2) continue;
 		for (size_t k = 0; k < sizeof names / sizeof names[0]; k++)
 			if (!strcmp(btn, names[k].n)) {
@@ -435,6 +437,7 @@ static void run_loop(const char *title, int use_log)
 		u32 t0 = cpuGetTiming();
 		scanKeys();
 		if (title) hud_input();
+		while (stop_at && bench.frames >= stop_at) swiWaitForVBlank();
 		psx_pad_buttons = npress ? script_pad(bench.frames + 1) : map_pad(keysHeld());
 		psx_run_frame();
 		frame_beat++;
@@ -472,7 +475,7 @@ int main(void)
 	fb[1] = fb[0] + 256 * 256;   // banco B, base de mapa 8
 	dmaFillHalfWords(0x8000, fb[0], 2 * 256 * 256 * 2);
 
-	printf("SparStation - PS1 en DSi\nby Spar Retro\n\n");
+	printf("SparStation v2 - PS1 en DSi\nby Spar Retro\n\n");
 #ifdef PSX_SELFTEST
 	if (!nitroFSInit(NULL) || !pak_init() || !load_bios()) {
 		printf("Pruebas: falta nitro:/bios.bin\no el Expansion Pak.\n");

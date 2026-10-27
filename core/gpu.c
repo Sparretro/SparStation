@@ -543,10 +543,10 @@ static void grad(int a0, int a1, int a2, const Vtx *v0, const Vtx *v1, const Vtx
 // Límite de columnas de una arista en cada fila: q = floor(w / |d|) llevado con su resto r
 typedef struct { s32 q, r, D, qs, rs; int kind; } EdgeStep;   // kind: 1 = límite izquierdo, -1 = derecho, 0 = horizontal
 
-static inline s32 floordiv(s32 a, s32 d)
+static inline s32 floordiv(s32 a, s32 d)   // d > 0
 {
-	s32 q = a / d;
-	if ((a % d) && a < 0) q--;
+	s32 q = div64_32(a, d);
+	if (q * d != a && a < 0) q--;
 	return q;
 }
 

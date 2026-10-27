@@ -7,7 +7,7 @@ $(error "Please set DEVKITARM in your environment. export DEVKITARM=<path to>dev
 endif
 
 GAME_TITLE     := SparStation
-GAME_SUBTITLE1 := PlayStation en tu DSi
+GAME_SUBTITLE1 := PlayStation en tu DSi (v2)
 GAME_SUBTITLE2 := by Spar Retro
 # make SELFTEST=1 [NITRODIR=carpeta] mete esa carpeta como NitroFS (selftest.exe o disco reducido) para probar en modo DS
 ifeq ($(SELFTEST),1)

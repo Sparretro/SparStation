@@ -187,6 +187,7 @@ typedef struct {
 	u32 dyn_idle;      // bucles de espera saltados (se avanza el reloj en vez de dar vueltas)
 	u32 dyn_mips, dyn_arm;   // instrucciones MIPS traducidas y palabras ARM generadas
 	u32 gte_ops, io_calls;   // comandos de la GTE y accesos a memoria por el camino lento (E/S, scratchpad)
+	u32 sio_bytes, sio_acks, sio_polls;   // mando: bytes enviados, ACK y lecturas completas (0x42)
 	u32 gpu_px_kind[4];   // píxeles: triángulos por el bucle rápido / el resto, rectángulos rápido / el resto
 } PsxStats;
 extern PsxStats psx_stat;
