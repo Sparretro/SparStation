@@ -347,8 +347,7 @@ static void present(void)
 		if (gpu_disp.color24) REG_DISPCNT &= ~DISPLAY_BG0_ACTIVE;
 		else REG_DISPCNT |= DISPLAY_BG0_ACTIVE;
 	}
-	if (single_fb && (gx_bg_hidden || !gx_display_dirty) && !gpu_disp.disabled && !gpu_disp.color24) return;   // GPU 3D: el fondo no se ve o no ha cambiado (en 24 bits, vídeos: siempre)
-	gx_display_dirty = 0;
+	if (single_fb && !gpu_disp.disabled && !gpu_disp.color24 && (gx_bg_hidden || !gx_need_copy())) return;   // GPU 3D: el fondo no se ve o no ha cambiado (en 24 bits, vídeos: siempre)
 	while (flip_to >= 0) { }   // el cambio anterior aún no se ha hecho
 	if (single_fb) back = 0;
 	dst32 = (u32 *)fb[back];

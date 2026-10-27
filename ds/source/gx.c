@@ -29,7 +29,21 @@
 static u32 list[LIST_WORDS];
 static int ln, npolys;
 static u32 frame_no;
-int gx_display_dirty = 1;   // la zona mostrada de la VRAM cambió: hay que volver a copiarla al fondo
+// Fondo BG3 (la VRAM de la PS1 copiada a la pantalla): con el 3D solo hace falta copiarlo si el juego escribió
+// en la zona mostrada (vídeos, imágenes subidas). Por franjas de 16 filas: cambiado desde la última copia, y
+// con algo escrito alguna vez (si no, da igual qué buffer se ve: lo dibuja el 3D).
+static u8 band_dirty[32], band_content[32];
+static int shown_y = -1;
+
+int gx_need_copy(void)
+{
+	int y0 = gpu_disp.disp_y >> 4, y1 = (gpu_disp.disp_y + gpu_disp.height - 1) >> 4, dirty = 0, content = 0;
+	for (int b = y0; b <= y1; b++) { dirty |= band_dirty[b & 31]; content |= band_content[b & 31]; }
+	if (!dirty && !(content && shown_y != gpu_disp.disp_y) && shown_y >= 0) return 0;
+	for (int b = y0; b <= y1; b++) band_dirty[b & 31] = 0;
+	shown_y = gpu_disp.disp_y;
+	return 1;
+}
 int gx_bg_hidden;           // el 3D tapa toda la pantalla: no hace falta copiar el fondo
 // Depuración: en qué paso está gx (tools/dsbench lo enseña al final si encuentra la marca)
 GxDbg gx_dbg = { "SPDBGSTG", 0, 0, 0, 0 };
@@ -311,7 +325,8 @@ static void gx_vram_written(int x, int y, int w, int h)
 {
 	tex_dirty(x, y, w, h);
 	pal_dirty(x, y, w, h);
-	if (x < gpu_disp.disp_x + gpu_disp.width && x + w > gpu_disp.disp_x) gx_display_dirty = 1;   // basta con mirar columnas
+	if (x < gpu_disp.disp_x + gpu_disp.width && x + w > gpu_disp.disp_x)
+		for (int b = y >> 4; b <= (y + h - 1) >> 4; b++) band_dirty[b & 31] = band_content[b & 31] = 1;
 }
 
 static u32 clear_next;   // color de fondo del 3D para el frame en curso (0 = transparente: se ve el fondo BG3)
@@ -335,7 +350,6 @@ static void gx_flip(int drawn)
 	ln = npolys = 0;
 	frame_no++;
 	STAGE(13);
-	if (!opaque) gx_display_dirty = 1;   // el fondo pasa a mostrar el otro buffer (si el 3D no lo tapa entero)
 	gx_bg_hidden = opaque;
 }
 
