@@ -117,16 +117,32 @@ static inline void a_movi(int rd, u32 v)
 	e = arm_imm(~v);
 	if (e >= 0) { a_dp_imm(C_AL, OP_MVN, 0, rd, 0, e); return; }
 	{
-		int first = 1;
-		for (int b = 0; b < 32; b += 8) {
-			u32 part = v & (0xffu << b);
-			if (!part) continue;
-			e = arm_imm(part);
-			if (first) a_dp_imm(C_AL, OP_MOV, 0, rd, 0, e);
-			else a_dp_imm(C_AL, OP_ORR, 0, rd, rd, e);
-			first = 0;
+		// trozos de 8 bits que empiezan en el bit par más bajo que quede: suele salir una instrucción
+		// menos que cortando por bytes (0x8003be14 = 3 en vez de 4); si con MVN + BIC sale menos, así
+		int n_or = 0, n_bic = 0;
+		for (u32 r = v; r; n_or++) r &= ~(0xffu << (__builtin_ctz(r) & ~1));
+		for (u32 r = ~v; r; n_bic++) r &= ~(0xffu << (__builtin_ctz(r) & ~1));
+		if (n_bic < n_or) {
+			u32 r = ~v;
+			int first = 1;
+			while (r) {
+				u32 part = r & (0xffu << (__builtin_ctz(r) & ~1));
+				r &= ~part;
+				if (first) a_dp_imm(C_AL, OP_MVN, 0, rd, 0, arm_imm(part));
+				else a_dp_imm(C_AL, OP_BIC, 0, rd, rd, arm_imm(part));
+				first = 0;
+			}
+		} else {
+			u32 r = v;
+			int first = 1;
+			while (r) {
+				u32 part = r & (0xffu << (__builtin_ctz(r) & ~1));
+				r &= ~part;
+				if (first) a_dp_imm(C_AL, OP_MOV, 0, rd, 0, arm_imm(part));
+				else a_dp_imm(C_AL, OP_ORR, 0, rd, rd, arm_imm(part));
+				first = 0;
+			}
 		}
-		if (first) a_dp_imm(C_AL, OP_MOV, 0, rd, 0, 0);
 	}
 }
 

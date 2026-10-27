@@ -440,6 +440,108 @@ RECT_FAST(rect_f4s, 4, 4, 1)
 RECT_FAST(rect_f8, 2, 8, 0)
 RECT_FAST(rect_f8s, 2, 8, 1)
 
+// ---- media resolución horizontal (gpu_half_x, solo triángulos) ----
+// Se calcula un píxel de cada par alineado y se escribe en los dos: la mitad de texturas, mezclas y
+// colores. Para semitransparencias se mezcla con el fondo del primero de los dos.
+#define SPAN_FAST_H(NAME, TEX, SEMI) \
+	static void NAME(u16 *d, int n, s32 u, s32 v, s32 r, s32 gg, s32 b) \
+	{ \
+		const u16 *page = rs.page; \
+		const s32 du = rs.du, dv = rs.dv; \
+		const int semi = rs.semi; \
+		u32 c; \
+		(void)r; (void)gg; (void)b; (void)semi; \
+		if (n <= 0) return; \
+		prefetch_span(d, n); \
+		if ((uintptr_t)d & 2) { \
+			c = shade(TEX(u, v), SEMI ? *d : 0, SEMI, semi); \
+			if (!(c & 0x10000)) *d = (u16)c; \
+			d++; n--; u += du; v += dv; \
+		} \
+		for (; n >= 2; n -= 2, d += 2, u += 2 * du, v += 2 * dv) { \
+			c = shade(TEX(u, v), SEMI ? *d : 0, SEMI, semi); \
+			if (!(c & 0x10000)) *(u32 *)d = (c & 0xffff) * 0x10001u; \
+		} \
+		if (n) { \
+			c = shade(TEX(u, v), SEMI ? *d : 0, SEMI, semi); \
+			if (!(c & 0x10000)) *d = (u16)c; \
+		} \
+	}
+SPAN_FAST_H(span_f4_h, TEX_UV4, 0)
+SPAN_FAST_H(span_f4s_h, TEX_UV4, 1)
+SPAN_FAST_H(span_f8_h, TEX_UV8, 0)
+SPAN_FAST_H(span_f8s_h, TEX_UV8, 1)
+
+#define GOUR_PX(TEX, SEMI) \
+	u32 c = TEX(u, v); \
+	if (!(c & 0x10000)) { \
+		c = mod_lut[((r >> 11) & 0x1fe0) | (c & 31)] | (mod_lut[((gg >> 11) & 0x1fe0) | ((c >> 5) & 31)] << 5) | \
+		    (mod_lut[((b >> 11) & 0x1fe0) | ((c >> 10) & 31)] << 10) | (c & 0x8000); \
+		if (SEMI && (c & 0x8000)) c = 0x8000 | blend_fast(*d, (u16)c, semi);
+#define SPAN_GOUR_H(NAME, TEX, SEMI) \
+	static void NAME(u16 *d, int n, s32 u, s32 v, s32 r, s32 gg, s32 b) \
+	{ \
+		const u16 *page = rs.page; \
+		const s32 du = rs.du, dv = rs.dv, dr = rs.dr, dg = rs.dg, db = rs.db; \
+		const int semi = rs.semi; \
+		(void)semi; \
+		if (n <= 0) return; \
+		prefetch_span(d, n); \
+		if ((uintptr_t)d & 2) { \
+			GOUR_PX(TEX, SEMI) *d = (u16)c; } \
+			d++; n--; u += du; v += dv; r += dr; gg += dg; b += db; \
+		} \
+		for (; n >= 2; n -= 2, d += 2, u += 2 * du, v += 2 * dv, r += 2 * dr, gg += 2 * dg, b += 2 * db) { \
+			GOUR_PX(TEX, SEMI) *(u32 *)d = c * 0x10001u; } \
+		} \
+		if (n) { GOUR_PX(TEX, SEMI) *d = (u16)c; } } \
+	}
+SPAN_GOUR_H(span_g4_h, TEX_UV4, 0)
+SPAN_GOUR_H(span_g4s_h, TEX_UV4, 1)
+SPAN_GOUR_H(span_g8_h, TEX_UV8, 0)
+SPAN_GOUR_H(span_g8s_h, TEX_UV8, 1)
+
+#define SPAN_COLOR_H(NAME, SEMI) \
+	static void NAME(u16 *d, int n, s32 u, s32 v, s32 r, s32 gg, s32 b) \
+	{ \
+		const s32 dr = rs.dr, dg = rs.dg, db = rs.db; \
+		const int semi = rs.semi; \
+		const u32 set = rs.set; \
+		u32 c; \
+		(void)u; (void)v; (void)semi; \
+		if (n <= 0) return; \
+		prefetch_span(d, n); \
+		if ((uintptr_t)d & 2) { \
+			c = (u16)((r >> 19) | ((gg >> 19) << 5) | ((b >> 19) << 10)); \
+			if (SEMI) c = blend_fast(*d, (u16)c, semi); \
+			*d = (u16)(c | set); \
+			d++; n--; r += dr; gg += dg; b += db; \
+		} \
+		for (; n >= 2; n -= 2, d += 2, r += 2 * dr, gg += 2 * dg, b += 2 * db) { \
+			c = (u16)((r >> 19) | ((gg >> 19) << 5) | ((b >> 19) << 10)); \
+			if (SEMI) c = blend_fast(*d, (u16)c, semi); \
+			*(u32 *)d = (c | set) * 0x10001u; \
+		} \
+		if (n) { \
+			c = (u16)((r >> 19) | ((gg >> 19) << 5) | ((b >> 19) << 10)); \
+			if (SEMI) c = blend_fast(*d, (u16)c, semi); \
+			*d = (u16)(c | set); \
+		} \
+	}
+SPAN_COLOR_H(span_cg_h, 0)
+SPAN_COLOR_H(span_cgs_h, 1)
+
+u8 gpu_half_x;
+
+static span_fn half_of(span_fn fn)
+{
+	static const span_fn full[] = { span_f4, span_f4s, span_f8, span_f8s, span_g4, span_g4s, span_g8, span_g8s, span_cg, span_cgs };
+	static const span_fn half[] = { span_f4_h, span_f4s_h, span_f8_h, span_f8s_h, span_g4_h, span_g4s_h, span_g8_h, span_g8s_h, span_cg_h, span_cgs_h };
+	for (unsigned i = 0; i < sizeof full / sizeof full[0]; i++)
+		if (fn == full[i]) return half[i];
+	return fn;
+}
+
 // Prepara rs para un primitivo; tex: 0 sin textura, si no usa la textura activa (use_texture)
 static span_fn span_setup(int tex, int gouraud, int raw, int semi_on, u32 rgb)
 {
@@ -614,6 +716,7 @@ static void triangle(Vtx *v0, Vtx *v1, Vtx *v2, int textured, int gouraud, int s
 		grad(v0->v, v1->v, v2->v, v0, v1, v2, area, &dvdx, &dvdy);
 	}
 	fn = span_setup(textured, gouraud, raw, semi_on, (u32)(v0->r | (v0->g << 8) | (v0->b << 16)));
+	if (gpu_half_x) fn = half_of(fn);
 	rs.du = dudx; rs.dv = dvdx; rs.dr = drdx; rs.dg = dgdx; rs.db = dbdx;
 
 	b0 = top_left(v1, v2) ? 0 : -1;

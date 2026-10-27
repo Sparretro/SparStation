@@ -91,6 +91,10 @@ void dyn_cache_use(u32 *used, u32 *size);   // bytes de la caché de código ocu
 u32 gte_read(int reg);
 void gte_write(int reg, u32 v);
 void gte_command(u32 op);
+// Para el dynarec: dónde vive el registro reg (0-63) si leerlo o escribirlo es solo copiar memoria.
+// Hasta dos trozos: el primero con los 16 o 32 bits bajos, el segundo con los 16 altos. 0 = no es simple.
+typedef struct { void *addr; u8 bits, sign; } GteRegPart;
+int gte_reg_parts(int reg, int write, GteRegPart part[2]);
 
 // ---- GPU ----
 extern u16 *psx_vram;    // 1024x512, 15 bits por píxel
@@ -104,6 +108,7 @@ typedef struct {
 extern GpuDisplay gpu_disp;
 // ajustes de velocidad (los pone el frontend)
 extern u8 gpu_frameskip;       // 0 = dibujar todo; N = de cada N+1 frames del juego, dibujar 1
+extern u8 gpu_half_x;          // triángulos a media resolución horizontal (un píxel calculado por par)
 extern u8 gpu_rows_on;         // 1 = dibujar solo las filas marcadas en gpu_row_draw
 extern u8 gpu_row_draw[512];   // por fila de la VRAM (lo rellena gpu_rows_for)
 extern u16 psx_cpu_scale;      // coste de cada ciclo en 1/256: 256 = CPU al 100%, más = CPU más lenta

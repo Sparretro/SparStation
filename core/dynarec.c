@@ -1,8 +1,8 @@
 // Dynarec: traduce bloques de código MIPS de la PS1 a código ARM de la DS la primera vez que se
 // ejecutan.
 //
-// Registros: dentro de cada bloque, los registros MIPS más usados viven en registros ARM (r4-r8 y
-// r12): se cargan de la estructura cpu la primera vez que se leen y se guardan al salir del bloque o
+// Registros: dentro de cada bloque, los registros MIPS más usados viven en registros ARM (r4-r8):
+// se cargan de la estructura cpu la primera vez que se leen y se guardan al salir del bloque o
 // antes de lo que necesite verlos en memoria (el intérprete, las excepciones). Los valores que se
 // conocen al traducir (lui, addiu sobre constantes, la dirección de vuelta de jal...) ni siquiera se
 // calculan: se escriben directamente donde hagan falta. Lo raro (COP0, LWL/SWR) lo hace el intérprete;
@@ -14,7 +14,13 @@
 // acabarse el tiempo (los dispositivos y las interrupciones lo adelantan), en excepciones y en lo raro.
 //
 // Registros ARM fijos: r11 = &cpu (y psx_cycles, psx_run_until y la scratchpad cerca, en la DTCM),
-// r10 = RAM de la PS1, r9 = dyn_pages. r0-r3 = temporales.
+// r10 = RAM de la PS1, r9 = dyn_pages, r12 = psx_cycles - psx_run_until (negativo mientras quede
+// tiempo: el final de un bloque es un solo ADDS). r0-r3 = temporales. Las llamadas a C pasan por
+// trampolines que ponen psx_cycles en memoria antes y recalculan r12 después.
+//
+// Densidad: en la DSi el código traducido se ejecuta desde la RAM principal y la caché de instrucciones
+// es de 8 KB, así que cada palabra cuenta. Lo que casi nunca se ejecuta (salidas por fin de tiempo,
+// excepciones) va a una zona fría aparte, al final de la caché.
 #ifdef PSX_DYNAREC
 #include "psx.h"
 #include "arm_emit.h"
@@ -33,6 +39,7 @@ typedef u32 *block_fn;   // primera instrucción del bloque; la palabra anterior
 u32 *emit_ptr;
 u8 dyn_pages[DYN_NPAGES];
 static u32 *code_buf, *code_end, *code_start, code_size;
+static u32 *cold_base, *cold_ptr, *hot_save;   // zona fría: [cold_base, code_end)
 // Tabla hash de bloques: la entrada apunta al código y la palabra anterior guarda el PC traducido
 static block_fn *slots;
 static u32 slot_mask;
@@ -52,6 +59,7 @@ static s32 link_head[DYN_NPAGES], link_n, link_max;
 #define RCPU R11
 #define RRAM R10
 #define RPAGES R9
+#define RCYC R12
 #define OFF_R(n) ((int)offsetof(Cpu, r) + (n) * 4)
 #define OFF_HI ((int)offsetof(Cpu, hi))
 #define OFF_LO ((int)offsetof(Cpu, lo))
@@ -87,7 +95,56 @@ static void land(u32 *p)
 	*p = (*p & 0xf0000000) | (5u << 25) | ((u32)off & 0xffffff);
 }
 
+// Emitir en la zona fría (begin_cold ... end_cold); fwd/land funcionan igual entre las dos zonas
+static void begin_cold(void) { hot_save = emit_ptr; emit_ptr = cold_ptr; }
+static void end_cold(void) { cold_ptr = emit_ptr; emit_ptr = hot_save; }
+
 static void emit_handlers(void);
+
+// r12 <-> psx_cycles alrededor de las llamadas a C (usan r2 y r3; r0 y r1 son los argumentos o el resultado)
+static void cycles_out(void)
+{
+	a_ldr(R3, RCPU, off_until);
+	a_dp_reg(C_AL, OP_ADD, 0, R2, RCYC, R3, SH_LSL, 0);
+	a_str(R2, RCPU, off_cyc);
+}
+
+static void cycles_in(void)
+{
+	a_ldr(R2, RCPU, off_cyc);
+	a_ldr(R3, RCPU, off_until);
+	a_dp_reg(C_AL, OP_SUB, 0, RCYC, R2, R3, SH_LSL, 0);
+}
+
+// Llamada a C desde una rutina compartida a la que se llegó con BL (lr guardado alrededor)
+static void call_c_inline(const void *fn)
+{
+	a_push((1u << R12) | (1u << LR));   // r12 solo para que la pila siga alineada a 8
+	cycles_out();
+	a_b(C_AL, 1, fn);
+	cycles_in();
+	a_pop((1u << R3) | (1u << LR));
+}
+
+// Trampolines: el código traducido llama a C con un solo BL
+static u32 h_r32(u32 a), h_r16s(u32 a), h_r16u(u32 a), h_r8s(u32 a), h_r8u(u32 a);
+static void h_w32(u32 a, u32 v), h_w16(u32 a, u32 v), h_w8(u32 a, u32 v);
+static void h_div(s32 n, s32 d), h_divu(u32 n, u32 d);
+static const void *const tramp_fn[] = {
+	(const void *)cpu_dyn_interp, (const void *)cpu_dyn_exception, (const void *)gte_command, (const void *)gte_read,
+	(const void *)gte_write, (const void *)h_div, (const void *)h_divu, (const void *)dyn_smc,
+	(const void *)h_r32, (const void *)h_r16s, (const void *)h_r16u, (const void *)h_r8s, (const void *)h_r8u,
+	(const void *)h_w32, (const void *)h_w16, (const void *)h_w8,
+};
+#define NTRAMP (int)(sizeof tramp_fn / sizeof tramp_fn[0])
+static u32 *tramp_at[NTRAMP];
+
+static const void *tramp(const void *fn)
+{
+	for (int i = 0; i < NTRAMP; i++)
+		if (tramp_fn[i] == fn) return tramp_at[i];
+	return NULL;   // no pasa: todas las funciones llamadas desde el código están en la lista
+}
 
 static void emit_stubs(void)
 {
@@ -99,10 +156,24 @@ static void emit_stubs(void)
 	a_mov(RCPU, R0);
 	a_mov(RRAM, R1);
 	a_mov(RPAGES, R2);
+	a_ldr(R0, RCPU, off_cyc);   // r3 es el cuerpo: aquí no vale cycles_in
+	a_ldr(R1, RCPU, off_until);
+	a_dp_reg(C_AL, OP_SUB, 0, RCYC, R0, R1, SH_LSL, 0);
 	a_bx(R3);
 	// salir a C (cpu.pc ya está guardado)
 	stub_exit = emit_ptr;
+	a_ldr(R1, RCPU, off_until);
+	a_dp_reg(C_AL, OP_ADD, 0, R0, RCYC, R1, SH_LSL, 0);
+	a_str(R0, RCPU, off_cyc);
 	a_pop(0x8ff8);
+	for (int i = 0; i < NTRAMP; i++) {
+		tramp_at[i] = emit_ptr;
+		a_push((1u << R12) | (1u << LR));
+		cycles_out();
+		a_b(C_AL, 1, tramp_fn[i]);
+		cycles_in();
+		a_pop((1u << R2) | (1u << PC));
+	}
 	// salir a C con cpu.pc = la palabra que sigue al BL que llega aquí
 	stub_exit_pc = emit_ptr;
 	a_ldr(R0, LR, 0);
@@ -112,13 +183,17 @@ static void emit_stubs(void)
 	stub_sp_fail = emit_ptr;
 	a_ldr(R0, LR, 0);
 	a_str(R0, RCPU, OFF_PC);
+	a_push((1u << R3) | (1u << R12));
 	{ extern void dyn_sp_fail(u32 pc); a_b(C_AL, 1, (const void *)dyn_sp_fail); }
+	a_pop((1u << R3) | (1u << R12));
 	a_b(C_AL, 0, stub_exit);
 	// enlazar: se llega con BL desde el final de un bloque; la palabra siguiente al BL es el PC destino
 	stub_link = emit_ptr;
 	a_ldr(R0, LR, 0);
 	a_dp_imm(C_AL, OP_SUB, 0, R1, LR, 4);
+	a_push((1u << R3) | (1u << R12));   // traducir no toca el tiempo: r12 sigue valiendo
 	{ extern block_fn dyn_link(u32 target, u32 *site); a_b(C_AL, 1, (const void *)dyn_link); }
+	a_pop((1u << R3) | (1u << R12));
 	a_dp_imm(C_AL, OP_CMP, 1, 0, R0, 0);
 	a_b(C_EQ, 0, stub_exit);
 	a_bx(R0);
@@ -156,6 +231,7 @@ static void emit_stubs(void)
 	a_bx(R2);
 	emit_handlers();
 	code_start = emit_ptr;
+	cold_base = cold_ptr = code_start + (code_end - code_start) * 3 / 4;
 	p = code_buf;
 	sync_code(p, (u32)((u8 *)emit_ptr - (u8 *)p));
 }
@@ -202,7 +278,7 @@ u32 *dyn_code_base(void) { return code_buf; }
 
 void dyn_cache_use(u32 *used, u32 *size)
 {
-	*used = (u32)(emit_ptr - code_buf) * 4;
+	*used = (u32)(emit_ptr - code_buf + cold_ptr - cold_base) * 4;
 	*size = code_size;
 }
 
@@ -215,6 +291,7 @@ static void flush_all(void)
 	link_n = 0;
 	gen++;
 	emit_ptr = code_start;
+	cold_ptr = cold_base;
 }
 
 void dyn_reset(void) { flush_all(); }
@@ -300,8 +377,7 @@ static void h_divu(u32 n, u32 d)
 // host: registro ARM asignado (o -1); valid: el registro ARM tiene el valor; stale: la memoria (cpu.r)
 // no lo tiene; isconst: el valor se conoce al traducir (k)
 static struct { s8 host; u8 valid, stale, isconst; u32 k; } rg[32];
-static const int host_pool[6] = { R4, R5, R6, R7, R8, R12 };
-static int save_r12;   // r12 está asignado: hay que guardarlo alrededor de las llamadas a C
+static const int host_pool[5] = { R4, R5, R6, R7, R8 };
 
 // Pila: si un bloque accede a memoria con sp, se comprueba una vez al entrar que sp apunta a la RAM y
 // r8 guarda su dirección real en la DS; así «lw s0, 20(sp)» es una sola instrucción ARM. Si no apunta
@@ -320,15 +396,8 @@ static int sp_is_unsafe(u32 pc)
 	return sp_unsafe_n >= 200;   // tabla casi llena: este juego no usa la pila en la RAM
 }
 
-static void call(const void *fn) { a_b(C_AL, 1, fn); }
-
-// Llamada a C conservando los registros asignados (r4-r8 los guarda C; r12, nosotros)
-static void call_keep(const void *fn)
-{
-	if (save_r12) a_push((1u << R12) | (1u << LR));
-	call(fn);
-	if (save_r12) a_pop((1u << R12) | (1u << LR));
-}
+// Llamada a C por su trampolín (r4-r8 los conserva C; r0-r3 se pierden)
+static void call(const void *fn) { a_b(C_AL, 1, tramp(fn)); }
 
 // Valor del registro MIPS mr en un registro ARM (el asignado o tmp)
 static int get(int mr, int tmp)
@@ -398,9 +467,8 @@ static void flush_regs(void)
 	}
 }
 
-// Tras una llamada que puede cambiar cpu.r o pisar r12: olvidar lo que ya no vale
-static int r12_owner;   // registro MIPS que vive en r12 (0 = ninguno)
-static void forget(u32 written_mask, int lost_r12)
+// Tras una llamada que puede cambiar cpu.r: olvidar lo que ya no vale
+static void forget(u32 written_mask)
 {
 	if (written_mask & (1u << 29)) hsp_ok = 0;
 	written_mask &= ~1u;
@@ -410,7 +478,6 @@ static void forget(u32 written_mask, int lost_r12)
 		written_mask &= written_mask - 1;
 		rg[i].valid = rg[i].isconst = rg[i].stale = 0;
 	}
-	if (lost_r12 && r12_owner) rg[r12_owner].valid = 0;
 }
 
 // ---- utilidades de emisión ----
@@ -420,20 +487,11 @@ static void set_pc_const(u32 v)
 	a_str(R0, RCPU, OFF_PC);
 }
 
-// psx_cycles += ciclos de ninstr instrucciones; deja el nuevo valor en r0
+// Suma los ciclos de ninstr instrucciones al contador (r12); flags MI si aún queda tiempo
 static void emit_cycles(int ninstr)
 {
-	u32 c = ((u32)ninstr * 2 * psx_cpu_scale) >> 8;
-	a_ldr(R0, RCPU, off_cyc);
-	a_addi(R0, R0, c ? c : 1, R1);
-	a_str(R0, RCPU, off_cyc);
-}
-
-// Tras emit_cycles: r1 = psx_run_until y flags MI si aún queda tiempo
-static void emit_time_check(void)
-{
-	a_ldr(R1, RCPU, off_until);
-	a_dp_reg(C_AL, OP_SUB, 1, R0, R0, R1, SH_LSL, 0);
+	u32 c = ((u32)ninstr * 2 * psx_cpu_scale) >> 8;   // <= 130: cabe como inmediato
+	a_dp_imm(C_AL, OP_ADD, 1, RCYC, RCYC, arm_imm(c ? c : 1));
 }
 
 // Vuelve a C (cpu.pc ya puesto y los registros ya en memoria)
@@ -457,17 +515,18 @@ static void exit_pc(u32 target)
 	emit(target);
 }
 
-// Fin de bloque hacia un PC conocido
+// Fin de bloque hacia un PC conocido; si se acabó el tiempo, la salida está en la zona fría
 static void exit_to(u32 target, int ninstr)
 {
 	u32 *out;
 	flush_regs();
 	emit_cycles(ninstr);
-	emit_time_check();
 	out = fwd(C_PL);
 	link_site(target);
+	begin_cold();
 	land(out);
 	exit_pc(target);
+	end_cold();
 }
 
 // ---- accesos a memoria ----
@@ -475,13 +534,19 @@ static void exit_to(u32 target, int ninstr)
 // rutinas compartidas al principio de la caché, una por tamaño y registro, a las que se llega con BLNE.
 enum { M_W, M_HS, M_HU, M_BS, M_BU };   // tamaño y signo
 static u32 *ld_handler[5][16], *st_handler[5][16], *smc_handler;
-static const int mem_regs[7] = { R2, R4, R5, R6, R7, R8, R12 };   // destinos o valores posibles
+static const int mem_regs[6] = { R2, R4, R5, R6, R7, R8 };   // destinos o valores posibles
 
 // Carga o guarda rd en [rn + off] con la instrucción del tamaño pedido (usa r3 si off no cabe)
 static void mem_off(int cond, int load, int size, int rd, int rn, int off)
 {
 	static const int hsh[5] = { 0, 3, 1, 2, 0 };
-	if (size == M_W || size == M_BU || (!load && size == M_BS)) {
+	int word = size == M_W || size == M_BU || (!load && size == M_BS), lim = word ? 4095 : 255;
+	if ((off < -lim || off > lim) && off > 0 && arm_imm((u32)off & ~(u32)lim) >= 0) {   // base + parte alta, y el resto
+		a_dp_imm(cond, OP_ADD, 0, R3, rn, arm_imm((u32)off & ~(u32)lim));
+		rn = R3;
+		off &= lim;
+	}
+	if (word) {
 		if (off >= -4095 && off <= 4095) a_mem_imm(cond, load, size != M_W, rd, rn, off);
 		else { a_movi(R3, (u32)off); a_mem_reg(cond, load, size != M_W, rd, rn, R3); }
 	} else {
@@ -505,42 +570,37 @@ static void handler_scratch(int load, int size, int r)
 	not_scratch = fwd(C_CS);
 	a_dp_reg(C_AL, OP_ADD, 0, R1, R1, RCPU, SH_LSL, 0);
 	mem_off(C_AL, load, size, r, R1, off_scr);
-	if (!load) a_dp_imm(C_AL, OP_MOV, 0, R3, 0, 0);
 	a_bx(LR);
 	land(not_scratch);
 }
 
 static void emit_handlers(void)
 {
+	// escritura en una página con código traducido: r1 = desplazamiento en RAM << 11
+	smc_handler = emit_ptr;
+	a_dp_reg(C_AL, OP_MOV, 0, R0, 0, R1, SH_LSR, 11);
+	call_c_inline((const void *)dyn_smc);
+	a_bx(LR);
 	for (int sz = 0; sz < 5; sz++)
-		for (int i = 0; i < 7; i++) {
+		for (int i = 0; i < 6; i++) {
 			int r = mem_regs[i];
 			// carga: el valor en r
 			ld_handler[sz][r] = emit_ptr;
 			handler_scratch(1, sz, r);
-			a_push((1u << R12) | (1u << LR));
-			call(rd_fn[sz]);
-			a_pop((1u << R12) | (1u << LR));
+			call_c_inline(rd_fn[sz]);
 			if (r != R0) a_mov(r, R0);
 			a_bx(LR);
-			// escritura del valor de r; vuelve con r3 = 0 (no hay que mirar si había código)
+			// escritura del valor de r: se llega si la dirección no es de la RAM (NE) o si lo es y en su
+			// página había código traducido (EQ, r1 = desplazamiento << 11)
 			if (sz == M_HS || sz == M_BS) continue;
 			st_handler[sz][r] = emit_ptr;
+			a_dp_imm(C_AL, OP_TST, 1, 0, R0, arm_imm(0x1f800000));
+			a_b(C_EQ, 0, smc_handler);
 			handler_scratch(0, sz, r);
 			a_mov(R1, r);
-			a_push((1u << R12) | (1u << LR));
-			call(wr_fn[sz]);
-			a_pop((1u << R12) | (1u << LR));
-			a_dp_imm(C_AL, OP_MOV, 0, R3, 0, 0);
+			call_c_inline(wr_fn[sz]);
 			a_bx(LR);
 		}
-	// escritura en una página con código traducido: r1 = desplazamiento en RAM << 11
-	smc_handler = emit_ptr;
-	a_dp_reg(C_AL, OP_MOV, 0, R0, 0, R1, SH_LSR, 11);
-	a_push((1u << R12) | (1u << LR));
-	call(dyn_smc);
-	a_pop((1u << R12) | (1u << LR));
-	a_bx(LR);
 }
 
 static int ram_const(u32 a, u32 *off)   // dirección fija en RAM: desplazamiento
@@ -568,7 +628,7 @@ static void load_to(int size, int rs, u32 simm, int d)
 		else if (scratch_const(a, &off)) mem_off(C_AL, 1, size, d, RCPU, off_scr + (int)off);
 		else {
 			a_movi(R0, a);
-			call_keep(rd_fn[size]);
+			call(rd_fn[size]);
 			if (d != R0) a_mov(d, R0);
 		}
 		return;
@@ -598,19 +658,23 @@ static void store_from(int size, int rs, u32 simm, int v)
 	if (is_const(rs)) {
 		u32 a = const_of(rs) + simm, off;
 		if (ram_const(a, &off)) {
-			u32 *skip;
+			u32 *smc, *back;
 			mem_off(C_AL, 0, size, v, RRAM, (int)off);
 			a_mem_imm(C_AL, 1, 1, R3, RPAGES, (int)(off >> DYN_PAGE_BITS));
 			a_dp_imm(C_AL, OP_CMP, 1, 0, R3, 0);
-			skip = fwd(C_EQ);
+			smc = fwd(C_NE);
+			back = emit_ptr;
+			begin_cold();
+			land(smc);
 			a_movi(R0, off);
-			call_keep(dyn_smc);
-			land(skip);
+			call(dyn_smc);
+			a_b(C_AL, 0, back);
+			end_cold();
 		} else if (scratch_const(a, &off)) mem_off(C_AL, 0, size, v, RCPU, off_scr + (int)off);
 		else {
 			a_movi(R0, a);
 			if (v != R1) a_mov(R1, v);
-			call_keep(wr_fn[size]);
+			call(wr_fn[size]);
 		}
 		return;
 	}
@@ -623,9 +687,8 @@ static void store_from(int size, int rs, u32 simm, int v)
 		a_memh_reg(C_EQ, 0, 1, v, RRAM, R3);
 	}
 	a_mem_regsh(C_EQ, 1, 1, R3, RPAGES, R1, SH_LSR, 11 + DYN_PAGE_BITS);   // ¿había código traducido en esa página?
-	a_b(C_NE, 1, st_handler[size][v]);                     // (vuelve con r3 = 0)
-	a_dp_imm(C_AL, OP_CMP, 1, 0, R3, 0);
-	a_b(C_NE, 1, smc_handler);
+	a_dp_imm(C_EQ, OP_CMP, 1, 0, R3, 0);
+	a_b(C_NE, 1, st_handler[size][v]);   // E/S o scratchpad (NE del TST) o página con código
 }
 
 static void emit_store(int size, int rs, int rt, u32 simm)
@@ -642,10 +705,12 @@ static void emit_interp(u32 op, u32 pc, int ninstr)
 	a_movi(R1, pc);
 	call(cpu_dyn_interp);
 	a_dp_imm(C_AL, OP_CMP, 1, 0, R0, 0);
-	ok = fwd(C_EQ);
-	exit_block(ninstr);
+	ok = fwd(C_NE);
+	begin_cold();
 	land(ok);
-	forget((1u << ((op >> 16) & 31)) | (1u << ((op >> 11) & 31)), 1);
+	exit_block(ninstr);
+	end_cold();
+	forget((1u << ((op >> 16) & 31)) | (1u << ((op >> 11) & 31)));
 }
 
 static int is_branch(u32 op)
@@ -743,11 +808,9 @@ static void alloc_regs(u32 pc)
 	}
 	memset(rg, 0, sizeof rg);
 	for (int i = 0; i < 32; i++) rg[i].host = -1;
-	save_r12 = 0;
-	r12_owner = 0;
 	stale_mask = 0;
 	use_hsp = hsp_ok = sp_ops >= 2 && lin(pc) < 0x200000 && !sp_is_unsafe(pc);
-	for (int h = 0; h < 6 && seen; h++) {
+	for (int h = 0; h < 5 && seen; h++) {
 		if (use_hsp && host_pool[h] == RHSP) continue;
 		int best = 0;
 		for (u32 m = seen; m; m &= m - 1) {
@@ -757,7 +820,6 @@ static void alloc_regs(u32 pc)
 		if (!best || uses[best] < 2) break;
 		seen &= ~(1u << best);
 		rg[best].host = (s8)host_pool[h];
-		if (host_pool[h] == R12) { save_r12 = 1; r12_owner = best; }
 	}
 }
 
@@ -778,6 +840,56 @@ static u32 alu_fold(int f, u32 a, u32 b)
 	case 0x2b: return a < b;
 	}
 	return 0;
+}
+
+// ---- registros de la GTE ----
+// Los simples (gte_reg_parts) se copian en línea: están en la DTCM, normalmente a tiro de r11
+static void gte_part_mem(int load, const GteRegPart *p, int rd)
+{
+	int off = (int)((u8 *)p->addr - (u8 *)&cpu), lim = p->bits == 32 ? 4095 : 255, base = RCPU;
+	if (off < -lim || off > lim) {
+		a_movi(R1, (u32)(uintptr_t)p->addr);
+		base = R1;
+		off = 0;
+	}
+	if (p->bits == 32) a_mem_imm(C_AL, load, 0, rd, base, off);
+	else a_memh_imm(C_AL, load, load && p->sign ? 3 : 1, rd, base, off);
+}
+
+// Registro reg de la GTE (0-63) en el registro ARM d (ni r1 ni r3)
+static void gte_to(int reg, int d)
+{
+	GteRegPart p[2];
+	int n = gte_reg_parts(reg, 0, p);
+	if (!n) {
+		a_movi(R0, (u32)reg);
+		call(gte_read);
+		if (d != R0) a_mov(d, R0);
+		return;
+	}
+	gte_part_mem(1, &p[0], d);
+	if (n == 2) {
+		gte_part_mem(1, &p[1], R3);
+		a_dp_reg(C_AL, OP_ORR, 0, d, d, R3, SH_LSL, 16);
+	}
+}
+
+// Registro ARM v (ni r0, ni r1 ni r3) al registro reg de la GTE
+static void gte_from(int reg, int v)
+{
+	GteRegPart p[2];
+	int n = gte_reg_parts(reg, 1, p);
+	if (!n) {
+		a_mov(R1, v);
+		a_movi(R0, (u32)reg);
+		call(gte_write);
+		return;
+	}
+	gte_part_mem(0, &p[0], v);
+	if (n == 2) {
+		a_dp_reg(C_AL, OP_MOV, 0, R3, 0, v, SH_LSR, 16);
+		gte_part_mem(0, &p[1], R3);
+	}
 }
 
 // Traduce una instrucción que no es salto. Devuelve 0 si termina el bloque.
@@ -846,7 +958,7 @@ static int emit_op(u32 op, u32 pc, int ninstr)
 			int a = get(rs, R0), b = get(rt, R1);   // a es r0 o asignado; b, r1 o asignado
 			if (a != R0) a_mov(R0, a);
 			if (b != R1) a_mov(R1, b);
-			call_keep((op & 0x3f) == 0x1a ? (const void *)h_div : (const void *)h_divu);
+			call((op & 0x3f) == 0x1a ? (const void *)h_div : (const void *)h_divu);
 			return 1;
 		}
 		case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27: {
@@ -960,25 +1072,19 @@ static int emit_op(u32 op, u32 pc, int ninstr)
 	case 0x12:   // COP2 (GTE): directo, sin pasar por el intérprete
 		if (op & (1 << 25)) {
 			a_movi(R0, op);
-			call_keep(gte_command);
+			call(gte_command);
 			return 1;
 		}
 		switch (rs) {
 		case 0x00: case 0x02: {   // MFC2, CFC2
 			int d = dst(rt, R0);
-			a_movi(R0, rd + (rs == 2 ? 32 : 0));
-			call_keep(gte_read);
-			if (d != R0) a_mov(d, R0);
+			gte_to((int)rd + (rs == 2 ? 32 : 0), d);
 			put(rt, d);
 			return 1;
 		}
-		case 0x04: case 0x06: {   // MTC2, CTC2
-			int v = get(rt, R1);
-			if (v != R1) a_mov(R1, v);
-			a_movi(R0, rd + (rs == 6 ? 32 : 0));
-			call_keep(gte_write);
+		case 0x04: case 0x06:   // MTC2, CTC2
+			gte_from((int)rd + (rs == 6 ? 32 : 0), get(rt, R2));
 			return 1;
-		}
 		}
 		break;
 	case 0x20: emit_load(M_BS, rs, rt, simm); return 1;   // LB
@@ -991,14 +1097,10 @@ static int emit_op(u32 op, u32 pc, int ninstr)
 	case 0x2b: emit_store(M_W, rs, rt, simm); return 1;   // SW
 	case 0x32:   // LWC2
 		load_to(M_W, rs, simm, R2);
-		a_mov(R1, R2);
-		a_movi(R0, rt);
-		call_keep(gte_write);
+		gte_from((int)rt, R2);
 		return 1;
 	case 0x3a:   // SWC2
-		a_movi(R0, rt);
-		call_keep(gte_read);
-		a_mov(R2, R0);
+		gte_to((int)rt, R2);
 		store_from(M_W, rs, simm, R2);
 		return 1;
 	}
@@ -1091,7 +1193,7 @@ static int vsync_poll_call(u32 pc)
 	return 0;
 }
 
-// Tras emit_time_check (r1 = psx_run_until, flags MI): saltar la espera hasta el siguiente evento
+// Saltar la espera hasta el siguiente evento
 static void emit_idle(u32 target)
 {
 #ifdef PSX_PROFILE
@@ -1100,7 +1202,7 @@ static void emit_idle(u32 target)
 	a_dp_imm(C_AL, OP_ADD, 0, R3, R3, 1);
 	a_str(R3, R2, 0);
 #endif
-	a_str(R1, RCPU, off_cyc);   // psx_cycles = psx_run_until
+	a_dp_imm(C_AL, OP_MOV, 0, RCYC, 0, 0);   // psx_cycles = psx_run_until
 	exit_pc(target);
 }
 
@@ -1137,11 +1239,12 @@ static void branch_operands(u32 op, int *a, int *b, int tmp1, int tmp2)
 // Traduce el bloque que empieza en pc; NULL si no se puede (se interpretará)
 static block_fn compile(u32 pc, block_fn *s)
 {
-	u32 *start, *entry, cur = pc;
+	u32 *start, *entry, *cold_start, cur = pc;
 	int n = 0;
 
-	if (emit_ptr + MAX_BLOCK * 48 + 512 > code_end) flush_all();
+	if (emit_ptr + MAX_BLOCK * 48 + 512 > cold_base || cold_ptr + MAX_BLOCK * 16 + 256 > code_end) flush_all();
 	start = emit_ptr;
+	cold_start = cold_ptr;
 	alloc_regs(pc);
 	emit(pc);   // cabecera: el PC virtual con el que se tradujo
 	entry = emit_ptr;
@@ -1168,7 +1271,7 @@ static block_fn compile(u32 pc, block_fn *s)
 			int dynamic = 0, cond_kind = 0, link_reg = 0;   // cond_kind: 0 = siempre, 1 = condicional, 2 = nunca
 			int late, a, b;
 			if (is_branch(dop) || ends_block(dop)) {
-				if (n == 1) { emit_ptr = start; return NULL; }   // que lo haga el intérprete
+				if (n == 1) { emit_ptr = start; cold_ptr = cold_start; return NULL; }   // que lo haga el intérprete
 				flush_regs();
 				set_pc_const(cur);
 				exit_block(n - 1);
@@ -1219,7 +1322,6 @@ static block_fn compile(u32 pc, block_fn *s)
 				if (late) t = get(rs, R2);
 				else a_ldr(R2, RCPU, off_tmp);
 				emit_cycles(n);
-				emit_time_check();
 				a_str(t, RCPU, OFF_PC);
 				a_mov(R0, t);
 				a_b(C_MI, 0, stub_dispatch);
@@ -1229,11 +1331,12 @@ static block_fn compile(u32 pc, block_fn *s)
 			else if (cond_kind == 0) {   // «j .»: esperar a una interrupción
 				u32 *out;
 				emit_cycles(n);
-				emit_time_check();
 				out = fwd(C_PL);
 				emit_idle(target);
+				begin_cold();
 				land(out);
 				exit_pc(target);
+				end_cold();
 			} else {
 				u32 *out, *not_taken, *taken_exit;
 				int idle = (target == pc || psyq_vsync(target) || vsync_poll_call(target)) && pure_loop(pc, cur), c;
@@ -1241,7 +1344,6 @@ static block_fn compile(u32 pc, block_fn *s)
 				if (late) branch_operands(op, &a, &b, R2, R3);
 				else { a_ldr(R2, RCPU, off_tmp); a = R2; b = -1; }
 				emit_cycles(n);
-				emit_time_check();
 				out = fwd(C_PL);
 				if (late) c = branch_cond(op, a, b);
 				else { a_dp_imm(C_AL, OP_CMP, 1, 0, R2, 0); c = C_NE; }
@@ -1250,6 +1352,7 @@ static block_fn compile(u32 pc, block_fn *s)
 				else link_site(target);
 				land(not_taken);
 				link_site(cur + 8);
+				begin_cold();   // sin tiempo: volver a C por el camino que toque
 				land(out);
 				if (late) c = branch_cond(op, a, b);
 				else { a_dp_imm(C_AL, OP_CMP, 1, 0, R2, 0); c = C_NE; }
@@ -1257,6 +1360,7 @@ static block_fn compile(u32 pc, block_fn *s)
 				exit_pc(cur + 8);
 				land(taken_exit);
 				exit_pc(target);
+				end_cold();
 			}
 			cur += 4;
 			break;
@@ -1270,15 +1374,18 @@ static block_fn compile(u32 pc, block_fn *s)
 	}
 
 	if (use_hsp) {   // salida de los fallos de la comprobación de entrada
+		begin_cold();
 		land(sp_fail[0]);
 		land(sp_fail[1]);
 		a_b(C_AL, 1, stub_sp_fail);
 		emit(pc);
+		end_cold();
 	}
 	mark_pages(pc, cur);
 	STAT_ADD(dyn_mips, (cur - pc) / 4 + 1);
-	STAT_ADD(dyn_arm, (u32)(emit_ptr - start));
+	STAT_ADD(dyn_arm, (u32)(emit_ptr - start));   // solo la zona caliente
 	sync_code(start, (u32)((u8 *)emit_ptr - (u8 *)start));
+	if (cold_ptr != cold_start) sync_code(cold_start, (u32)((u8 *)cold_ptr - (u8 *)cold_start));
 	*s = entry;
 	return entry;
 }

@@ -251,6 +251,7 @@ int main(int argc, char **argv)
 		if (!strcmp(argv[i], "--lbas") && i + 1 < argc) lba_log = fopen(argv[i + 1], "a");
 		if (!strcmp(argv[i], "--frameskip") && i + 1 < argc) gpu_frameskip = (u8)atoi(argv[i + 1]);
 		if (!strcmp(argv[i], "--rows") && i + 1 < argc) rows_mode = ds_rows = atoi(argv[i + 1]);
+		if (!strcmp(argv[i], "--halfx")) gpu_half_x = 1;
 		// (se aplica tras psx_init)   // como la DS: 1 = filas que se ven, 2 = pares
 	}
 	if (want_prof) {
@@ -284,6 +285,9 @@ int main(int argc, char **argv)
 	t0 = clock();
 	for (int f = 1; f <= frames; f++) {
 		profiling = f > frames - 60;
+#ifdef PSX_OPSTAT
+		{ extern int psx_opstat_on; psx_opstat_on = profiling; }
+#endif
 		// --press F:boton mantiene el botón pulsado 6 frames desde el frame F
 		psx_pad_buttons = 0xffff;
 		for (int i = 1; i + 1 < argc; i++) {
@@ -344,6 +348,13 @@ int main(int argc, char **argv)
 	for (int i = 1; i + 1 < argc; i++)
 		if (!strcmp(argv[i], "--ref")) printf("VRAM_DIFF %d\n", vram_diff(argv[i + 1]));
 	if (want_prof) report_profile();
+#ifdef PSX_OPSTAT
+	{   // instrucciones por frame en los 60 últimos frames, por tipo
+		extern u32 psx_opstat[18];
+		static const char *const nm[18] = { "total", "en_delay", "nop", "lw_sp", "lw_ram", "lw_scr", "lw_io", "sw_sp", "sw_ram", "sw_scr", "sw_io", "gte_cmd", "gte_mov", "mul_div_hilo", "jr", "saltos", "cop0", "alu" };
+		for (int k = 0; k < 18; k++) printf("OPSTAT %-13s %8.0f/frame  %5.1f%%\n", nm[k], psx_opstat[k] / 60.0, 100.0 * psx_opstat[k] / (psx_opstat[0] ? psx_opstat[0] : 1));
+	}
+#endif
 	for (int i = 1; i + 1 < argc; i++)
 		if (!strcmp(argv[i], "--mem")) {   // volcado de memoria: --mem dirección
 			u32 a = (u32)strtoul(argv[i + 1], NULL, 16);

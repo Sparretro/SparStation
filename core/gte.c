@@ -4,12 +4,12 @@
 
 // Los registros van en la DTCM (PSX_FAST): se tocan en cada operación
 PSX_FAST static s16 V[3][3];
-PSX_FAST static u8 RGBC[4];
+PSX_FAST static u8 RGBC[4] __attribute__((aligned(4)));
 PSX_FAST static u16 OTZ;
 PSX_FAST static s16 IR[4];
 PSX_FAST static s16 SX[3], SY[3];
 PSX_FAST static u16 SZ[4];
-PSX_FAST static u8 CF[3][4];   // FIFO de colores RGB0..RGB2
+PSX_FAST static u8 CF[3][4] __attribute__((aligned(4)));   // FIFO de colores RGB0..RGB2
 PSX_FAST static u32 RES1;
 PSX_FAST static s32 MAC[4];
 PSX_FAST static u32 LZCS, LZCR;
@@ -126,6 +126,54 @@ void gte_write(int r, u32 v)
 	case 62: ZSF4 = (s16)v; break;
 	case 63: FLAG = v & 0x7ffff000; break;
 	}
+}
+
+static int part2(GteRegPart *p, void *lo, void *hi)
+{
+	p[0].addr = lo; p[0].bits = 16; p[0].sign = 0;
+	p[1].addr = hi; p[1].bits = 16; p[1].sign = 0;
+	return 2;
+}
+
+static int part1(GteRegPart *p, void *a, int bits, int sign)
+{
+	p[0].addr = a; p[0].bits = (u8)bits; p[0].sign = (u8)sign;
+	return 1;
+}
+
+int gte_reg_parts(int r, int write, GteRegPart p[2])
+{
+	if (r >= 32 && r < 56 && (r & 7) < 5) {   // matrices RT, LM y LC: pares de s16 seguidos
+		s16 *m = r < 40 ? &RT[0][0] : r < 48 ? &LM[0][0] : &LC[0][0];
+		int k = r & 7;
+		return k < 4 ? part2(p, m + 2 * k, m + 2 * k + 1) : part1(p, m + 8, 16, 1);
+	}
+	switch (r) {
+	case 0: case 2: case 4: return part2(p, &V[r / 2][0], &V[r / 2][1]);
+	case 1: case 3: case 5: return part1(p, &V[r / 2][2], 16, 1);
+	case 6: return part1(p, RGBC, 32, 0);
+	case 7: return part1(p, &OTZ, 16, 0);
+	case 8: case 9: case 10: case 11: return part1(p, &IR[r - 8], 16, 1);
+	case 12: case 13: case 14: return part2(p, &SX[r - 12], &SY[r - 12]);
+	case 15: return write ? 0 : part2(p, &SX[2], &SY[2]);   // escribir SXYP mueve la FIFO
+	case 16: case 17: case 18: case 19: return part1(p, &SZ[r - 16], 16, 0);
+	case 20: case 21: case 22: return part1(p, CF[r - 20], 32, 0);
+	case 23: return part1(p, &RES1, 32, 0);
+	case 24: case 25: case 26: case 27: return part1(p, &MAC[r - 24], 32, 0);
+	case 30: return write ? 0 : part1(p, &LZCS, 32, 0);
+	case 31: return write ? 0 : part1(p, &LZCR, 32, 0);
+	case 37: case 38: case 39: return part1(p, &TR[r - 37], 32, 0);
+	case 45: case 46: case 47: return part1(p, &BK[r - 45], 32, 0);
+	case 53: case 54: case 55: return part1(p, &FC[r - 53], 32, 0);
+	case 56: return part1(p, &OFX, 32, 0);
+	case 57: return part1(p, &OFY, 32, 0);
+	case 58: return part1(p, &H, 16, 1);   // se lee con signo (ver gte_read)
+	case 59: return part1(p, &DQA, 16, 1);
+	case 60: return part1(p, &DQB, 32, 0);
+	case 61: return part1(p, &ZSF3, 16, 1);
+	case 62: return part1(p, &ZSF4, 16, 1);
+	}
+	return 0;   // IRGB/ORGB, LZCS al escribir, FLAG: con gte_read/gte_write
 }
 
 // ---- aritmética con banderas ----

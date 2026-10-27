@@ -120,8 +120,8 @@ static int open_disc(const char *path)
 
 // Ajustes de velocidad: se eligen en la lista de juegos y se guardan en la SD
 #define CFG_PATH GAMES_DIR "/sparstation.cfg"
-static int opt_quality, opt_skip, opt_cpu;   // calidad 0-2, frames saltados 0-3, CPU 0-2
-static const char *const quality_name[3] = { "normal", "rapida", "muy rapida" };
+static int opt_quality, opt_skip, opt_cpu;   // calidad 0-3, frames saltados 0-3, CPU 0-2
+static const char *const quality_name[4] = { "normal", "rapida", "muy rapida", "baja res" };
 static const int cpu_pct[3] = { 100, 85, 70 };
 
 static void load_cfg(void)
@@ -130,7 +130,7 @@ static void load_cfg(void)
 	if (!f) return;
 	if (fscanf(f, "calidad=%d saltar=%d cpu=%d", &opt_quality, &opt_skip, &opt_cpu) != 3) opt_quality = opt_skip = opt_cpu = 0;
 	fclose(f);
-	if (opt_quality < 0 || opt_quality > 2) opt_quality = 0;
+	if (opt_quality < 0 || opt_quality > 3) opt_quality = 0;
 	if (opt_skip < 0 || opt_skip > 3) opt_skip = 0;
 	if (opt_cpu < 0 || opt_cpu > 2) opt_cpu = 0;
 }
@@ -145,7 +145,8 @@ static void save_cfg(void)
 
 static void apply_cfg(void)
 {
-	gpu_rows_for(opt_quality, 192);
+	gpu_rows_for(opt_quality > 2 ? 2 : opt_quality, 192);
+	gpu_half_x = opt_quality == 3;   // baja res: además, la mitad de los píxeles de cada línea
 	gpu_frameskip = (u8)opt_skip;
 	psx_cpu_scale = (u16)(256 * 100 / cpu_pct[opt_cpu]);
 }
@@ -173,14 +174,14 @@ static int pick_game(char *out, size_t outlen)
 		printf("L/R    calidad: %s\n", quality_name[opt_quality]);
 		printf("SELECT saltar frames: %d\n", opt_skip);
 		printf("Y      CPU PS1: %d%%\n", cpu_pct[opt_cpu]);
-		printf("\x1b[37mrapida: no dibuja lo que la DS\nno ensena. muy rapida: la mitad\nde las lineas.\x1b[37;1m\n");
+		printf("\x1b[37mrapida: solo lo visible. muy\nrapida: 1/2 lineas. baja res:\ntambien 1/2 de cada linea 3D.\x1b[37;1m\n");
 		printf("\nA: jugar");
 		fflush(stdout);
 		do { swiWaitForVBlank(); scanKeys(); keys = keysDown(); } while (!keys);
 		if (keys & KEY_UP) sel = (sel + n - 1) % n;
 		if (keys & KEY_DOWN) sel = (sel + 1) % n;
-		if (keys & KEY_R) opt_quality = (opt_quality + 1) % 3;
-		if (keys & KEY_L) opt_quality = (opt_quality + 2) % 3;
+		if (keys & KEY_R) opt_quality = (opt_quality + 1) % 4;
+		if (keys & KEY_L) opt_quality = (opt_quality + 3) % 4;
 		if (keys & KEY_SELECT) opt_skip = (opt_skip + 1) % 4;
 		if (keys & KEY_Y) opt_cpu = (opt_cpu + 1) % 3;
 		if (keys & KEY_A) break;
@@ -322,7 +323,7 @@ static void present(void)
 {
 	static u16 xmap[256], ymap[192];
 	static int last_w, last_h, last_even;
-	int w = gpu_disp.width, h = gpu_disp.height, even = opt_quality == 2 && !gpu_disp.color24;
+	int w = gpu_disp.width, h = gpu_disp.height, even = opt_quality >= 2 && !gpu_disp.color24;
 	u32 *dst32;
 
 	if (gpu_disp.stale && !gpu_disp.disabled) return;   // el juego enseña un frame que no se dibujó: dejar el anterior
@@ -477,7 +478,7 @@ int main(void)
 	fb[1] = fb[0] + 256 * 256;   // banco B, base de mapa 8
 	dmaFillHalfWords(0x8000, fb[0], 2 * 256 * 256 * 2);
 
-	printf("SparStation v3 - PS1 en DSi\nby Spar Retro\n\n");
+	printf("SparStation v4 - PS1 en DSi\nby Spar Retro\n\n");
 #ifdef PSX_SELFTEST
 	if (!nitroFSInit(NULL) || !pak_init() || !load_bios()) {
 		printf("Pruebas: falta nitro:/bios.bin\no el Expansion Pak.\n");
@@ -517,6 +518,10 @@ int main(void)
 				fclose(sf);
 			}
 			load_script("nitro:/press.txt");
+#ifdef BENCH_QUALITY
+			opt_quality = BENCH_QUALITY;   // make SELFTEST=1 EXTRA=-DBENCH_QUALITY=n: medir con esa calidad
+			apply_cfg();
+#endif
 		}
 		irqSet(IRQ_VBLANK, on_vblank);
 		run_loop(psx_tty ? NULL : "modo DS (prueba)", 0);

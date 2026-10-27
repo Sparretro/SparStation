@@ -339,6 +339,11 @@ static void execute(u32 op)
 	}
 }
 
+#ifdef PSX_OPSTAT
+u32 psx_opstat[18];   // perfil de instrucciones en el PC (ver pc/main.c --opstat)
+int psx_opstat_on;
+#endif
+
 #ifdef PSX_BLOCKY
 // Imita los tiempos del dynarec en el PC: los ciclos se suman por bloques y las interrupciones
 // y eventos solo se atienden entre bloques (tras el delay slot de un salto o cada 64 instrucciones).
@@ -397,6 +402,25 @@ void cpu_run(u32 until)
 				mips_dis(cpu.pc, op);
 				if (--trace_live == 0) printf("--- fin de traza ---\n");
 			}
+		}
+#endif
+#ifdef PSX_OPSTAT
+		if (psx_opstat_on) {
+			u32 o = op >> 26, base = (op >> 21) & 31, a = R(base) + (u32)(s32)(s16)op, k;
+			int ram = (a & 0x1fffffff) < 0x800000, scr = (a & 0x1ffffc00) == 0x1f800000;
+			psx_opstat[0]++;
+			if (cpu.in_delay) psx_opstat[1]++;
+			if (op == 0) k = 2;
+			else if (o >= 0x20 && o <= 0x26) k = base == 29 ? 3 : ram ? 4 : scr ? 5 : 6;
+			else if (o >= 0x28 && o <= 0x2e) k = base == 29 ? 7 : ram ? 8 : scr ? 9 : 10;
+			else if (o == 0x12) k = (op & (1 << 25)) ? 11 : 12;
+			else if (o == 0x32 || o == 0x3a) k = 12;
+			else if (o == 0 && (op & 0x3f) >= 0x10 && (op & 0x3f) <= 0x1b) k = 13;
+			else if (o == 0 && ((op & 0x3f) == 8 || (op & 0x3f) == 9)) k = 14;
+			else if (o >= 1 && o <= 7) k = 15;
+			else if (o == 0x10) k = 16;
+			else k = 17;
+			psx_opstat[k]++;
 		}
 #endif
 		cpu.pc = cpu.next_pc;
