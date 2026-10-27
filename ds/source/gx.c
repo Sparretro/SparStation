@@ -243,7 +243,8 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 	static const u8 alpha_of[5] = { 31, 16, 16, 14, 8 };   // opaco, B/2+F/2, B+F, B-F, B+F/4 (aproximados)
 	static const int order[4] = { 0, 1, 3, 2 };            // cuadrado de la PS1 -> perímetro de la DS
 	int w = gpu_disp.width, h = gpu_disp.height;
-	s32 kx = (8192 << 8) / w, ky = (8192 << 8) / h;
+	static int last_w, last_h;
+	static s32 kx, ky;   // escala a coordenadas de la DS (4.12) por píxel, en 24.8: se recalcula si cambia la resolución
 	u32 attr, teximg = 0, pltt = 0, *o;
 	s32 z;
 	int lum = 24, alpha, white = 0, black = 0;
@@ -252,6 +253,7 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 	// del color de los vértices en el alfa del polígono.
 	int addlike = p->semi >= 2, a3 = 0, vb = 0, ramp = 0;   // a3 (A3I5 por página) desactivado: llenaba la caché
 	if (npolys >= MAX_POLYS) return;
+	if (w != last_w || h != last_h) { kx = (8192 << 8) / w; ky = (8192 << 8) / h; last_w = w; last_h = h; }
 	// Con el bit de máscara (comprobar y poner) la PS1 solo pinta sobre lo que no lo tiene: en Silent Hill son
 	// velos de niebla que tiñen solo al personaje (el fondo y la niebla ya tienen la marca). La DS no puede
 	// limitarlos así y saldrían como un recuadro: mejor no dibujarlos.
