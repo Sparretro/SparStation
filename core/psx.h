@@ -82,6 +82,8 @@ void dyn_ram_written(u32 ram_off, u32 len);
 int dyn_init(int big);
 void dyn_run(u32 until);
 void dyn_cache_use(u32 *used, u32 *size);   // bytes de la caché de código ocupados / total
+void dyn_regions(u32 r[6]);   // zonas de la caché de código (para el perfilador)
+u32 dyn_block_of(u32 arm_pc);   // PC MIPS del bloque traducido que contiene esa dirección (0 = ninguno)
 #define DYN_CHECK_WRITE(off) do { if (dyn_pages[((off) & 0x1fffff) >> DYN_PAGE_BITS]) dyn_smc((off) & 0x1fffff); } while (0)
 #else
 #define DYN_CHECK_WRITE(off) do { } while (0)

@@ -36,6 +36,13 @@ DATA     :=
 BUILD    := build_test
 TARGET   := SparStation_test
 endif
+# make PERFIL=1: ROM con el perfilador por muestreo (sd:/ps1/sparstation_prof.bin, ver source/prof.c)
+ifeq ($(PERFIL),1)
+CFLAGS   += -DSPAR_PROF
+BUILD    := build_perfil
+TARGET   := SparStation_perfil
+endif
+
 LIBDIRS  := $(LIBNDS) $(PORTLIBS)
 
 ifneq ($(BUILD),$(notdir $(CURDIR)))

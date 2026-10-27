@@ -40,6 +40,8 @@ u32 *emit_ptr;
 u8 dyn_pages[DYN_NPAGES];
 static u32 *code_buf, *code_end, *code_start, code_size;
 static u32 *cold_base, *cold_ptr, *hot_save;   // zona fría: [cold_base, code_end)
+// Bloques en orden de dirección ARM (para el perfilador): inicio y PC MIPS; se vacía con la caché
+static u32 *blk_arm, *blk_mips, blk_n, blk_max;
 // Tabla hash de bloques: la entrada apunta al código y la palabra anterior guarda el PC traducido
 static block_fn *slots;
 static u32 slot_mask;
@@ -252,6 +254,10 @@ int dyn_init(int big)
 	if (big) {
 		code_size = 3 * 1024 * 1024;
 		code_buf = malloc(code_size);
+		blk_max = 65536;
+		blk_arm = malloc(blk_max * 4);
+		blk_mips = malloc(blk_max * 4);
+		if (!blk_arm || !blk_mips) blk_max = 0;
 	} else {   // en modo DS la memoria va muy justa: lo que quede del montón, dejando 128 KB para lo demás
 		code_size = 64 * 1024;
 #ifdef ARM9
@@ -276,6 +282,7 @@ int dyn_init(int big)
 
 u32 *dyn_code_base(void) { return code_buf; }
 
+
 void dyn_cache_use(u32 *used, u32 *size)
 {
 	*used = (u32)(emit_ptr - code_buf + cold_ptr - cold_base) * 4;
@@ -292,6 +299,7 @@ static void flush_all(void)
 	gen++;
 	emit_ptr = code_start;
 	cold_ptr = cold_base;
+	blk_n = 0;
 }
 
 void dyn_reset(void) { flush_all(); }
@@ -1386,6 +1394,7 @@ static block_fn compile(u32 pc, block_fn *s)
 	STAT_ADD(dyn_arm, (u32)(emit_ptr - start));   // solo la zona caliente
 	sync_code(start, (u32)((u8 *)emit_ptr - (u8 *)start));
 	if (cold_ptr != cold_start) sync_code(cold_start, (u32)((u8 *)cold_ptr - (u8 *)cold_start));
+	if (blk_n < blk_max) { blk_arm[blk_n] = (u32)(uintptr_t)start; blk_mips[blk_n++] = pc; }
 	*s = entry;
 	return entry;
 }
@@ -1467,5 +1476,28 @@ void dyn_run(u32 until)
 		dyn_enter(&cpu, psx_ram, dyn_pages, f);   // corre bloques encadenados hasta psx_run_until
 	}
 	dyn_where = 0;
+}
+
+// Para el perfilador: inicio de la caché, trampolines, rutinas de memoria, bloques, zona fría y final
+void dyn_regions(u32 r[6])
+{
+	r[0] = (u32)(uintptr_t)code_buf;
+	r[1] = (u32)(uintptr_t)tramp_at[0];
+	r[2] = (u32)(uintptr_t)smc_handler;
+	r[3] = (u32)(uintptr_t)code_start;
+	r[4] = (u32)(uintptr_t)cold_base;
+	r[5] = (u32)(uintptr_t)code_end;
+}
+
+// PC MIPS del bloque que contiene la dirección ARM a (0 si no es de un bloque de la zona caliente)
+u32 dyn_block_of(u32 a)
+{
+	u32 lo = 0, hi = blk_n;
+	if (!blk_n || a < blk_arm[0] || a >= (u32)(uintptr_t)emit_ptr) return 0;
+	while (hi - lo > 1) {
+		u32 mid = (lo + hi) / 2;
+		if (blk_arm[mid] <= a) lo = mid; else hi = mid;
+	}
+	return blk_mips[lo];
 }
 #endif

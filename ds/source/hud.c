@@ -11,6 +11,9 @@
 #include "hud.h"
 
 #define LOG_PATH "sd:/ps1/sparstation_log.txt"
+#ifdef SPAR_PROF
+#include "prof.h"
+#endif
 #define HIST 30          // segundos que enseña la gráfica
 #define TICKS_MS 33514   // cpuGetTiming va a 33,51 MHz
 
@@ -218,6 +221,9 @@ void hud_start(const char *game, int use_log, const char *settings)
 		fflush(logf);
 		fsync(fileno(logf));
 	}
+#ifdef SPAR_PROF
+	prof_start(game_name);
+#endif
 }
 
 void hud_frame(u32 ticks)
@@ -236,6 +242,10 @@ static void log_mark(void)
 		fprintf(logf, "# MARCA %lu  t=%s (%lu s)\n", marks, t, seconds);
 		fflush(logf);
 		fsync(fileno(logf));
+#ifdef SPAR_PROF
+		prof_mark(marks);
+		prof_sync();
+#endif
 	}
 	draw();
 }
@@ -298,6 +308,10 @@ void hud_second(int frames, u32 vblanks)
 		        s.st.gpu_pixels / 1000, (u32)((u64)p[PROF_GTE] * 100 / total), s.st.dyn_idle, s.st.io_calls,
 		        s.st.dyn_mips ? s.st.dyn_arm / s.st.dyn_mips : 0, s.st.dyn_mips ? s.st.dyn_arm * 10 / s.st.dyn_mips % 10 : 0);
 		log_lines++;
+#ifdef SPAR_PROF
+		prof_second(seconds);
+		if (log_lines % 10 == 0) prof_sync();
+#endif
 		if (log_lines % 10 == 0) {   // a la tarjeta cada 10 s: si se apaga la consola se pierde poco
 			fflush(logf);
 			fsync(fileno(logf));
