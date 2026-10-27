@@ -268,9 +268,9 @@ typedef void (*span_fn)(u16 *d, int n, s32 u, s32 v, s32 r, s32 gg, s32 b);
 #define SPAN_S(T, G, R) SPAN(T, G, R, 0) SPAN(T, G, R, 1)
 #define SPAN_RS(T, G) SPAN_S(T, G, 0) SPAN_S(T, G, 1)
 SPAN_S(0, 0, 1) SPAN_S(0, 1, 1)
-// textura sin gouraud: casi siempre van por span_f4/span_f8 (más abajo), estos se quedan fuera de la ITCM
+// textura: casi siempre van por span_f4/span_g4... (más abajo), estos se quedan fuera de la ITCM
 #define SPAN_RS_SLOW(T, G) SPAN_SLOW(T, G, 0, 0) SPAN_SLOW(T, G, 0, 1) SPAN_SLOW(T, G, 1, 0) SPAN_SLOW(T, G, 1, 1)
-SPAN_RS_SLOW(1, 0) SPAN_RS(1, 1) SPAN_RS_SLOW(2, 0) SPAN_RS(2, 1)
+SPAN_RS_SLOW(1, 0) SPAN_RS_SLOW(1, 1) SPAN_RS_SLOW(2, 0) SPAN_RS_SLOW(2, 1)
 #define SPAN3(G, R) SPAN_SLOW(3, G, R, 0) SPAN_SLOW(3, G, R, 1)
 SPAN3(0, 0) SPAN3(0, 1) SPAN3(1, 0) SPAN3(1, 1)
 // [textura][gouraud][sin modular][semitransparente]
@@ -353,6 +353,63 @@ SPAN_FAST(span_f4s, TEX_UV4, 1)
 SPAN_FAST(span_f8, TEX_UV8, 0)
 SPAN_FAST(span_f8s, TEX_UV8, 1)
 
+// Textura con gouraud: el color del texel (sin modular, de tex_tab) se multiplica por el color
+// interpolado con una tabla en vez de multiplicar y saturar cada canal
+static u8 mod_lut[256 * 32];   // [color 8 bits][canal 5 bits] = min(31, canal * color >> 7), como modulate()
+static int mod_lut_ready;
+
+static void mod_lut_init(void)
+{
+	for (int c = 0; c < 256; c++)
+		for (int t = 0; t < 32; t++) {
+			int m = (t * c) >> 7;
+			mod_lut[c * 32 + t] = (u8)(m > 31 ? 31 : m);
+		}
+	mod_lut_ready = 1;
+}
+
+#define SPAN_GOUR(NAME, TEX, SEMI) \
+	static PSX_ITCM void NAME(u16 *d, int n, s32 u, s32 v, s32 r, s32 gg, s32 b) \
+	{ \
+		const u16 *page = rs.page; \
+		const s32 du = rs.du, dv = rs.dv, dr = rs.dr, dg = rs.dg, db = rs.db; \
+		const int semi = rs.semi; \
+		(void)semi; \
+		if (n <= 0) return; \
+		prefetch_span(d, n); \
+		for (; n > 0; n--, d++, u += du, v += dv, r += dr, gg += dg, b += db) { \
+			u32 c = TEX(u, v); \
+			if (c & 0x10000) continue; \
+			c = mod_lut[((r >> 11) & 0x1fe0) | (c & 31)] | (mod_lut[((gg >> 11) & 0x1fe0) | ((c >> 5) & 31)] << 5) | \
+			    (mod_lut[((b >> 11) & 0x1fe0) | ((c >> 10) & 31)] << 10) | (c & 0x8000); \
+			if (SEMI && (c & 0x8000)) c = 0x8000 | blend_fast(*d, (u16)c, semi); \
+			*d = (u16)c; \
+		} \
+	}
+SPAN_GOUR(span_g4, TEX_UV4, 0)
+SPAN_GOUR(span_g4s, TEX_UV4, 1)
+SPAN_GOUR(span_g8, TEX_UV8, 0)
+SPAN_GOUR(span_g8s, TEX_UV8, 1)
+
+// Sin textura con gouraud (degradados): el color de 8 bits por canal se queda en 5
+#define SPAN_COLOR(NAME, SEMI) \
+	static PSX_ITCM void NAME(u16 *d, int n, s32 u, s32 v, s32 r, s32 gg, s32 b) \
+	{ \
+		const s32 dr = rs.dr, dg = rs.dg, db = rs.db; \
+		const int semi = rs.semi; \
+		const u32 set = rs.set; \
+		(void)u; (void)v; (void)semi; \
+		if (n <= 0) return; \
+		prefetch_span(d, n); \
+		for (; n > 0; n--, d++, r += dr, gg += dg, b += db) { \
+			u32 c = (u16)((r >> 19) | ((gg >> 19) << 5) | ((b >> 19) << 10)); \
+			if (SEMI) c = blend_fast(*d, (u16)c, semi); \
+			*d = (u16)(c | set); \
+		} \
+	}
+SPAN_COLOR(span_cg, 0)
+SPAN_COLOR(span_cgs, 1)
+
 // Rectángulos (sprites) con textura de 4/8 bits sin voltear: la fila de textura es fija y u avanza de
 // uno en uno, así que basta con el índice dentro de la fila
 #define TEX_ROW(tu, PER, BITS) tex_tab[(row[((tu) & 0xff) / PER] >> (((tu) % PER) * BITS)) & ((1u << BITS) - 1)]
@@ -421,11 +478,18 @@ static span_fn span_setup(int tex, int gouraud, int raw, int semi_on, u32 rgb)
 			}
 		}
 	} else raw = 1;
+	if (!t && gouraud && !rs.check) return semi_on ? span_cgs : span_cg;   // degradados (los rectángulos nunca son gouraud)
 	// el caso más común (ver span_f4): página que no da la vuelta a la VRAM por la derecha
-	if ((t == 1 || (t == 2 && rs.tx <= 1024 - 128)) && !gouraud && !rs.check && !rs.set && rs.mu == 0xff && !rs.ou &&
-	    rs.mv == 0xff && !rs.ov) {
-		tex_tab_build(t == 1 ? 16 : 256, raw ? 1u << 24 : rgb & 0xffffff);
+	if ((t == 1 || (t == 2 && rs.tx <= 1024 - 128)) && !rs.check && !rs.set && rs.mu == 0xff && !rs.ou && rs.mv == 0xff &&
+	    !rs.ov) {
 		rs.page = &psx_vram[rs.ty * 1024 + rs.tx];
+		if (gouraud && !raw) {   // gouraud: la paleta sin modular y el color por píxel (span_g4)
+			if (!mod_lut_ready) mod_lut_init();
+			tex_tab_build(t == 1 ? 16 : 256, 1u << 24);
+			if (t == 1) return semi_on ? span_g4s : span_g4;
+			return semi_on ? span_g8s : span_g8;
+		}
+		tex_tab_build(t == 1 ? 16 : 256, raw ? 1u << 24 : rgb & 0xffffff);
 		if (t == 1) return semi_on ? span_f4s : span_f4;
 		return semi_on ? span_f8s : span_f8;
 	}
@@ -589,7 +653,7 @@ static void triangle(Vtx *v0, Vtx *v1, Vtx *v2, int textured, int gouraud, int s
 			}
 			if (lo <= hi && (!gpu_rows_on || gpu_row_draw[y & 511])) {
 				STAT_ADD(gpu_pixels, hi - lo + 1);
-				STAT_ADD(gpu_px_kind[fn == span_f4 || fn == span_f4s || fn == span_f8 || fn == span_f8s ? 0 : 1], hi - lo + 1);
+				STAT_ADD(gpu_px_kind[fn == span_f4 || fn == span_f4s || fn == span_f8 || fn == span_f8s || fn == span_g4 || fn == span_g4s || fn == span_g8 || fn == span_g8s || fn == span_cg || fn == span_cgs ? 0 : 1], hi - lo + 1);
 				fn(line + lo, hi - lo + 1, (s32)((u32)ur + (u32)dudx * lo), (s32)((u32)vr + (u32)dvdx * lo),
 				   (s32)((u32)rr + (u32)drdx * lo), (s32)((u32)gr + (u32)dgdx * lo), (s32)((u32)br + (u32)dbdx * lo));
 			}
