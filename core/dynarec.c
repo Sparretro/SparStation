@@ -636,16 +636,43 @@ static int scratch_const(u32 a, u32 *off)
 	return 1;
 }
 
-// Registros MIPS escritos hasta ahora en el bloque que se traduce: los demás aún valen lo que en cpu.r
-static u32 blk_written;
+// Valor probable de cada registro MIPS en el punto que se traduce (pv_ok: los que se saben). El bloque se
+// traduce justo antes de ejecutarse: al empezar valen lo que hay en cpu.r, y se siguen las sumas sencillas
+// (addiu v0, s1, 896 con s1 = 1F800000, como hace SH antes de un lwc2)
+static u32 pv[32], pv_ok;
+static void op_regs(u32 op, u32 *r, u32 *w);
 
-// ¿rs + simm apuntará a la scratchpad? El bloque se traduce justo antes de ejecutarse, así que si rs no
-// cambia antes en el bloque su valor actual es el de la primera vez (SH tiene s0 = 1F800000 casi siempre)
+static void pv_start(void)
+{
+	memcpy(pv, cpu.r, sizeof pv);
+	pv[0] = 0;
+	pv_ok = ~0u;
+}
+
+static void pv_after(u32 op)
+{
+	u32 o = op >> 26, rs = (op >> 21) & 31, rt = (op >> 16) & 31, rd = (op >> 11) & 31, r, w;
+	u32 ok_s = (pv_ok >> rs) & 1, ok_t = (pv_ok >> rt) & 1, v = 0;
+	int known = 0, dst = -1;
+	if (o == 0x08 || o == 0x09) { dst = (int)rt; known = ok_s; v = pv[rs] + (u32)(s32)(s16)op; }   // ADDI(U)
+	else if (o == 0x0d) { dst = (int)rt; known = ok_s; v = pv[rs] | (op & 0xffff); }               // ORI
+	else if (o == 0x0f) { dst = (int)rt; known = 1; v = op << 16; }                                 // LUI
+	else if (o == 0 && ((op & 0x3f) == 0x21 || (op & 0x3f) == 0x25)) {                             // ADDU, OR
+		dst = (int)rd; known = ok_s && ok_t;
+		v = (op & 0x3f) == 0x21 ? pv[rs] + pv[rt] : pv[rs] | pv[rt];
+	}
+	op_regs(op, &r, &w);
+	pv_ok &= ~w;
+	if (dst > 0 && known) { pv[dst] = v; pv_ok |= 1u << dst; }
+	pv_ok |= 1;
+}
+
+// ¿rs + simm apuntará a la scratchpad? (SH tiene s0 = 1F800000 casi siempre)
 static int scratch_hint(int rs, u32 simm)
 {
 	u32 a;
-	if (blk_written & (1u << rs)) return 0;
-	a = (cpu.r[rs] + simm) & 0x1fffffff;
+	if (!(pv_ok & (1u << rs))) return 0;
+	a = (pv[rs] + simm) & 0x1fffffff;
 	return (a & ~0x3ffu) == 0x1f800000;
 }
 
@@ -1306,7 +1333,7 @@ static block_fn compile(u32 pc, block_fn *s)
 	if (emit_ptr + MAX_BLOCK * 48 + 512 > cold_base || cold_ptr + MAX_BLOCK * 16 + 256 > code_end) flush_all();
 	start = emit_ptr;
 	cold_start = cold_ptr;
-	blk_written = 0;
+	pv_start();
 	alloc_regs(pc);
 	emit(pc);   // cabecera: el PC virtual con el que se tradujo
 	entry = emit_ptr;
@@ -1428,7 +1455,7 @@ static block_fn compile(u32 pc, block_fn *s)
 			break;
 		}
 		if (op && !emit_op(op, cur, n)) break;
-		{ u32 r, w; op_regs(op, &r, &w); blk_written |= w; }
+		pv_after(op);
 		if (n >= MAX_BLOCK) {
 			exit_to(cur + 4, n);
 			break;
