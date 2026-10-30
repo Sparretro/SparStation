@@ -32,6 +32,10 @@ int main(int argc, char **argv)
 	uint32_t reg[6], pair[2], total = 0, cat[8] = { 0 };
 	static const char *cn[8] = { "bloques traducidos", "zona fria", "trampolines", "rutinas de memoria", "stubs", "BIOS", "funciones C", "?" };
 	static Blk blk[65536];
+	// PROF_FN=función: además, sus direcciones más calientes (para mirarlas con objdump)
+	const char *want = getenv("PROF_FN");
+	static Blk hot[65536];
+	int nhot = 0;
 	int nblk = 0, top = argc > 3 ? atoi(argv[3]) : 30;
 	char line[512];
 	if (argc < 3) { fprintf(stderr, "uso: profrep muestras.bin simbolos.txt [n]\n"); return 1; }
@@ -65,6 +69,12 @@ int main(int argc, char **argv)
 			Sym *s = find(a);
 			c = s ? 6 : 7;
 			if (s) s->n++;
+			if (s && want && !strcmp(s->name, want)) {
+				int i;
+				for (i = 0; i < nhot && hot[i].pc != a; i++) { }
+				if (i == nhot && nhot < 65536) { hot[nhot].pc = a; hot[nhot++].n = 0; }
+				if (i < 65536) hot[i].n++;
+			}
 		}
 		cat[c]++;
 		if (c == 0 && pair[1]) {
@@ -84,5 +94,10 @@ int main(int argc, char **argv)
 	qsort(blk, nblk, sizeof(Blk), by_n_blk);
 	printf("bloques MIPS (%d distintos):\n", nblk);
 	for (int i = 0; i < 15 && i < nblk; i++) printf("  %5.1f%%  %08x\n", blk[i].n * 100.0 / total, blk[i].pc);
+	if (want) {
+		qsort(hot, nhot, sizeof(Blk), by_n_blk);
+		printf("direcciones de %s:\n", want);
+		for (int i = 0; i < 40 && i < nhot; i++) printf("  %5.2f%%  %08x\n", hot[i].n * 100.0 / total, hot[i].pc);
+	}
 	return 0;
 }

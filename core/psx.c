@@ -108,9 +108,9 @@ static void run_until(u32 end)
 		if (sio_next_event(&w) && TIME_BEFORE(w, t)) t = w;
 		if (!TIME_BEFORE(psx_cycles, t)) t = psx_cycles + 1;
 #ifdef PSX_DYNAREC
-		{ PROF_BEGIN(); dyn_run(t); PROF_END(PROF_CPU); }
+		dyn_run(t);   // el tiempo de CPU se mide una vez por frame (psx_run_frame): por línea costaba ~2%
 #else
-		{ PROF_BEGIN(); cpu_run(t); PROF_END(PROF_CPU); }
+		cpu_run(t);
 #endif
 		timers_advance(psx_cycles - start);
 		cdrom_tick();
@@ -121,6 +121,10 @@ static void run_until(u32 end)
 void psx_run_frame(void)
 {
 	u32 line_start = psx_cycles;
+#ifdef PSX_PROFILE
+	u32 disc0 = psx_prof[PROF_DISC];
+	PROF_BEGIN();
+#endif
 	gpu_disp.frame_done = 0;
 	for (int line = 0; line < PSX_LINES; line++) {
 		gpu_set_line(line);
@@ -133,6 +137,10 @@ void psx_run_frame(void)
 			gpu_vblank();
 		}
 	}
+#ifdef PSX_PROFILE
+	PROF_END(PROF_CPU);
+	psx_prof[PROF_CPU] -= psx_prof[PROF_DISC] - disc0;   // el disco va fuera de la CPU
+#endif
 }
 
 // ---- SPU: de momento solo guarda registros y RAM de sonido para que los juegos no se cuelguen ----

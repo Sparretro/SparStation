@@ -30,7 +30,10 @@ static void tm_add(int i, u32 n)
 	// llega al objetivo al pasar de debajo a >= objetivo; en modo «reinicia» cuenta 0..objetivo
 	hit_t = (old < tgt && c >= tgt) || (tgt == 0 && (t->mode & 8));
 	if (t->mode & 8) {
-		if (old <= tgt && c > tgt) c = (c - tgt - 1) % (tgt + 1);
+		if (old <= tgt && c > tgt) {
+			c -= tgt + 1;
+			if (c > tgt) c %= tgt + 1;   // solo si da más de una vuelta (la división es cara en la DS)
+		}
 		else if (c > 0xffff) { hit_f = 1; c &= 0xffff; }
 	} else if (c > 0xffff) {
 		hit_f = 1;
