@@ -175,6 +175,10 @@ void dma_mdec_kick(void);   // el MDEC tiene datos nuevos: reanuda el DMA de sal
 
 // ---- mandos (SIO0) ----
 extern u16 psx_pad_buttons;   // activo en bajo, formato de la PS1
+extern u8 *psx_memcard;           // tarjeta de memoria de la ranura 1 (128 KB) o NULL
+extern u32 psx_memcard_writes;    // sectores escritos desde el arranque (el frontend guarda al ver cambios)
+void sio_memcard_reset(void);     // tarjeta recién puesta (bandera de «nueva»)
+void psx_memcard_format(u8 *card);   // tarjeta vacía formateada
 void sio_reset(void);
 u32 sio_read(u32 off, int size);
 void sio_write(u32 off, u32 v, int size);

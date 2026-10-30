@@ -150,6 +150,36 @@ static void save_cfg(void)
 	fclose(f);
 }
 
+// Tarjeta de memoria: una por juego, junto al .cue (Silent Hill.cue -> Silent Hill.mcr). Se guarda en la SD
+// cuando el juego lleva un segundo sin escribir en ella (una partida son decenas de sectores seguidos).
+static char card_path[256];
+static u32 card_saved_writes, card_quiet, card_wait;
+
+static void card_open(const char *game)
+{
+	FILE *f;
+	const char *dot = strrchr(game, '.');
+	snprintf(card_path, sizeof card_path, "%.*s.mcr", dot ? (int)(dot - game) : (int)strlen(game), game);
+	psx_memcard = malloc(128 * 1024);
+	if (!psx_memcard) return;
+	f = fopen(card_path, "rb");
+	if (!f || fread(psx_memcard, 1, 128 * 1024, f) != 128 * 1024) psx_memcard_format(psx_memcard);
+	if (f) fclose(f);
+}
+
+static void card_frame(void)
+{
+	FILE *f;
+	if (!psx_memcard || psx_memcard_writes == card_saved_writes) return;
+	if (psx_memcard_writes != card_quiet) { card_quiet = psx_memcard_writes; card_wait = 60; return; }
+	if (card_wait && --card_wait) return;
+	f = fopen(card_path, "wb");
+	if (f) {
+		if (fwrite(psx_memcard, 1, 128 * 1024, f) == 128 * 1024) card_saved_writes = card_quiet;
+		fclose(f);
+	}
+}
+
 static int single_fb;   // con la GPU 3D el banco B es de texturas: un solo buffer de fondo
 
 static void apply_cfg(void)
@@ -471,6 +501,63 @@ static void microbench(void)
 }
 #endif
 
+// Menú de pausa (tocar MENU en la pantalla de abajo): estado guardado junto al juego (.sst, ~3,7 MB)
+static char state_path[256];
+
+static void wait_release(void) { do { swiWaitForVBlank(); scanKeys(); } while (keysHeld()); }
+
+static void pause_menu(void)
+{
+	static int has_state = -1;
+	wait_release();
+	if (has_state < 0) { FILE *f = fopen(state_path, "rb"); has_state = f != NULL; if (f) fclose(f); }
+	for (;;) {
+		int k;
+		consoleClear();
+		printf("\x1b[36;1mSparStation - PAUSA\x1b[37;1m\n\n");
+		printf("A      seguir jugando\n\n");
+		printf("X      guardar estado\n\n");
+		printf("Y      cargar estado%s\n\n", has_state ? "" : " (no hay)");
+		printf("\x1b[37mEl estado guarda el momento\nexacto (en la SD, junto al\njuego). Las partidas del juego\nvan a la tarjeta de memoria\n(.mcr), que se guarda sola.\x1b[37;1m\n");
+		fflush(stdout);
+		do { swiWaitForVBlank(); scanKeys(); k = keysDown(); } while (!k);
+		if (k & (KEY_A | KEY_B | KEY_START)) break;
+		if (k & KEY_X) {
+			FILE *f = fopen(state_path, "wb");
+			int ok;
+			printf("\x1b[20;0HGuardando...");
+			fflush(stdout);
+			if (f) setvbuf(f, NULL, _IOFBF, 64 * 1024);
+			ok = f && psx_state_save(state_write, f);
+			if (f && fclose(f)) ok = 0;
+			if (ok) has_state = 1;
+			printf("\x1b[20;0H%s", ok ? "Estado guardado.   " : "ERROR al guardar.  ");
+			fflush(stdout);
+			for (int i = 0; i < 60; i++) swiWaitForVBlank();
+			if (ok) break;
+		}
+		if ((k & KEY_Y) && has_state) {
+			FILE *f = fopen(state_path, "rb");
+			int ok;
+			printf("\x1b[20;0HCargando...");
+			fflush(stdout);
+			if (f) setvbuf(f, NULL, _IOFBF, 64 * 1024);
+			ok = f && psx_state_load(state_read, f);
+			if (f) fclose(f);
+			if (!ok) {   // a medias: la máquina queda inconsistente, mejor empezar de cero
+				psx_reset();
+				printf("\x1b[20;0HERROR: estado no valido.\nSe reinicia el juego.");
+				fflush(stdout);
+				for (int i = 0; i < 120; i++) swiWaitForVBlank();
+			}
+			if (gpu_hw) gpu_hw->vram_written(0, 0, 1024, 512);   // texturas del 3D: todas viejas
+			break;
+		}
+	}
+	wait_release();
+	hud_redraw();
+}
+
 // title NULL: sin medidor (la autoprueba usa la pantalla de abajo para su texto)
 static void run_loop(const char *title, int use_log)
 {
@@ -488,12 +575,13 @@ static void run_loop(const char *title, int use_log)
 	for (;;) {
 		u32 t0 = fast_ticks();
 		scanKeys();
-		if (title) hud_input();
+		if (title && hud_input()) { pause_menu(); last = vblanks; frames = 0; }
 		while (stop_at && bench.frames >= stop_at) swiWaitForVBlank();
 		psx_pad_buttons = npress ? script_pad(bench.frames + 1) : map_pad(keysHeld());
 		gx_dbg.stage = 1;
 		psx_run_frame();
 		frame_beat++;
+		card_frame();
 		gx_dbg.stage = 2;
 		{ PROF_BEGIN(); present(); PROF_END(PROF_PRESENT); }
 		gx_dbg.stage = 3;
@@ -534,7 +622,7 @@ int main(void)
 	fb[1] = fb[0] + 256 * 256;   // banco B, base de mapa 8
 	dmaFillHalfWords(0x8000, fb[0], 2 * 256 * 256 * 2);
 
-	printf("SparStation v7 - PS1 en DSi\nby Spar Retro\n\n");
+	printf("SparStation v8 - PS1 en DSi\nby Spar Retro\n\n");
 #ifdef PSX_SELFTEST
 	if (!nitroFSInit(NULL) || !pak_init() || !load_bios()) {
 		printf("Pruebas: falta nitro:/bios.bin\no el Expansion Pak.\n");
@@ -601,6 +689,8 @@ int main(void)
 		printf("No puedo abrir\n%s\n", game);
 		for (;;) swiWaitForVBlank();
 	}
+	card_open(game);
+	snprintf(state_path, sizeof state_path, "%.*s.sst", (int)(strrchr(card_path, '.') - card_path), card_path);
 	psx_reset();
 	apply_cfg();
 	irqSet(IRQ_VBLANK, on_vblank);

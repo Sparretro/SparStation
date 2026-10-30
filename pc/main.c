@@ -241,6 +241,7 @@ int main(int argc, char **argv)
 	int frames = 300, want_vram = 0, want_prof = 0, dump_from = 0;
 	int rows_mode = 0;
 	const char *out = "frame";
+	const char *card_path = NULL;
 	clock_t t0;
 
 	if (argc < 2) { fprintf(stderr, "uso: psxpc <bios> [exe|cue|bin] [frames] [prefijo] [--vram] [--prof]\n"); return 1; }
@@ -279,6 +280,14 @@ int main(int argc, char **argv)
 	{ extern const GpuHw dbg_hw; if (getenv("HWDBG")) gpu_hw = &dbg_hw; }
 #endif
 	psx_reset();
+	for (int i = 1; i + 1 < argc; i++)   // --card archivo: tarjeta de memoria (se crea formateada si no existe)
+		if (!strcmp(argv[i], "--card")) {
+			FILE *cf = fopen(argv[i + 1], "rb");
+			card_path = argv[i + 1];
+			psx_memcard = malloc(128 * 1024);
+			if (!cf || fread(psx_memcard, 1, 128 * 1024, cf) != 128 * 1024) psx_memcard_format(psx_memcard);
+			if (cf) fclose(cf);
+		}
 	for (int i = 1; i + 1 < argc; i++)   // --load archivo: empieza desde un estado guardado
 		if (!strcmp(argv[i], "--load")) {
 			FILE *sf = fopen(argv[i + 1], "rb");
@@ -344,6 +353,11 @@ int main(int argc, char **argv)
 #ifdef PSX_TRACE_IO
 	{ extern u32 gp0_hist[256]; for (int i = 0; i < 256; i++) if (gp0_hist[i]) printf("GP0 %02x x%u\n", i, gp0_hist[i]); }
 #endif
+	if (card_path && psx_memcard_writes) {
+		FILE *cf = fopen(card_path, "wb");
+		printf("tarjeta: %u sectores escritos -> %s\n", psx_memcard_writes, card_path);
+		if (cf) { fwrite(psx_memcard, 1, 128 * 1024, cf); fclose(cf); }
+	}
 	if (want_vram) {
 		char name[512];
 		snprintf(name, sizeof name, "%s_vram.png", out);

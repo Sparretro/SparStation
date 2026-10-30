@@ -84,7 +84,7 @@ static void clock_str(char *out, u32 secs) { sprintf(out, "%02lu:%02lu", secs / 
 
 static void draw_buttons(void)
 {
-	row(23, C_C "< PAGINA %d/3" C_D "   toca   " C_C "MARCA >", page + 1);
+	row(23, C_C "< PAGINA %d/3  " C_Y "MENU" C_C "   MARCA >", page + 1);
 }
 
 static void draw_page0(void)
@@ -251,15 +251,19 @@ static void log_mark(void)
 	draw();
 }
 
-void hud_input(void)
+int hud_input(void)
 {
 	if (keysDown() & KEY_TOUCH) {
 		touchPosition tp;
 		touchRead(&tp);
+		if (tp.px >= 96 && tp.px < 160) return 1;   // centro: menú de pausa
 		if (tp.px < 128) { page = (page + 1) % 3; consoleClear(); draw(); }
 		else log_mark();
 	}
+	return 0;
 }
+
+void hud_redraw(void) { consoleClear(); draw(); }
 
 void hud_second(int frames, u32 vblanks)
 {
