@@ -386,6 +386,30 @@ static void dpc(const u8 *c)
 	push_color();
 }
 
+// DPCS/DPCT con sf = 12 y |FC| < 2^18 (lo normal): todo cabe en 32 bits y los MAC no pueden desbordar.
+// Mismo resultado y banderas que dpc(); es la operación que más usa Silent Hill (niebla).
+GTE_INL int dpc_fast_ok(void)
+{
+	return sf && ((u32)(FC[0] + 0x40000) | (u32)(FC[1] + 0x40000) | (u32)(FC[2] + 0x40000)) < 0x80000;
+}
+
+static void dpc_fast(const u8 *c)
+{
+	s32 ir0 = IR[0];
+	for (int i = 0; i < 3; i++) {
+		s32 m = (s32)c[i] << 16, t = ((FC[i] << 12) - m) >> 12, ir;
+		if (t < -0x8000) { t = -0x8000; FLAG |= 1u << (24 - i); }
+		else if (t > 0x7fff) { t = 0x7fff; FLAG |= 1u << (24 - i); }
+		t = (t * ir0 + m) >> 12;
+		MAC[i + 1] = t;
+		ir = t;
+		if (ir < (lm ? 0 : -0x8000)) { ir = lm ? 0 : -0x8000; FLAG |= 1u << (24 - i); }
+		else if (ir > 0x7fff) { ir = 0x7fff; FLAG |= 1u << (24 - i); }
+		IR[i + 1] = (s16)ir;
+	}
+	push_color();
+}
+
 static void gte_exec(u32 op)
 {
 	if (!unr_ready) {
@@ -402,6 +426,12 @@ static void gte_exec(u32 op)
 	switch (op & 0x3f) {
 	case 0x01: rtp(0, 1); break;   // RTPS
 	case 0x06: {                    // NCLIP
+		// Con SX y SY de 11 bits (lo normal: RTP los recorta) la suma cabe en 32 bits y no hay desbordamiento
+		if ((((u32)(SX[0] + 0x400) | (u32)(SX[1] + 0x400) | (u32)(SX[2] + 0x400) |
+		      (u32)(SY[0] + 0x400) | (u32)(SY[1] + 0x400) | (u32)(SY[2] + 0x400)) & ~0x7ffu) == 0) {
+			MAC[0] = SX[0] * (SY[1] - SY[2]) + SX[1] * (SY[2] - SY[0]) + SX[2] * (SY[0] - SY[1]);
+			break;
+		}
 		s64 v = (s64)SX[0] * SY[1] + (s64)SX[1] * SY[2] + (s64)SX[2] * SY[0] -
 		        (s64)SX[0] * SY[2] - (s64)SX[1] * SY[0] - (s64)SX[2] * SY[1];
 		set_mac0(v);
@@ -415,7 +445,7 @@ static void gte_exec(u32 op)
 		mac_to_ir();
 		break;
 	}
-	case 0x10: dpc(RGBC); break;   // DPCS
+	case 0x10: if (dpc_fast_ok()) dpc_fast(RGBC); else dpc(RGBC); break;   // DPCS
 	case 0x11:                     // INTPL
 		interpolate((s32)IR[1] << 12, (s32)IR[2] << 12, (s32)IR[3] << 12);
 		push_color();
@@ -483,7 +513,10 @@ static void gte_exec(u32 op)
 		}
 		push_color();
 		break;
-	case 0x2a: dpc(CF[0]); dpc(CF[0]); dpc(CF[0]); break;   // DPCT
+	case 0x2a:   // DPCT
+		if (dpc_fast_ok()) { dpc_fast(CF[0]); dpc_fast(CF[0]); dpc_fast(CF[0]); }
+		else { dpc(CF[0]); dpc(CF[0]); dpc(CF[0]); }
+		break;
 	case 0x2d:   // AVSZ3
 		{ s64 v = (s64)ZSF3 * (SZ[1] + SZ[2] + SZ[3]); set_mac0(v); set_otz(v); }
 		break;
@@ -525,5 +558,8 @@ void gte_command(u32 op)
 {
 	// sin PROF_BEGIN/END: se llama miles de veces por frame y medir costaba casi tanto como calcular
 	STAT_ADD(gte_ops, 1);
+#ifdef PSX_GTESTAT
+	{ extern u32 gte_hist[64]; gte_hist[op & 0x3f]++; }
+#endif
 	gte_exec(op);
 }
