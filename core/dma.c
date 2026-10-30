@@ -79,7 +79,8 @@ static void run(int ch)
 		PROF_BEGIN();
 		for (;;) {
 			u32 hdr = *ram32(addr), n = hdr >> 24;
-			for (u32 i = 1; i <= n; i++) gpu_write_gp0(*ram32(addr + i * 4));
+			if (n && (addr & 0x1ffffc) + n * 4 < 0x200000) gpu_write_gp0_n(ram32(addr + 4), n);   // el paquete entero
+			else for (u32 i = 1; i <= n; i++) gpu_write_gp0(*ram32(addr + i * 4));
 			if ((hdr & 0x800000) || --guard == 0) break;
 			addr = hdr & 0xfffffc;
 		}

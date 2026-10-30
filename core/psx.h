@@ -136,6 +136,7 @@ extern u16 psx_cpu_scale;      // coste de cada ciclo en 1/256: 256 = CPU al 100
 void gpu_rows_for(int mode, int out_lines);   // rellena gpu_row_draw según la escala de la pantalla de destino
 void gpu_reset(void);
 void gpu_write_gp0(u32 v);
+void gpu_write_gp0_n(const u32 *w, u32 n);   // n palabras seguidas (paquete de la DMA)
 void gpu_write_gp1(u32 v);
 u32 gpu_read(void);
 u32 gpu_stat(void);

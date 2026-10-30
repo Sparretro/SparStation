@@ -1209,6 +1209,22 @@ void gpu_write_gp0(u32 v)
 	}
 }
 
+// Paquete de la lista enlazada (DMA): los comandos que vienen enteros se ejecutan sin pasar palabra a palabra
+void gpu_write_gp0_n(const u32 *w, u32 n)
+{
+	while (n) {
+		u32 need;
+		if (mode != M_CMD || fifo_n || (need = (u32)cmd_len(w[0] >> 24)) > n) { gpu_write_gp0(*w++); n--; continue; }
+		for (u32 i = 0; i < need; i++) fifo[i] = w[i];
+		fifo_n = (int)need;
+		STAT_ADD(gpu_cmds, 1);
+		execute_cmd();
+		fifo_n = 0;
+		w += need;
+		n -= need;
+	}
+}
+
 void gpu_write_gp1(u32 v)
 {
 	switch (v >> 24) {
