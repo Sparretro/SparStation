@@ -43,7 +43,7 @@ static void watchdog(void)
 	}
 }
 
-static void on_vblank(void) { vblanks++; gx_dbg.vbl++; flip_in_vblank(); watchdog(); }
+static void on_vblank(void) { vblanks++; gx_dbg.vbl++; flip_in_vblank(); if (gpu_hw) gx_vblank(); watchdog(); }
 
 static int read_exe(void *user, u8 *dst, u32 len) { return fread(dst, 1, len, (FILE *)user) == len; }
 
@@ -534,7 +534,7 @@ int main(void)
 	fb[1] = fb[0] + 256 * 256;   // banco B, base de mapa 8
 	dmaFillHalfWords(0x8000, fb[0], 2 * 256 * 256 * 2);
 
-	printf("SparStation v6 - PS1 en DSi\nby Spar Retro\n\n");
+	printf("SparStation v7 - PS1 en DSi\nby Spar Retro\n\n");
 #ifdef PSX_SELFTEST
 	if (!nitroFSInit(NULL) || !pak_init() || !load_bios()) {
 		printf("Pruebas: falta nitro:/bios.bin\no el Expansion Pak.\n");

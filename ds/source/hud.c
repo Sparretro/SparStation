@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include "psx.h"
 #include "hud.h"
+#include "gx.h"
 
 #define LOG_PATH "sd:/ps1/sparstation_log.txt"
 #ifdef SPAR_PROF
@@ -217,7 +218,7 @@ void hud_start(const char *game, int use_log, const char *settings)
 		fprintf(logf, "\n# SparStation  %04d-%02d-%02d %02d:%02d  juego=%s  cache=%luKB  %s\n", tm->tm_year + 1900, tm->tm_mon + 1,
 		        tm->tm_mday, tm->tm_hour, tm->tm_min, game_name, size / 1024, settings_str);
 		fprintf(logf, "t,fps,fps_juego,cpu%%,gpu%%,mdec%%,trad%%,copia%%,sd%%,otros%%,peor_ms,mejor_ms,cmds,tri,rect,"
-		              "vram_kb,cd_sect,mdec_mb,bloques,interp,pasos,smc,vaciados,cache%%,res,pc,kpx,gte%%,esperas,es_lentas,arm_por_mips\n");
+		              "vram_kb,cd_sect,mdec_mb,bloques,interp,pasos,smc,vaciados,cache%%,res,pc,kpx,gte%%,esperas,es_lentas,arm_por_mips,3d_subdesb,3d_tarde,3d_lineas_min\n");
 		fflush(logf);
 		fsync(fileno(logf));
 	}
@@ -299,14 +300,17 @@ void hud_second(int frames, u32 vblanks)
 	if (logf) {
 		u32 t0 = cpuGetTiming(), used, size;
 		dyn_cache_use(&used, &size);
-		fprintf(logf, "%lu,%d.%d,%d.%d,%d,%d,%d,%d,%d,%d,%d,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%dx%d%s,%08lx,%lu,%lu,%lu,%lu,%lu.%lu\n",
+		fprintf(logf, "%lu,%d.%d,%d.%d,%d,%d,%d,%d,%d,%d,%d,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%dx%d%s,%08lx,%lu,%lu,%lu,%lu,%lu.%lu,%lu,%lu,%lu\n",
 		        seconds, s.fps10 / 10, s.fps10 % 10, s.game10 / 10, s.game10 % 10, s.pct[T_CPU], s.pct[T_GPU], s.pct[T_MDEC],
 		        s.pct[T_COMPILE], s.pct[T_PRESENT], s.pct[T_DISC], s.pct[T_OTHER], s.worst_ms, s.best_ms, s.st.gpu_cmds,
 		        s.st.gpu_tris, s.st.gpu_rects, s.st.vram_upload * 2 / 1024, s.st.cd_sectors, s.st.mdec_blocks,
 		        s.st.dyn_compiled, s.st.dyn_interp_ops, s.st.dyn_interp_steps, s.st.dyn_smc, s.st.dyn_flushes,
 		        size ? used * 100 / size : 0, gpu_disp.width, gpu_disp.height, gpu_disp.color24 ? "x24" : "", cpu.pc,
 		        s.st.gpu_pixels / 1000, (u32)((u64)p[PROF_GTE] * 100 / total), s.st.dyn_idle, s.st.io_calls,
-		        s.st.dyn_mips ? s.st.dyn_arm / s.st.dyn_mips : 0, s.st.dyn_mips ? s.st.dyn_arm * 10 / s.st.dyn_mips % 10 : 0);
+		        s.st.dyn_mips ? s.st.dyn_arm / s.st.dyn_mips : 0, s.st.dyn_mips ? s.st.dyn_arm * 10 / s.st.dyn_mips % 10 : 0,
+		        gx_underflows, gx_late, gx_rdlines_min == 99 ? 0 : gx_rdlines_min);
+		gx_underflows = gx_late = 0;
+		gx_rdlines_min = 99;
 		log_lines++;
 #ifdef SPAR_PROF
 		prof_second(seconds);

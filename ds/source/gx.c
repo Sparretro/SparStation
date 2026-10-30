@@ -16,6 +16,7 @@
 // buffer: así no hay que esperar a que el hardware acabe el frame anterior.
 #include <nds.h>
 #include <string.h>
+#include <stdlib.h>
 #include "psx.h"
 #include "gx.h"
 
@@ -61,6 +62,76 @@ static u16 *bank_lcd(int bank)   // dirección de un banco cuando está en modo 
 	return addr[bank];
 }
 
+// ---- copias en la RAM principal ----
+// En la DSi real el motor 3D lee las texturas y paletas mientras dibuja la pantalla, línea a línea: si se
+// pasa un banco a modo LCD para escribir en él a mitad de frame, lee basura (píxeles de otros colores,
+// parpadeos). melonDS dibuja el 3D de golpe y no lo enseña. Así que se escribe en estas copias y lo cambiado
+// se lleva a la VRAM por DMA en la vblank en que el 3D cambia de buffer (gx_vblank), antes de que empiece a
+// dibujar el frame nuevo. El frame que aún se ve sigue con sus texturas intactas hasta entonces.
+#define GX_NR 13            // 12 huecos de textura + las paletas
+#define GX_PAL 12
+static u16 *sh_tex, *sh_pal;   // NULL: sin memoria, se escribe directo en la VRAM (como antes)
+static u32 pend_lo[GX_NR], pend_hi[GX_NR];          // bytes cambiados desde el último cambio de buffer
+static u32 com_lo[GX_NR], com_hi[GX_NR];            // los que esperan a la próxima vblank
+static volatile int commit_on;
+
+// Se va a escribir [lo, hi) del hueco k (o de las paletas): si eso aún tiene que llegar a la VRAM para el
+// frame que se acaba de mandar, esperar a que llegue; luego se apunta como cambiado.
+static void sh_mark(int k, u32 lo, u32 hi)
+{
+	if (commit_on && com_lo[k] < hi && lo < com_hi[k]) while (commit_on) { }
+	if (pend_lo[k] >= pend_hi[k]) { pend_lo[k] = lo; pend_hi[k] = hi; }
+	else { if (lo < pend_lo[k]) pend_lo[k] = lo; if (hi > pend_hi[k]) pend_hi[k] = hi; }
+}
+
+// Bytes [b0, b1) de una textura que empieza en el hueco u (puede ocupar varios)
+static void sh_mark_tex(int u, u32 b0, u32 b1)
+{
+	for (u32 k = b0 >> 15; k <= (b1 - 1) >> 15; k++) {
+		u32 base = k << 15, lo = b0 > base ? b0 - base : 0, hi = b1 < base + 0x8000 ? b1 - base : 0x8000;
+		sh_mark(u + (int)k, lo, hi);
+	}
+}
+
+static void bank_mode(int bank, int lcd)   // 0 = B, 1 = D, 2 = C, 3 = E
+{
+	switch (bank) {
+	case 0: vramSetBankB(lcd ? VRAM_B_LCD : VRAM_B_TEXTURE_SLOT0); break;
+	case 1: vramSetBankD(lcd ? VRAM_D_LCD : VRAM_D_TEXTURE_SLOT1); break;
+	case 2: vramSetBankC(lcd ? VRAM_C_LCD : VRAM_C_TEXTURE_SLOT2); break;
+	default: vramSetBankE(lcd ? VRAM_E_LCD : VRAM_E_TEX_PALETTE); break;
+	}
+}
+
+// En la vblank (main.c): si el 3D ya cambió de buffer, lleva lo cambiado a la VRAM
+volatile u32 gx_underflows, gx_late, gx_rdlines_min = 99;
+
+void gx_vblank(void)
+{
+	// diagnóstico para el registro (hud.c): líneas que el 3D no llegó a dibujar a tiempo (demasiados polígonos
+	// en una línea; en la DSi real salen con colores raros, melonDS no lo imita) y su margen mínimo
+	vu16 *cnt = (vu16 *)0x04000060;
+	u32 rl = *(vu8 *)0x04000320;
+	if (*cnt & (1u << 12)) { gx_underflows++; *cnt |= 1u << 12; }
+	if (rl < gx_rdlines_min) gx_rdlines_min = rl;
+	if (!commit_on) return;
+	if (GFX_STATUS & (1u << 27)) { gx_late++; return; }   // el motor aún no ha cambiado de buffer: en la siguiente
+	for (int k = 0; k < GX_NR; k++) {
+		u32 lo = com_lo[k] & ~3u, hi = (com_hi[k] + 3) & ~3u;
+		int bank = k == GX_PAL ? 3 : k >> 2;
+		const u8 *src;
+		u8 *dst;
+		if (lo >= hi) continue;
+		src = k == GX_PAL ? (const u8 *)sh_pal + lo : (const u8 *)sh_tex + ((u32)k << 15) + lo;
+		dst = k == GX_PAL ? (u8 *)bank_lcd(3) + lo : (u8 *)bank_lcd(bank) + ((u32)(k & 3) << 15) + lo;
+		bank_mode(bank, 1);
+		dmaCopyWords(2, src, dst, hi - lo);
+		bank_mode(bank, 0);
+		com_lo[k] = com_hi[k] = 0;
+	}
+	commit_on = 0;
+}
+
 static void pal_reset(void)
 {
 	memset(pal, 0, sizeof pal);
@@ -81,8 +152,8 @@ static u32 pal_get(int cx, int cy, int n, int *lum)
 	if (n == 256) pal_top = (pal_top + 511) & ~511u;
 	e = &pal[h];
 	e->x = (s16)cx; e->y = (s16)cy; e->n = (u16)n; e->off = (u16)(pal_top >> 4);
-	vramSetBankE(VRAM_E_LCD);
-	dst = bank_lcd(3) + pal_top / 2;
+	if (sh_pal) { sh_mark(GX_PAL, pal_top, pal_top + (u32)n * 2); dst = sh_pal + pal_top / 2; }
+	else { vramSetBankE(VRAM_E_LCD); dst = bank_lcd(3) + pal_top / 2; }
 	for (int i = 0; i < n; i++) {
 		u16 c = i < (n == 32 ? 16 : n) ? psx_vram[cy * 1024 + ((cx + i) & 1023)] : 0;
 		int r = c & 31, g = (c >> 5) & 31, b = (c >> 10) & 31, m = r > g ? (r > b ? r : b) : (g > b ? g : b);
@@ -90,7 +161,7 @@ static u32 pal_get(int cx, int cy, int n, int *lum)
 		dst[i] = (u16)(r | (g << 5) | (b << 10));
 		if (c && (u32)m > sum) sum = (u32)m;   // brillo máximo de la CLUT
 	}
-	vramSetBankE(VRAM_E_TEX_PALETTE);
+	if (!sh_pal) vramSetBankE(VRAM_E_TEX_PALETTE);
 	pal_top += (u32)n * 2;
 	e->lum = (u8)sum;
 	*lum = e->lum;
@@ -152,13 +223,13 @@ static void tex_upload(const TexEnt *t, int u, int row0, int row1)
 		for (int i = 0; i < 16; i++) b[i] = (u8)(i | (((m[i] * 7 + mmax / 2) / mmax) << 5));
 		for (int k = 0; k < 256; k++) lut[k] = (u16)(b[k & 15] | (b[k >> 4] << 8));
 	}
-	vramSetBankB(VRAM_B_LCD);
-	vramSetBankD(VRAM_D_LCD);
-	vramSetBankC(VRAM_C_LCD);
+	if (sh_tex) sh_mark_tex(u, (u32)row0 * (u32)rb, (u32)row1 * (u32)rb);
+	else { vramSetBankB(VRAM_B_LCD); vramSetBankD(VRAM_D_LCD); vramSetBankC(VRAM_C_LCD); }
 	for (int row = row0; row < row1; row++) {
 		u32 byte = (u32)row * (u32)rb;   // posición en la textura
 		int unit = u + (int)(byte >> 15);
-		u16 *dst = bank_lcd(unit >> 2) + ((unit & 3) << 14) + ((byte & 0x7fff) >> 1);
+		u16 *dst = sh_tex ? sh_tex + ((u32)unit << 14) + ((byte & 0x7fff) >> 1)
+		                  : bank_lcd(unit >> 2) + ((unit & 3) << 14) + ((byte & 0x7fff) >> 1);
 		const u16 *src = &psx_vram[((t->y + row) & 511) * 1024];
 		if (t->depth == 3) {
 			for (int k = 0; k < tw; k++) {
@@ -179,9 +250,7 @@ static void tex_upload(const TexEnt *t, int u, int row0, int row1)
 			for (int k = 0; k < tw; k++) dst[k] = src[(t->x + k) & 1023];
 		}
 	}
-	vramSetBankB(VRAM_B_TEXTURE_SLOT0);
-	vramSetBankD(VRAM_D_TEXTURE_SLOT1);
-	vramSetBankC(VRAM_C_TEXTURE_SLOT2);
+	if (!sh_tex) { vramSetBankB(VRAM_B_TEXTURE_SLOT0); vramSetBankD(VRAM_D_TEXTURE_SLOT1); vramSetBankC(VRAM_C_TEXTURE_SLOT2); }
 }
 
 // Hueco donde está (o se carga) la página; devuelve el primero
@@ -346,9 +415,22 @@ static void gx_flip(int drawn)
 	GFX_CLEAR_COLOR = opaque ? clear_next : 63u << 24;
 	clear_next = 0;
 	STAGE(11);
+	while (commit_on) { }   // lo del frame anterior aún no ha llegado a la VRAM (dos frames en una vblank)
 	for (int i = 0; i < ln; i++) GFX_FIFO = list[i];
 	STAGE(12);
 	GFX_FLUSH = 1;   // orden manual de los semitransparentes; se cambia de buffer en la próxima vblank
+	if (sh_tex) {   // lo cambiado para este frame va a la VRAM en esa vblank (gx_vblank)
+		int any = 0;
+		for (int k = 0; k < GX_NR; k++) {
+			com_lo[k] = pend_lo[k]; com_hi[k] = pend_hi[k];
+			pend_lo[k] = pend_hi[k] = 0;
+			if (com_lo[k] < com_hi[k]) {
+				any = 1;
+				DC_FlushRange(k == GX_PAL ? (u8 *)sh_pal + com_lo[k] : (u8 *)sh_tex + ((u32)k << 15) + com_lo[k], com_hi[k] - com_lo[k]);
+			}
+		}
+		commit_on = any;
+	}
 	ln = npolys = 0;
 	frame_no++;
 	STAGE(13);
@@ -376,6 +458,16 @@ void gx_init(void)
 	glMatrixMode(GL_MODELVIEW);
 	glLoadIdentity();
 	REG_BLDCNT = BLEND_ALPHA | BLEND_SRC_BG0 | BLEND_DST_BG3 | BLEND_DST_BACKDROP;
+	if (!sh_tex) {
+#ifdef BENCH_VRAM_PAK
+		sh_tex = (u16 *)0x09200000;   // banco de pruebas en modo DS: en el Expansion Pak, sin quitar RAM a la caché de código
+		sh_pal = (u16 *)(0x09200000 + GX_PAL * 0x8000);
+#else
+		sh_tex = malloc(GX_PAL * 0x8000);
+		sh_pal = malloc(0x10000);
+#endif
+		if (!sh_tex || !sh_pal) { free(sh_tex); free(sh_pal); sh_tex = sh_pal = NULL; }
+	}
 	tex_reset();
 	pal_reset();
 	ramp_init();
