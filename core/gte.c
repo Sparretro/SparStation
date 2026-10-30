@@ -186,6 +186,7 @@ GTE_INL s64 chk44(int i, s64 v)
 }
 
 GTE_INL void set_mac(int i, s64 v) { MAC[i] = (s32)(chk44(i, v) >> sf); }
+GTE_INL void set_mac_s(int i, s64 v, int s) { MAC[i] = (s32)(chk44(i, v) >> s); }
 
 GTE_INL void set_ir(int i, s32 v, int lmv)
 {
@@ -284,15 +285,15 @@ static void mat_vec(s16 m[3][3], const s32 *add, s32 vx, s32 vy, s32 vz)
 	for (int i = 0; i < 3; i++) MAC[i + 1] = (s32)(mat_row(m[i], add, i, vx, vy, vz) >> sf);
 }
 
-static void rtp(int vi, int last)
+GTE_INL void rtp_s(int vi, int last, int s)
 {
 	s64 z;
 	u32 n;
 	s32 vx = V[vi][0], vy = V[vi][1], vz = V[vi][2];
-	MAC[1] = (s32)(mat_row(RT[0], TR, 0, vx, vy, vz) >> sf);
-	MAC[2] = (s32)(mat_row(RT[1], TR, 1, vx, vy, vz) >> sf);
+	MAC[1] = (s32)(mat_row(RT[0], TR, 0, vx, vy, vz) >> s);
+	MAC[2] = (s32)(mat_row(RT[1], TR, 1, vx, vy, vz) >> s);
 	z = mat_row(RT[2], TR, 2, vx, vy, vz);
-	MAC[3] = (s32)(z >> sf);
+	MAC[3] = (s32)(z >> s);
 	set_ir(1, MAC[1], lm);
 	set_ir(2, MAC[2], lm);
 	// IR3: la bandera mira MAC3>>12 aunque el valor se recorta con el MAC3 normal
@@ -320,20 +321,25 @@ static void rtp(int vi, int last)
 	}
 }
 
+// con sf fijo (12 o 0) los desplazamientos de 64 bits salen mucho más cortos
+static void rtp(int vi, int last) { if (sf) rtp_s(vi, last, 12); else rtp_s(vi, last, 0); }
+
 // interpolación hacia el color de lejanía (FC) según IR0
-static void interpolate(s32 m1, s32 m2, s32 m3)
+GTE_INL void interpolate_s(s32 m1, s32 m2, s32 m3, int s)
 {
-	set_mac(1, ((s64)FC[0] << 12) - m1);
-	set_mac(2, ((s64)FC[1] << 12) - m2);
-	set_mac(3, ((s64)FC[2] << 12) - m3);
+	set_mac_s(1, ((s64)FC[0] << 12) - m1, s);
+	set_mac_s(2, ((s64)FC[1] << 12) - m2, s);
+	set_mac_s(3, ((s64)FC[2] << 12) - m3, s);
 	set_ir(1, MAC[1], 0);
 	set_ir(2, MAC[2], 0);
 	set_ir(3, MAC[3], 0);
-	set_mac(1, (s64)IR[1] * IR[0] + m1);
-	set_mac(2, (s64)IR[2] * IR[0] + m2);
-	set_mac(3, (s64)IR[3] * IR[0] + m3);
+	set_mac_s(1, (s64)IR[1] * IR[0] + m1, s);
+	set_mac_s(2, (s64)IR[2] * IR[0] + m2, s);
+	set_mac_s(3, (s64)IR[3] * IR[0] + m3, s);
 	mac_to_ir();
 }
+
+static void interpolate(s32 m1, s32 m2, s32 m3) { if (sf) interpolate_s(m1, m2, m3, 12); else interpolate_s(m1, m2, m3, 0); }
 
 static void light(int vi)   // L*V y luego BK + LC*IR
 {
@@ -484,7 +490,10 @@ static void gte_exec(u32 op)
 	case 0x2e:   // AVSZ4
 		{ s64 v = (s64)ZSF4 * (SZ[0] + SZ[1] + SZ[2] + SZ[3]); set_mac0(v); set_otz(v); }
 		break;
-	case 0x30: rtp(0, 0); rtp(1, 0); rtp(2, 1); break;   // RTPT
+	case 0x30:   // RTPT
+		if (sf) { rtp_s(0, 0, 12); rtp_s(1, 0, 12); rtp_s(2, 1, 12); }
+		else { rtp(0, 0); rtp(1, 0); rtp(2, 1); }
+		break;
 	case 0x3d:                                            // GPF
 		set_mac(1, (s64)IR[0] * IR[1]);
 		set_mac(2, (s64)IR[0] * IR[2]);
