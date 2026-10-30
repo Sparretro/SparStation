@@ -10,6 +10,7 @@ u8 b8[64];
 u16 h16[32];
 u32 w32[32];
 struct pk_t pk[8];
+volatile u32 *mpx[2] = { (volatile u32 *)0x1f800200, w32 };   // base en un registro: scratchpad o RAM
 
 __attribute__((noinline)) u32 hlp0(u32 a, u32 b) { return a * 31 + b; }
 __attribute__((noinline)) u32 hlp1(u32 a, u32 b) { return (a ^ b) >> 3 | a << 7; }

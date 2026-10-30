@@ -256,6 +256,7 @@ int main(int argc, char **argv)
 				printf("\n  ms/frame: ejec=%.1f gte=%.1f gpu=%.1f traducir=%.1f mdec=%.1f copia=%.1f total=%.1f",
 				       ((double)d[B_PROF] - d[B_PROF + 1] - d[B_PROF + 5] - d[B_PROF + 6] - d[B_PROF + 7]) / f, d[B_PROF + 7] / f, d[B_PROF + 1] / f, d[B_PROF + 6] / f,
 				       d[B_PROF + 5] / f, d[B_PROF + 2] / f, d[B_PROF + 3] / f);
+				printf("\n  DSi estimado (sin traducir): %.1f ms/frame", ((double)d[B_PROF + 3] - d[B_PROF + 6]) / f);
 			}
 			printf("\n  por s:");
 			for (int k = 0; k < 28; k++) printf(" %s=%.0f", sn[k], d[B_STAT + k] / secs);

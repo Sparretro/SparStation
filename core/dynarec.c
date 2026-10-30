@@ -636,6 +636,41 @@ static int scratch_const(u32 a, u32 *off)
 	return 1;
 }
 
+// Registros MIPS escritos hasta ahora en el bloque que se traduce: los demás aún valen lo que en cpu.r
+static u32 blk_written;
+
+// ¿rs + simm apuntará a la scratchpad? El bloque se traduce justo antes de ejecutarse, así que si rs no
+// cambia antes en el bloque su valor actual es el de la primera vez (SH tiene s0 = 1F800000 casi siempre)
+static int scratch_hint(int rs, u32 simm)
+{
+	u32 a;
+	if (blk_written & (1u << rs)) return 0;
+	a = (cpu.r[rs] + simm) & 0x1fffffff;
+	return (a & ~0x3ffu) == 0x1f800000;
+}
+
+// Acceso con la scratchpad primero: r1 = dirección - 1F800000 (sin segmento), en línea si es < 400h;
+// si no, la ruta general en C desde la zona fría (r0 = dirección)
+static void scratch_first(int load, int size, int rs, u32 simm, int r)
+{
+	u32 *slow, *back;
+	a_addi(R0, get(rs, R0), simm, R1);
+	a_dp_imm(C_AL, OP_BIC, 0, R1, R0, arm_imm(0xe0000000));
+	a_dp_imm(C_AL, OP_SUB, 0, R1, R1, arm_imm(0x1f800000));
+	a_dp_imm(C_AL, OP_CMP, 1, 0, R1, arm_imm(0x400));
+	a_dp_reg(C_CC, OP_ADD, 0, R1, R1, RCPU, SH_LSL, 0);
+	mem_off(C_CC, load, size, r, R1, off_scr);
+	slow = fwd(C_CS);
+	back = emit_ptr;
+	begin_cold();
+	land(slow);
+	if (!load && r != R1) a_mov(R1, r);
+	call(load ? rd_fn[size] : wr_fn[size]);
+	if (load && r != R0) a_mov(r, R0);
+	a_b(C_AL, 0, back);
+	end_cold();
+}
+
 // Carga en el registro ARM d (r2 o uno asignado) desde rs + simm
 static void load_to(int size, int rs, u32 simm, int d)
 {
@@ -652,6 +687,7 @@ static void load_to(int size, int rs, u32 simm, int d)
 		}
 		return;
 	}
+	if (scratch_hint(rs, simm)) { scratch_first(1, size, rs, simm, d); return; }
 	a_addi(R0, get(rs, R0), simm, R1);
 	a_dp_imm(C_AL, OP_TST, 1, 0, R0, arm_imm(0x1f800000));   // fuera de la RAM (bits 23-28): NE
 	a_dp_reg(C_EQ, OP_MOV, 0, R1, 0, R0, SH_LSL, 11);
@@ -697,6 +733,7 @@ static void store_from(int size, int rs, u32 simm, int v)
 		}
 		return;
 	}
+	if (scratch_hint(rs, simm)) { scratch_first(0, size, rs, simm, v); return; }
 	a_addi(R0, get(rs, R0), simm, R1);
 	a_dp_imm(C_AL, OP_TST, 1, 0, R0, arm_imm(0x1f800000));
 	a_dp_reg(C_EQ, OP_MOV, 0, R1, 0, R0, SH_LSL, 11);
@@ -1264,6 +1301,7 @@ static block_fn compile(u32 pc, block_fn *s)
 	if (emit_ptr + MAX_BLOCK * 48 + 512 > cold_base || cold_ptr + MAX_BLOCK * 16 + 256 > code_end) flush_all();
 	start = emit_ptr;
 	cold_start = cold_ptr;
+	blk_written = 0;
 	alloc_regs(pc);
 	emit(pc);   // cabecera: el PC virtual con el que se tradujo
 	entry = emit_ptr;
@@ -1385,6 +1423,7 @@ static block_fn compile(u32 pc, block_fn *s)
 			break;
 		}
 		if (op && !emit_op(op, cur, n)) break;
+		{ u32 r, w; op_regs(op, &r, &w); blk_written |= w; }
 		if (n >= MAX_BLOCK) {
 			exit_to(cur + 4, n);
 			break;

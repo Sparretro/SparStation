@@ -845,6 +845,9 @@ static void polygon(void)
 	int nv = quad ? 4 : 3, i = 1;
 	Vtx v[4];
 	u32 clut = 0, col = fifo[0] & 0xffffff;
+#ifdef BENCH_NO_SEMI
+	if (semi_on) return;   // medida: sin semitransparencias
+#endif
 
 	for (int k = 0; k < nv; k++) {
 		u32 xy;

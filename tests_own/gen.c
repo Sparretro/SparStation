@@ -38,7 +38,7 @@ static void stmt(int d, int depth)
 {
 	int x = R(NV), y = R(NV);
 	ind(d);
-	switch (R(depth < 2 ? 22 : 17)) {
+	switch (R(depth < 2 ? 25 : 17)) {
 	case 0: case 1: case 2: case 3: case 4: case 5: printf("v%d = ", x); expr(); printf(";\n"); break;
 	case 6: printf("b8[(v%d + %d) & 63] = (u8)v%d;\n", y, R(64), x); break;
 	case 7: printf("v%d += b8[(v%d + %d) & 63];\n", x, y, R(64)); break;
@@ -51,6 +51,10 @@ static void stmt(int d, int depth)
 	case 14: printf("v%d = hlp[v%d & 3](v%d, v%d);\n", x, y, x, R(NV)); break;
 	case 15: printf("v%d = hlp%d(v%d, v%d) + v%d;\n", x, R(4), y, x, R(NV)); break;
 	case 16: printf("sp[v%d & 255] = v%d; v%d += sp[(v%d + 3) & 255];\n", y, x, x, y); break;
+	// base en un registro que unas veces es la scratchpad y otras la RAM (la suposición del dynarec falla)
+	case 22: printf("{ volatile u32 *p = mpx[v%d & 1]; p[v%d & 15] = v%d; v%d += p[(v%d + 1) & 15]; }\n", y, x, y, x, x); break;
+	case 23: printf("{ volatile u32 *p = mpx[(v%d >> 2) & 1]; ((volatile u16 *)p)[v%d & 31] = (u16)v%d; v%d -= (u32)(s16)((volatile u16 *)p)[(v%d + 3) & 31]; }\n", y, x, y, x, x); break;
+	case 24: printf("{ volatile u32 *p = mpx[v%d & 1]; ((volatile u8 *)p)[v%d & 63] = (u8)v%d; v%d ^= (u32)(s8)((volatile u8 *)p)[(v%d + 5) & 63] + ((volatile u8 *)p)[v%d & 63]; }\n", x, y, x, y, x, y); break;
 	case 17: case 18:
 		printf("if ((s32)v%d %s (s32)v%d) {\n", x, R(2) ? "<" : ">=", y);
 		for (int i = R(3) + 1; i; i--) stmt(d + 1, depth + 1);

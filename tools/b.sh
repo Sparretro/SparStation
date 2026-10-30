@@ -3,4 +3,4 @@
 # uso: tools/b.sh [nombre] [carpeta nitro]
 cd "$(dirname "$0")/.."
 touch ds/source/main.c
-EXTRA="-DBENCH_QUALITY=2 -DBENCH_SKIP=1 -DDYN_DS_RESERVE_KB=160 $EXTRA" sh tools/bench.sh ${2:-nitro_shg} 3000 1000 ${1:-ref} 2>/dev/null | grep -E 'BENCH|ms/frame'
+EXTRA="-DBENCH_QUALITY=2 -DBENCH_SKIP=1 -DDYN_DS_RESERVE_KB=0 $EXTRA" sh tools/bench.sh ${2:-nitro_shg} 3000 1000 ${1:-ref} 2>/dev/null | grep -E 'BENCH|ms/frame|DSi'

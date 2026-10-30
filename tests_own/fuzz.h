@@ -11,6 +11,7 @@ extern u16 h16[32];
 extern u32 w32[32];
 struct __attribute__((packed)) pk_t { u8 pad; u32 w; };
 extern struct pk_t pk[8];
+extern volatile u32 *mpx[2];
 #define sp ((volatile u32 *)0x1f800000)   // scratchpad
 u32 hlp0(u32, u32);
 u32 hlp1(u32, u32);
