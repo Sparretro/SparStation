@@ -19,7 +19,7 @@ static u32 pending_len;
 int psx_init(void)
 {
 	psx_ram = malloc(2 * 1024 * 1024);
-	psx_vram = malloc(1024 * 512 * 2);
+	if (!psx_vram) psx_vram = malloc(1024 * 512 * 2);   // el banco de pruebas puede ponerla antes en el Expansion Pak
 	if (!psx_ram || !psx_vram) return 0;
 	return 1;
 }

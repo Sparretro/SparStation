@@ -191,12 +191,16 @@ int main(int argc, char **argv)
 		// DSB_SNAP=N: mide entre el frame N y el final con los totales «SPBENCH» del frontend
 		int every = getenv("DSB_EVERY") ? atoi(getenv("DSB_EVERY")) : 0;   // captura cada N frames (salida_NNNNN.png)
 		int snap = getenv("DSB_SNAP") ? atoi(getenv("DSB_SNAP")) : -1;
+		// DSB_PSX=desde:hasta mide entre esos frames de la PS1 (el mismo trozo de juego vaya rápido o lento)
+		unsigned psx_from = 0, psx_to = 0;
+		int measuring = 0;
 		uint32_t b0[64] = { 0 };
 		uint8_t *ram = NULL;
 		size_t ramn = 0;
 		uint32_t *bench = NULL;
 #define BENCH_N 6 + 8 + 28
 		if (retro_get_memory_data && retro_get_memory_size) { ram = retro_get_memory_data(2); ramn = retro_get_memory_size(2); }
+		if (getenv("DSB_PSX")) sscanf(getenv("DSB_PSX"), "%u:%u", &psx_from, &psx_to);
 		// DSB_PROF=archivo: desde el frame DSB_SNAP, las muestras del perfilador (ds/source/prof.c, marca
 		// «SPPROFRG»): pares (dirección ARM, PC MIPS del bloque) tras una cabecera con las zonas del dynarec
 		const char *prof_path = getenv("DSB_PROF");
@@ -205,7 +209,13 @@ int main(int argc, char **argv)
 		for (int i = 0; i < frames; i++) {
 			cur_frame = i;
 			retro_run();
-			if (prof_path && ram && i >= (snap > 0 ? snap : 0)) {
+			if (psx_to && ram && !bench && i >= 1)
+				for (size_t o = 0; o + 8 + BENCH_N * 4 <= ramn; o += 4)
+					if (!memcmp(ram + o, "SPBENCH", 8)) { bench = (uint32_t *)(ram + o + 8); break; }
+			if (psx_to && bench && !measuring && bench[0] >= psx_from) { memcpy(b0, bench, BENCH_N * 4); measuring = 1; }
+			if (psx_to && bench && bench[0] >= psx_to) break;
+			if (!psx_to && i == snap) measuring = 1;
+			if (prof_path && ram && measuring) {
 				if (!prof) {
 					for (size_t o = 0; o + 64 <= ramn; o += 4)
 						if (!memcmp(ram + o, "SPPROFRG", 8)) { prof = (uint32_t *)(ram + o + 8); break; }
@@ -223,7 +233,7 @@ int main(int argc, char **argv)
 				snprintf(name, sizeof name, "%.*s_%05d.png", (int)(strlen(argv[4]) - 4), argv[4], i);
 				save_png(name);
 			}
-			if (i == snap && ram) {
+			if (i == snap && ram && !psx_from) {
 				for (size_t o = 0; o + 8 + BENCH_N * 4 <= ramn; o += 4)
 					if (!memcmp(ram + o, "SPBENCH", 8)) { bench = (uint32_t *)(ram + o + 8); }
 				if (bench) memcpy(b0, bench, BENCH_N * 4);

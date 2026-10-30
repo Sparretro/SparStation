@@ -285,6 +285,9 @@ static int load_bios(void)
 	if (!f) return 0;
 	psx_bios = PAK;
 	spu_mem = (u16 *)(PAK + 512 * 1024);
+#ifdef BENCH_VRAM_PAK
+	psx_vram = (u16 *)(PAK + 1024 * 1024);   // 1 MB más para la caché de código: se parece más a la DSi (3 MB de caché)
+#endif
 	ok = read_any(f, psx_bios, 512 * 1024);
 	fclose(f);
 	return ok;
