@@ -1023,19 +1023,23 @@ static int emit_op(u32 op, u32 pc, int ninstr)
 			int aop = (f <= 0x21) ? OP_ADD : (f <= 0x23) ? OP_SUB : f == 0x24 ? OP_AND : f == 0x26 ? OP_EOR : OP_ORR;
 			if (!rd) return 1;
 			if (is_const(rs) && is_const(rt)) { put_const(rd, alu_fold(f, const_of(rs), const_of(rt))); return 1; }
-			if (rt == 0 && f != 0x24) {   // con cero: copia, o NOR = negación
+			if (rt == 0 && f == 0x27) {   // NOR con cero = negación
 				a = get(rs, R0);
 				d = dst(rd, R0);
-				if (f == 0x27) a_dp_reg(C_AL, OP_MVN, 0, d, 0, a, SH_LSL, 0);
-				else if (d != a) a_mov(d, a);
+				a_dp_reg(C_AL, OP_MVN, 0, d, 0, a, SH_LSL, 0);
 				put(rd, d);
 				return 1;
 			}
-			if (rs == 0 && f != 0x24 && f != 0x27 && f != 0x22 && f != 0x23) {
-				b = get(rt, R1);
-				d = dst(rd, R0);
-				if (d != b) a_mov(d, b);
-				put(rd, d);
+			if ((rt == 0 && f != 0x24) || (rs == 0 && f != 0x24 && f != 0x27 && f != 0x22 && f != 0x23)) {
+				// copia: se carga directamente en el registro de destino, o se guarda directamente el de origen
+				int src = rt == 0 ? (int)rs : (int)rt;
+				d = dst(rd, -1);
+				if (d < 0) put(rd, get(src, R0));
+				else {
+					a = get(src, d);
+					if (a != d) a_mov(d, a);
+					put(rd, d);
+				}
 				return 1;
 			}
 			if (is_const(rt) && f != 0x27 && arm_imm(const_of(rt)) >= 0) {
@@ -1072,8 +1076,9 @@ static int emit_op(u32 op, u32 pc, int ninstr)
 		int a, d;
 		if (!rt) return 1;
 		if (is_const(rs)) { put_const(rt, const_of(rs) + simm); return 1; }
-		a = get(rs, R0);
 		d = dst(rt, R0);
+		a = get(rs, d);   // si rs no tiene registro, se carga ya en el destino
+		if (simm == 0 && d == R0 && a != R0) { put(rt, a); return 1; }   // copia a un registro sin asignar: guardar el origen
 		a_addi(d, a, simm, R1);
 		if (rt == 29 && rs == 29 && hsp_ok) {   // addiu sp, sp, n: la dirección real de la pila se mueve igual
 			put(rt, d);
