@@ -124,6 +124,12 @@ static void run(int ch)
 			addr += words * 4;
 			words = 0;
 		}
+		if (ch == CH_CDROM && !from_ram && step == 4 && (addr & 0x1ffffc) + words * 4 <= 0x200000) {   // de golpe (sectores)
+			cdrom_dma_words(ram32(addr), words);
+			dyn_ram_written_if(addr & 0x1ffffc, words * 4);
+			addr += words * 4;
+			words = 0;
+		}
 		if (ch == CH_MDEC_IN && from_ram && step == 4 && (addr & 0x1ffffc) + words * 4 <= 0x200000) {   // de golpe (vídeos)
 			mdec_write_words(ram32(addr), words);
 			addr += words * 4;

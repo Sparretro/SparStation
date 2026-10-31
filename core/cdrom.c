@@ -476,3 +476,17 @@ void cdlog_dma(u32 ch, u32 madr, u32 bcr, u32 chcr)   // pruebas: arranques de D
 #ifdef PSX_CDLOG
 void cdlog_any(u32 v) { CDLOG(v); }
 #endif
+
+// Varias palabras del sector de golpe (la DMA del CD); lo que pase del final, como read_data
+u32 cdrom_dma_words(u32 *dst, u32 n)
+{
+	u32 k = 0;
+	if (!(data_pos & 3) && data_pos < data_len) {
+		k = (data_len - data_pos) / 4;
+		if (k > n) k = n;
+		memcpy(dst, data_fifo + data_pos, k * 4);
+		data_pos += k * 4;
+	}
+	for (; k < n; k++) dst[k] = cdrom_dma_word();
+	return n;
+}

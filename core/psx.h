@@ -183,6 +183,7 @@ void cdrom_set_disc(psx_sector_reader rd, void *user, u32 sectors);
 u32 cdrom_read(u32 reg);
 void cdrom_write(u32 reg, u32 v);
 u32 cdrom_dma_word(void);
+u32 cdrom_dma_words(u32 *dst, u32 n);   // la DMA del CD, de golpe
 int cdrom_next_event(u32 *when);
 void cdrom_tick(void);
 // Audio XA: los sectores de audio que el juego manda a la SPU se le pasan al frontend tal cual (2352 bytes)
