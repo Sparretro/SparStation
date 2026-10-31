@@ -217,6 +217,14 @@ static int pick_game(char *out, size_t outlen)
 		if (ext && (!strcasecmp(ext, ".cue") || !strcasecmp(ext, ".bin"))) snprintf(names[n++], 128, "%s", e->d_name);
 	}
 	closedir(d);
+	for (int i = 0; i < n; i++) {   // un .bin con su .cue al lado: solo el .cue
+		const char *ext = strrchr(names[i], '.');
+		int stem = (int)(ext - names[i]), dup = 0;
+		if (strcasecmp(ext, ".bin")) continue;
+		for (int j = 0; j < n && !dup; j++)
+			dup = j != i && !strncasecmp(names[j], names[i], stem) && !strcasecmp(names[j] + stem, ".cue");
+		if (dup) { memmove(names[i], names[i + 1], (size_t)(n - i - 1) * sizeof names[0]); n--; i--; }
+	}
 	if (!n) return 0;
 	for (;;) {
 		int keys;
