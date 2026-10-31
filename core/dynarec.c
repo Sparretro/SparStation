@@ -401,12 +401,35 @@ static void h_div(s32 n, s32 d)
 {
 	if (d == 0) { cpu.hi = (u32)n; cpu.lo = n >= 0 ? 0xffffffff : 1; }
 	else if ((u32)n == 0x80000000 && d == -1) { cpu.hi = 0; cpu.lo = 0x80000000; }
-	else { cpu.lo = (u32)(n / d); cpu.hi = (u32)(n % d); }
+	else {
+#ifdef ARM9
+		// divisor por hardware de la DS (32/32 con signo): más rápido que la división por software
+		REG_DIVCNT = DIV_32_32;
+		REG_DIV_NUMER_L = n;
+		REG_DIV_DENOM_L = d;
+		while (REG_DIVCNT & DIV_BUSY) { }
+		cpu.lo = (u32)REG_DIV_RESULT_L;
+		cpu.hi = (u32)REG_DIVREM_RESULT_L;
+#else
+		cpu.lo = (u32)(n / d);
+		cpu.hi = (u32)(n % d);
+#endif
+	}
 }
 
 static void h_divu(u32 n, u32 d)
 {
 	if (d == 0) { cpu.hi = n; cpu.lo = 0xffffffff; }
+#ifdef ARM9
+	else if ((s32)n >= 0 && (s32)d > 0) {   // sin el bit alto: vale la división con signo del hardware
+		REG_DIVCNT = DIV_32_32;
+		REG_DIV_NUMER_L = (s32)n;
+		REG_DIV_DENOM_L = (s32)d;
+		while (REG_DIVCNT & DIV_BUSY) { }
+		cpu.lo = (u32)REG_DIV_RESULT_L;
+		cpu.hi = (u32)REG_DIVREM_RESULT_L;
+	}
+#endif
 	else { cpu.lo = n / d; cpu.hi = n % d; }
 }
 
