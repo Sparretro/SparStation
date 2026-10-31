@@ -333,6 +333,7 @@ int main(int argc, char **argv)
 		if (!strcmp(argv[i], "--frameskip") && i + 1 < argc) gpu_frameskip = (u8)atoi(argv[i + 1]);
 		if (!strcmp(argv[i], "--rows") && i + 1 < argc) rows_mode = ds_rows = atoi(argv[i + 1]);
 		if (!strcmp(argv[i], "--halfx")) gpu_half_x = 1;
+		if (!strcmp(argv[i], "--fastboot")) psx_fastboot = 1;
 		if (!strcmp(argv[i], "--wav") && i + 1 < argc && (wav = fopen(argv[i + 1], "wb"))) { wav_header(wav, 0); spu_hw = &pc_spu; cd_audio_hw = &pc_cd; }
 		// (se aplica tras psx_init)   // como la DS: 1 = filas que se ven, 2 = pares
 	}

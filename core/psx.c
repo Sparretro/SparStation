@@ -15,6 +15,7 @@ void bus_reset(void);
 
 static const u8 *pending_exe;
 static u32 pending_len;
+u8 psx_fastboot;   // arranque rápido: al llegar al shell, el ejecutable del CD (sin la animación de la BIOS)
 
 int psx_init(void)
 {
@@ -39,7 +40,7 @@ void psx_reset(void)
 	spu_reset();
 	mdec_reset();
 	psx_cycles = 0;
-	psx_hook_pc = pending_exe ? 0x80030000 : 0;
+	psx_hook_pc = pending_exe || psx_fastboot ? 0x80030000 : 0;
 }
 
 static u32 rd32(const u8 *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((u32)p[3] << 24); }
@@ -66,6 +67,34 @@ int psx_sideload_exe_reader(const u8 *header, int (*read)(void *user, u8 *dst, u
 	return 1;
 }
 
+// Arranque rápido desde el CD: el ejecutable que diría SYSTEM.CNF, cargado como el shell lo cargaría
+static void cd_fastboot(void)
+{
+	static u8 sec[2048];
+	u32 lba, fsize, pc0, gp0, dst, size, sp;
+	cdrom_boot_state();
+	if (!cdrom_boot_exe(&lba, &fsize) || !cdrom_read_data(lba, sec) || memcmp(sec, "PS-X EXE", 8)) return;   // si no, la BIOS sigue sola
+	pc0 = rd32(sec + 0x10);
+	gp0 = rd32(sec + 0x14);
+	dst = rd32(sec + 0x18);
+	size = rd32(sec + 0x1c);
+	sp = rd32(sec + 0x30) + rd32(sec + 0x34);
+	if (size > fsize - 0x800) size = fsize - 0x800;
+	for (u32 done = 0; done < size; done += 2048) {
+		u32 n = size - done < 2048 ? size - done : 2048, off = (dst + done) & 0x1fffff;
+		if (!cdrom_read_data(lba + 1 + done / 2048, sec)) return;
+		if (off + n > 0x200000) n = 0x200000 - off;
+		memcpy(psx_ram + off, sec, n);
+	}
+#ifdef PSX_DYNAREC
+	dyn_ram_written(dst & 0x1fffff, size);
+#endif
+	cpu.pc = pc0;
+	cpu.next_pc = pc0 + 4;
+	cpu.r[28] = gp0;
+	if (sp != 0) cpu.r[29] = cpu.r[30] = sp;
+}
+
 // La BIOS salta al shell en 0x80030000 cuando ya ha montado el kernel: justo ahí cambiamos el
 // shell por el ejecutable, igual que hacen los emuladores de PC con el «fast boot».
 void psx_hook(void)
@@ -73,7 +102,10 @@ void psx_hook(void)
 	const u8 *e = pending_exe;
 	u32 pc0, gp0, dst, size, sp_base, sp_size;
 	psx_hook_pc = 0;
-	if (!e) return;
+	if (!e) {
+		if (psx_fastboot) cd_fastboot();
+		return;
+	}
 	pc0 = rd32(e + 0x10);
 	gp0 = rd32(e + 0x14);
 	dst = rd32(e + 0x18);

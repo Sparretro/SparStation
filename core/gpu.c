@@ -1105,8 +1105,14 @@ static struct { int on, x, y, w, h; u16 c; } pend;
 
 static void fill_rect(int x0, int y0, int w, int h, u16 c)
 {
-	for (int y = 0; y < h; y++)
-		for (int x = 0; x < w; x++) VRAM(x0 + x, y0 + y) = c;
+	u32 cc = c | (u32)c << 16;
+	for (int y = 0; y < h; y++) {
+		if ((x0 & 1023) + w <= 1024 && !(x0 & 1) && !(w & 1)) {   // fila seguida: de dos en dos píxeles (la BIOS borra 640x480 cada frame)
+			u32 *p = (u32 *)&VRAM(x0, y0 + y);
+			for (int n = w >> 1; n; n--) *p++ = cc;
+		} else
+			for (int x = 0; x < w; x++) VRAM(x0 + x, y0 + y) = c;
+	}
 }
 
 static void pend_touch(int x, int y, int w, int h)   // algo va a escribir en la VRAM

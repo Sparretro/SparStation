@@ -832,6 +832,9 @@ static void rng_after(u32 op)
 static int scr_derived(int rs, u32 simm, int bytes)
 {
 	s32 lo, hi;
+#ifdef DYN_NOSCR
+	return 0;
+#endif
 	if (!rs || rng[rs].kind != RK_SCR) return 0;
 	lo = (s32)rng[rs].lo + (s32)simm;
 	hi = (s32)rng[rs].hi + (s32)simm + bytes;
@@ -1122,10 +1125,16 @@ static void alloc_regs(u32 pc)
 	for (int i = 0; i < 32; i++) rg[i].host = -1;
 	stale_mask = 0;
 	use_hsp = hsp_ok = sp_ops >= 2 && lin(pc) < 0x200000 && !sp_is_unsafe(pc);
+#ifdef DYN_NOHSP
+	use_hsp = hsp_ok = 0;
+#endif
 	scr_reg = scr_ok = 0;
 	if (!pc_in(scr_unsafe, pc) && scr_unsafe_n < 200)
 		for (int i = 1; i < 32; i++)
 			if (scr_uses[i] >= 2 && (!scr_reg || scr_uses[i] > scr_uses[scr_reg])) scr_reg = i;
+#ifdef DYN_NOSCR
+	scr_reg = 0;
+#endif
 	if (scr_reg) { scr_ok = 1; scr_val = pv[scr_reg]; }
 	for (int h = 0; h < 5 && seen; h++) {
 		if (use_hsp && host_pool[h] == RHSP) continue;
@@ -1590,8 +1599,9 @@ static int vsync_poll_call(u32 pc)
 	return 0;
 }
 
-// Saltar la espera hasta el siguiente evento
-static void emit_idle(u32 target)
+// Saltar la espera hasta el siguiente evento. vs_off >= 0: bucle de VSync() de PsyQ, cuyo plazo (un contador en
+// vs_off(sp) que baja en cada vuelta) se descuenta con las vueltas que habría dado en el tiempo saltado
+static void emit_idle(u32 target, int vs_off)
 {
 #ifdef PSX_PROFILE
 	a_movi(R2, (u32)(uintptr_t)&psx_stat.dyn_idle);
@@ -1599,7 +1609,31 @@ static void emit_idle(u32 target)
 	a_dp_imm(C_AL, OP_ADD, 0, R3, R3, 1);
 	a_str(R3, R2, 0);
 #endif
-	a_dp_imm(C_AL, OP_MOV, 0, RCYC, 0, 0);   // psx_cycles = psx_run_until
+	// Esperas de hardware (registros que cambian con el tiempo) o de interrupciones: se salta al siguiente evento.
+	// El VSync() de PsyQ además lleva un plazo; Tomb Raider lo llama sin la vblank activada y sale por ahí.
+	{
+#ifdef DYN_NOVSADJ
+		vs_off = -1;
+#endif
+		if (vs_off >= 0) {
+			u32 *not_ram;
+			a_ldr(R0, RCPU, OFF_R(29));
+			a_addi(R0, R0, (u32)(s32)(s16)vs_off, R1);
+			a_dp_imm(C_AL, OP_TST, 1, 0, R0, arm_imm(0x1f800000));
+			not_ram = fwd(C_NE);
+			a_dp_reg(C_AL, OP_MOV, 0, R0, 0, R0, SH_LSL, 11);
+			a_mem_regsh(C_AL, 1, 0, R1, RRAM, R0, SH_LSR, 11);
+			a_dp_imm(C_AL, OP_RSB, 0, R2, RCYC, 0);   // ciclos saltados
+			a_movi(R3, 65536 / 26);                     // una vuelta son unas 13 instrucciones
+			a_mul(R2, R3, R2);
+			a_dp_reg(C_AL, OP_MOV, 0, R2, 0, R2, SH_LSR, 16);
+			a_dp_reg(C_AL, OP_SUB, 1, R1, R1, R2, SH_LSL, 0);
+			a_dp_imm(C_MI, OP_MOV, 0, R1, 0, 0);       // sin pasarse: la siguiente vuelta lo deja en -1
+			a_mem_regsh(C_AL, 0, 0, R1, RRAM, R0, SH_LSR, 11);
+			land(not_ram);
+		}
+		a_dp_imm(C_AL, OP_MOV, 0, RCYC, 0, 0);   // psx_cycles = psx_run_until
+	}
 	exit_pc(target);
 }
 
@@ -1749,7 +1783,7 @@ static block_fn compile(u32 pc, block_fn *s)
 				u32 *out;
 				emit_cycles(n);
 				out = fwd(C_PL);
-				emit_idle(target);
+				emit_idle(target, -1);
 				begin_cold();
 				land(out);
 				exit_pc(target);
@@ -1757,6 +1791,9 @@ static block_fn compile(u32 pc, block_fn *s)
 			} else {
 				u32 *out, *not_taken, *taken_exit;
 				int idle = (target == pc || psyq_vsync(target) || vsync_poll_call(target)) && pure_loop(pc, cur), c;
+#ifdef DYN_NOIDLE
+				idle = 0;
+#endif
 				// operandos listos antes de mirar el tiempo: los dos caminos los usan
 				if (late) branch_operands(op, &a, &b, R2, R3);
 				else { a_ldr(R2, RCPU, off_tmp); a = R2; b = -1; }
@@ -1765,7 +1802,7 @@ static block_fn compile(u32 pc, block_fn *s)
 				if (late) c = branch_cond(op, a, b);
 				else { a_dp_imm(C_AL, OP_CMP, 1, 0, R2, 0); c = C_NE; }
 				not_taken = fwd(c ^ 1);
-				if (idle) emit_idle(target);
+				if (idle) emit_idle(target, psyq_vsync(target) ? (int)(fetch_op(target) & 0xffff) : -1);
 				else link_site(target);
 				land(not_taken);
 				goon = !idle && sb_cont(op, cur, pc) && tot + 2 < SB_MAX && !has_block(cur + 8);
@@ -1913,6 +1950,10 @@ void dyn_run(u32 until)
 		}
 #endif
 		if (cpu_dyn_irq()) { psx_cycles += 2; continue; }
+#ifdef DYN_INTERP
+		cpu_interp_step();   // pruebas: todo con el intérprete (¿el fallo es del dynarec?)
+		continue;
+#endif
 		// con la caché aislada (la BIOS la vacía así) las escrituras no deben llegar a la RAM
 		if (cpu.cop0[12] & (1 << 16)) { cpu_interp_step(); continue; }
 		s = slot(cpu.pc);

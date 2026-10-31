@@ -733,6 +733,7 @@ int main(void)
 			else psx_tty = tty_out;
 		} else if (nitro && open_subset()) {
 			printf("Modo DS: disco reducido\n");
+			psx_fastboot = 1;
 		} else printf("Modo DS: demo de la BIOS.\nLos juegos necesitan modo DSi.\n");
 		psx_reset();
 		if (nitro && !psx_tty) {   // banco de pruebas: empezar desde un estado guardado, con guion de botones
@@ -775,6 +776,7 @@ int main(void)
 	card_open(game);
 	snd_enable(opt_snd);
 	snprintf(state_path, sizeof state_path, "%.*s.sst", (int)(strrchr(card_path, '.') - card_path), card_path);
+	psx_fastboot = 1;   // sin la animación de la BIOS (unos 25 s en la DSi)
 	psx_reset();
 	apply_cfg();
 	irqSet(IRQ_VBLANK, on_vblank);

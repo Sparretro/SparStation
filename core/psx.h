@@ -301,6 +301,10 @@ void dyn_reset(void);   // olvida todo el código traducido
 int psx_init(void);   // reserva RAM y VRAM; psx_bios (512 KB) lo pone el frontend
 void psx_reset(void);
 int psx_sideload_exe(const u8 *exe, u32 len);   // carga un PS-X EXE cuando la BIOS llega al shell
+extern u8 psx_fastboot;   // 1: los juegos de CD arrancan sin la animación de la BIOS
+int cdrom_boot_exe(u32 *lba, u32 *size);
+int cdrom_read_data(u32 lba, u8 *out2048);
+void cdrom_boot_state(void);
 int psx_sideload_exe_reader(const u8 *header, int (*read)(void *user, u8 *dst, u32 len), void *user);
 void psx_run_frame(void);
 extern void (*psx_tty)(int c);   // salida de printf de la BIOS (puede ser NULL)
