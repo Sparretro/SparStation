@@ -26,7 +26,7 @@ DATA     := data
 ARCH     := -marm -march=armv5te -mtune=arm946e-s
 CFLAGS   := -Wall -O2 -ffunction-sections -fdata-sections -fomit-frame-pointer $(ARCH) $(INCLUDE) -DARM9 -DPSX_PROFILE -DPSX_DYNAREC -DPSX_TTY
 ASFLAGS  := $(ARCH)
-LDFLAGS   = -specs=ds_arm9.specs $(ARCH) -Wl,-Map,$(notdir $*.map)
+LDFLAGS   = -specs=ds_arm9.specs $(ARCH) -Wl,-Map,$(notdir $*.map) $(EXTRA_LD)
 LIBS     := -lfat -lnds9 -lm
 # Pruebas en melonDS (modo DS, 4 MB): la BIOS va en nitro:/bios.bin y se copia al Expansion Pak de la ranura
 # de GBA, que deja más memoria para la caché de código. Compila aparte (build_test, SparStation_test.nds).

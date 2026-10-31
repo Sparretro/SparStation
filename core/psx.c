@@ -243,3 +243,6 @@ int psx_state_load(int (*read)(void *user, void *p, u32 len), void *user)
 _Static_assert(offsetof(GteRegs, TR) == 48 && offsetof(GteRegs, OFX) == 84 && offsetof(GteRegs, OFY) == 88 &&
                offsetof(GteRegs, V) == 96 && offsetof(GteRegs, RT) == 134 && offsetof(GteRegs, H) == 204,
                "desplazamientos de la GTE que usa gte_rtpt_asm");
+_Static_assert(offsetof(GteRegs, SZ) == 196 && offsetof(GteRegs, SX) == 122 && offsetof(GteRegs, SY) == 128 &&
+               offsetof(GteRegs, MAC) == 32 && offsetof(GteRegs, IR) == 114 && offsetof(GteRegs, DQA) == 188 &&
+               offsetof(GteRegs, DQB) == 92 && offsetof(GteRegs, FLAG) == 28, "más desplazamientos de la GTE del ensamblador");

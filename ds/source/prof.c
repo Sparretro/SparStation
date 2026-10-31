@@ -96,3 +96,16 @@ void prof_sync(void)
 	fflush(pf);
 	fsync(fileno(pf));
 }
+
+#ifdef DIV_TRACE
+// Pruebas: quién llama a la división por software (con -Wl,--wrap=__aeabi_idiv); dsbench lo saca con DSB_MAGIC=SPDIVTRC
+int __real___aeabi_idiv(int a, int b);
+struct { char magic[8]; u32 n, pc[256], cnt[256]; } div_trace = { "SPDIVTRC" };
+int __wrap___aeabi_idiv(int a, int b)
+{
+	u32 ra = (u32)__builtin_return_address(0), i;
+	for (i = 0; i < div_trace.n && div_trace.pc[i] != ra; i++) { }
+	if (i < 256) { if (i == div_trace.n) { div_trace.pc[i] = ra; div_trace.n++; } div_trace.cnt[i]++; }
+	return __real___aeabi_idiv(a, b);
+}
+#endif

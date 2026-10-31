@@ -522,6 +522,46 @@ __asm__(
 "	ldr r12, [r0, #88]\n"
 "	PROJ r8, r12, 13, 38+\\vi*2\n"
 ".endm\n"
+// el final de RTPS/RTPT: MAC1-3 e IR1-3 del último vértice, profundidad (MAC0 = n*DQA + DQB, IR0 recortado a
+// [0, 1000h]) y FLAG |= las banderas. o (r1) tiene lo del último vértice.
+".macro FINISH\n"
+"	ldr r4, [r1, #0]\n"
+"	str r4, [r0, #36]\n"
+"	ldr r4, [r1, #4]\n"
+"	str r4, [r0, #40]\n"
+"	ldr r4, [r1, #8]\n"
+"	str r4, [r0, #44]\n"
+"	ldr r4, [r1, #12]\n"
+"	strh r4, [r0, #116]\n"
+"	ldr r4, [r1, #16]\n"
+"	strh r4, [r0, #118]\n"
+"	ldr r4, [r1, #20]\n"
+"	strh r4, [r0, #120]\n"
+"	ldr r7, [r1, #24]\n"
+"	ldrsh r8, [r0, #188]\n"
+"	ldr r12, [r0, #92]\n"
+"	smull r9, r10, r7, r8\n"
+"	adds r9, r9, r12\n"
+"	adc r10, r10, r12, asr #31\n"
+"	str r9, [r0, #32]\n"
+"	cmp r10, r9, asr #31\n"
+"	beq 1f\n"
+"	cmp r10, #0\n"
+"	orrge r11, r11, #(1 << 16)\n"
+"	orrlt r11, r11, #(1 << 15)\n"
+"1:	mov r8, r9, lsr #12\n"
+"	orr r8, r8, r10, lsl #20\n"
+"	cmp r8, #0\n"
+"	movlt r8, #0\n"
+"	orrlt r11, r11, #(1 << 12)\n"
+"	cmp r8, #0x1000\n"
+"	movgt r8, #0x1000\n"
+"	orrgt r11, r11, #(1 << 12)\n"
+"	strh r8, [r0, #114]\n"
+"	ldr r4, [r0, #28]\n"
+"	orr r4, r4, r11\n"
+"	str r4, [r0, #28]\n"
+".endm\n"
 "	.global gte_rtpt_asm\n"
 "	.type gte_rtpt_asm, %function\n"
 "gte_rtpt_asm:\n"
@@ -530,50 +570,75 @@ __asm__(
 "	RTPV 0\n"
 "	RTPV 1\n"
 "	RTPV 2\n"
-"	str r11, [r1, #28]\n"
+"	ldrh r4, [r0, #202]\n"              // SZ0 = SZ3 de antes; SZ1-3, SX0-2 y SY0-2: los de los tres vértices
+"	strh r4, [r0, #196]\n"
+"	ldrh r4, [r1, #44]\n"               // (de media en media palabra: SZ1 no está alineado a 4 y el ARM9
+"	ldrh r5, [r1, #46]\n"               // no lee ni escribe palabras desalineadas)
+"	ldrh r6, [r1, #48]\n"
+"	strh r4, [r0, #198]\n"
+"	strh r5, [r0, #200]\n"
+"	strh r6, [r0, #202]\n"
+"	ldrh r4, [r1, #32]\n"
+"	ldrh r5, [r1, #34]\n"
+"	ldrh r6, [r1, #36]\n"
+"	strh r4, [r0, #122]\n"
+"	strh r5, [r0, #124]\n"
+"	strh r6, [r0, #126]\n"
+"	ldrh r4, [r1, #38]\n"
+"	ldrh r5, [r1, #40]\n"
+"	ldrh r6, [r1, #42]\n"
+"	strh r4, [r0, #128]\n"
+"	strh r5, [r0, #130]\n"
+"	strh r6, [r0, #132]\n"
+"	FINISH\n"
 "	pop {r4-r11, pc}\n"
 "	.size gte_rtpt_asm, . - gte_rtpt_asm\n"
-"	.global gte_rtps_asm\n"             // RTPS: solo el vértice 0
+"	.global gte_rtps_asm\n"             // RTPS: solo el vértice 0 (las colas avanzan una)
 "	.type gte_rtps_asm, %function\n"
 "gte_rtps_asm:\n"
 "	push {r4-r11, lr}\n"
 "	mov r11, #0\n"
 "	RTPV 0\n"
-"	str r11, [r1, #28]\n"
+"	ldrh r4, [r0, #198]\n"              // SZ0-2 = SZ1-3; SZ3 = el nuevo
+"	ldrh r5, [r0, #200]\n"
+"	ldrh r6, [r0, #202]\n"
+"	ldrh r7, [r1, #44]\n"
+"	strh r4, [r0, #196]\n"
+"	strh r5, [r0, #198]\n"
+"	strh r6, [r0, #200]\n"
+"	strh r7, [r0, #202]\n"
+"	ldr r4, [r0, #124]\n"               // SX0-1 = SX1-2 (4 bytes alineados), SX2 = el nuevo
+"	ldrh r5, [r1, #32]\n"
+"	strh r4, [r0, #122]\n"
+"	mov r4, r4, lsr #16\n"
+"	strh r4, [r0, #124]\n"
+"	strh r5, [r0, #126]\n"
+"	ldrh r4, [r0, #130]\n"              // SY0-1 = SY1-2, SY2 = el nuevo
+"	ldrh r5, [r0, #132]\n"
+"	ldrh r6, [r1, #38]\n"
+"	strh r4, [r0, #128]\n"
+"	strh r5, [r0, #130]\n"
+"	strh r6, [r0, #132]\n"
+"	FINISH\n"
 "	pop {r4-r11, pc}\n"
 "	.size gte_rtps_asm, . - gte_rtps_asm\n"
 "	.purgem RTPROW\n"
 "	.purgem PROJ\n"
 "	.purgem RTPV\n"
+"	.purgem FINISH\n"
 );
 
 static __attribute__((noinline)) void rtpt12f(void)
 {
-	RtpOut o;
+	RtpOut o;   // trabajo del ensamblador; lo que ve el juego lo escribe él directamente en la GTE
 	if (((u32)(TR[0] + 0x40000000) | (u32)(TR[1] + 0x40000000) | (u32)(TR[2] + 0x40000000)) >= 0x80000000u) {
 		rtp12f(0, 0); rtp12f(1, 0); rtp12f(2, 1);
 		return;
 	}
 	gte_rtpt_asm(&psx_core.gte, &o, lm ? 0 : -0x8000, unr);
-	SZ[0] = SZ[3]; SZ[1] = o.sz[0]; SZ[2] = o.sz[1]; SZ[3] = o.sz[2];
-	SX[0] = o.sx[0]; SX[1] = o.sx[1]; SX[2] = o.sx[2];
-	SY[0] = o.sy[0]; SY[1] = o.sy[1]; SY[2] = o.sy[2];
-	MAC[1] = o.mac1; MAC[2] = o.mac2; MAC[3] = o.z12;
-	IR[1] = (s16)o.ir1; IR[2] = (s16)o.ir2; IR[3] = (s16)o.ir3;
-	{
-		u32 fl = o.fl;
-		s64 d = (s64)o.n * DQA + DQB;
-		s32 ir0 = (s32)(d >> 12);
-		if (d > 0x7fffffffLL) fl |= 1u << 16;
-		else if (d < -0x80000000LL) fl |= 1u << 15;
-		MAC[0] = (s32)d;
-		if (ir0 < 0) { ir0 = 0; fl |= 1u << 12; } else if (ir0 > 0x1000) { ir0 = 0x1000; fl |= 1u << 12; }
-		IR[0] = (s16)ir0;
-		FLAG |= fl;
-	}
 }
 
-// RTPS: lo mismo que rtp12f(0, 1) con el vértice en ensamblador
+// RTPS: lo mismo que rtp12f(0, 1), en ensamblador
 static __attribute__((noinline)) void rtps12f(void)
 {
 	RtpOut o;
@@ -582,22 +647,6 @@ static __attribute__((noinline)) void rtps12f(void)
 		return;
 	}
 	gte_rtps_asm(&psx_core.gte, &o, lm ? 0 : -0x8000, unr);
-	SZ[0] = SZ[1]; SZ[1] = SZ[2]; SZ[2] = SZ[3]; SZ[3] = o.sz[0];
-	SX[0] = SX[1]; SX[1] = SX[2]; SX[2] = o.sx[0];
-	SY[0] = SY[1]; SY[1] = SY[2]; SY[2] = o.sy[0];
-	MAC[1] = o.mac1; MAC[2] = o.mac2; MAC[3] = o.z12;
-	IR[1] = (s16)o.ir1; IR[2] = (s16)o.ir2; IR[3] = (s16)o.ir3;
-	{
-		u32 fl = o.fl;
-		s64 d = (s64)o.n * DQA + DQB;
-		s32 ir0 = (s32)(d >> 12);
-		if (d > 0x7fffffffLL) fl |= 1u << 16;
-		else if (d < -0x80000000LL) fl |= 1u << 15;
-		MAC[0] = (s32)d;
-		if (ir0 < 0) { ir0 = 0; fl |= 1u << 12; } else if (ir0 > 0x1000) { ir0 = 0x1000; fl |= 1u << 12; }
-		IR[0] = (s16)ir0;
-		FLAG |= fl;
-	}
 }
 #else
 static void rtps12f(void) { rtp12f(0, 1); }

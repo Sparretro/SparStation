@@ -86,6 +86,17 @@ static int open_subset(void)
 	disc = fopen("nitro:/disc.dat", "rb");
 	if (!disc) return 0;
 	cdrom_set_disc(read_subset, NULL, total);
+	{   // índice de pistas del disco entero (tools/cuetrk), si el juego tiene pistas de audio
+		FILE *t = fopen("nitro:/disc.trk", "rb");
+		u32 nt = 0, v[3];
+		static PsxTrack trk[99];
+		if (t && fread(&nt, 4, 1, t) == 1) {
+			if (nt > 99) nt = 99;
+			for (u32 i = 0; i < nt && fread(v, 4, 3, t) == 3; i++) { trk[i].audio = (u8)v[0]; trk[i].start = v[1]; trk[i].pre = v[2]; }
+			cdrom_set_tracks(trk, (int)nt);
+		}
+		if (t) fclose(t);
+	}
 	snd_set_disc(read_subset);
 	return 1;
 }

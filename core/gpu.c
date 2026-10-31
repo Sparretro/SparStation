@@ -1431,15 +1431,26 @@ u32 gp0_hist[256];
 // mode 0: todas; 1: solo las que se ven; 2: además solo pares (el frontend repite la de arriba)
 static void rows_update(void)
 {
+	// las filas (y*alto/out_lines) solo cambian con el alto, el modo o las líneas de salida: se calculan una vez
+	// (Tomb Raider cambia de buffer en cada frame y eran 192 divisiones cada vez)
+	static u16 rows[512];
+	static int key_h = -1, key_mode = -1, key_lines = -1, nrows;
 	int h = gpu_disp.height, mode = rows_mode, out_lines = rows_lines;
 	gpu_rows_on = mode != 0;
 	if (!mode) return;
+	if (h != key_h || mode != key_mode || out_lines != key_lines) {
+		key_h = h; key_mode = mode; key_lines = out_lines;
+		nrows = out_lines < 512 ? out_lines : 512;
+		for (int y = 0; y < nrows; y++) {
+			int r = y * h / out_lines;
+			if (mode == 2) r &= ~1;
+			rows[y] = (u16)r;
+		}
+	}
 	memset(gpu_row_draw, 0, sizeof gpu_row_draw);
-	for (int y = 0; y < out_lines; y++) {
-		int r = y * h / out_lines;
-		if (mode == 2) r &= ~1;
-		gpu_row_draw[(g.disp_y + r) & 511] = 1;
-		gpu_row_draw[(prev_disp_y + r) & 511] = 1;
+	for (int y = 0; y < nrows; y++) {
+		gpu_row_draw[(g.disp_y + rows[y]) & 511] = 1;
+		gpu_row_draw[(prev_disp_y + rows[y]) & 511] = 1;
 	}
 }
 
