@@ -234,6 +234,51 @@ static void report_profile(void)
 	for (u32 a = cpu.cop0[14] - 24; a < cpu.cop0[14] + 16; a += 4) mips_dis(a, bus_read32(a));
 }
 
+// ---- sonido: --wav archivo mezcla las voces como lo haría el hardware de la DS (44100 Hz, estéreo) ----
+static struct { const s16 *pcm; u32 len, pos, pitch, l, r; s32 loop; int on; } pcv[24];
+static FILE *wav;
+static u32 wav_samples;
+
+static void pc_key_on(int v, const s16 *pcm, u32 len, s32 loop, u32 pitch)
+{
+	pcv[v].pcm = pcm; pcv[v].len = len; pcv[v].loop = loop; pcv[v].pitch = pitch;
+	pcv[v].pos = 0; pcv[v].l = pcv[v].r = 0; pcv[v].on = 1;
+}
+static void pc_update(int v, u32 pitch, u32 l, u32 r) { pcv[v].pitch = pitch; pcv[v].l = l; pcv[v].r = r; }
+static void pc_stop(int v) { pcv[v].on = 0; }
+static void pc_mix(u32 n)
+{
+	static s16 buf[2 * 64];
+	if (!wav) return;
+	for (u32 i = 0; i < n; i++) {
+		s32 L = 0, R = 0;
+		for (int v = 0; v < 24; v++) {
+			s32 s;
+			if (!pcv[v].on) continue;
+			s = pcv[v].pcm[pcv[v].pos >> 12];
+			L += s * (s32)pcv[v].l >> 15;
+			R += s * (s32)pcv[v].r >> 15;
+			pcv[v].pos += pcv[v].pitch;
+			if ((pcv[v].pos >> 12) >= pcv[v].len) {
+				if (pcv[v].loop >= 0) pcv[v].pos = ((u32)pcv[v].loop << 12) + (pcv[v].pos & 0xfff);
+				else pcv[v].on = 0;
+			}
+		}
+		buf[i * 2] = (s16)(L > 32767 ? 32767 : L < -32768 ? -32768 : L);
+		buf[i * 2 + 1] = (s16)(R > 32767 ? 32767 : R < -32768 ? -32768 : R);
+	}
+	fwrite(buf, 4, n, wav);
+	wav_samples += n;
+}
+static const SpuHw pc_spu = { pc_key_on, pc_update, pc_stop, pc_mix };
+
+static void wav_header(FILE *f, u32 samples)
+{
+	u32 h[11] = { 0x46464952, 36 + samples * 4, 0x45564157, 0x20746d66, 16, 0x00020001, 44100, 44100 * 4, 0x00100004, 0x61746164, samples * 4 };
+	fseek(f, 0, SEEK_SET);
+	fwrite(h, 4, 11, f);
+}
+
 int main(int argc, char **argv)
 {
 	u32 len;
@@ -253,6 +298,7 @@ int main(int argc, char **argv)
 		if (!strcmp(argv[i], "--frameskip") && i + 1 < argc) gpu_frameskip = (u8)atoi(argv[i + 1]);
 		if (!strcmp(argv[i], "--rows") && i + 1 < argc) rows_mode = ds_rows = atoi(argv[i + 1]);
 		if (!strcmp(argv[i], "--halfx")) gpu_half_x = 1;
+		if (!strcmp(argv[i], "--wav") && i + 1 < argc && (wav = fopen(argv[i + 1], "wb"))) { wav_header(wav, 0); spu_hw = &pc_spu; }
 		// (se aplica tras psx_init)   // como la DS: 1 = filas que se ven, 2 = pares
 	}
 	if (want_prof) {
@@ -353,6 +399,7 @@ int main(int argc, char **argv)
 #ifdef PSX_TRACE_IO
 	{ extern u32 gp0_hist[256]; for (int i = 0; i < 256; i++) if (gp0_hist[i]) printf("GP0 %02x x%u\n", i, gp0_hist[i]); }
 #endif
+	if (wav) { wav_header(wav, wav_samples); fclose(wav); printf("sonido: %.1f s\n", wav_samples / 44100.0); }
 	if (card_path && psx_memcard_writes) {
 		FILE *cf = fopen(card_path, "wb");
 		printf("tarjeta: %u sectores escritos -> %s\n", psx_memcard_writes, card_path);

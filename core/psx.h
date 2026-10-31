@@ -192,6 +192,18 @@ u32 spu_read16(u32 off);
 void spu_write16(u32 off, u32 v);
 void spu_dma_write(u32 v);
 u32 spu_dma_read(void);
+void spu_advance(u32 cycles);   // avanza envolventes y posiciones de las voces (lo llama psx_run_frame)
+// Salida: cada voz de la PS1 la toca un canal del frontend con la muestra ya en PCM de 16 bits.
+// pitch: 0x1000 = 44100 Hz; volúmenes 0..0x7fff por lado; loop = muestra de la vuelta o -1 (una vez).
+typedef struct {
+	void (*key_on)(int v, const s16 *pcm, u32 len, s32 loop, u32 pitch);
+	void (*update)(int v, u32 pitch, u32 l, u32 r);
+	void (*stop)(int v);
+	void (*mix)(u32 samples);   // opcional (PC): se han emulado tantas muestras a 44100 Hz
+} SpuHw;
+extern const SpuHw *spu_hw;
+extern u8 *spu_cache_mem;    // caché de muestras en PCM (si es NULL, psx_reset la reserva)
+extern u32 spu_cache_size;
 
 // botones del mando (bit a 0 = pulsado)
 enum {

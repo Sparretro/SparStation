@@ -27,7 +27,8 @@ static struct {
 
 static u32 fifo[16];
 static int fifo_n, fifo_need;
-static enum { M_CMD, M_LOAD, M_POLYLINE } mode;
+enum { M_CMD, M_LOAD, M_POLYLINE };
+static u32 mode;   // u32 y no el enum: en ARM los enum ocupan 1 byte y el estado guardado no casaría con el del PC
 static int load_x, load_y, load_w, load_h, load_i, load_total;
 static int store_x, store_y, store_w, store_h, store_i, store_total;
 static u32 gpuread;

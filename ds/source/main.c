@@ -9,6 +9,7 @@
 #include "psx.h"
 #include "hud.h"
 #include "gx.h"
+#include "snd.h"
 #ifdef SPAR_PROF
 #include "prof.h"
 #endif
@@ -43,7 +44,7 @@ static void watchdog(void)
 	}
 }
 
-static void on_vblank(void) { vblanks++; gx_dbg.vbl++; flip_in_vblank(); if (gpu_hw) gx_vblank(); watchdog(); }
+static void on_vblank(void) { vblanks++; snd_vblanks++;gx_dbg.vbl++; flip_in_vblank(); if (gpu_hw) gx_vblank(); watchdog(); }
 
 static int read_exe(void *user, u8 *dst, u32 len) { return fread(dst, 1, len, (FILE *)user) == len; }
 
@@ -509,6 +510,7 @@ static void wait_release(void) { do { swiWaitForVBlank(); scanKeys(); } while (k
 static void pause_menu(void)
 {
 	static int has_state = -1;
+	snd_pause(1);
 	wait_release();
 	if (has_state < 0) { FILE *f = fopen(state_path, "rb"); has_state = f != NULL; if (f) fclose(f); }
 	for (;;) {
@@ -556,6 +558,7 @@ static void pause_menu(void)
 	}
 	wait_release();
 	hud_redraw();
+	snd_pause(0);
 }
 
 // title NULL: sin medidor (la autoprueba usa la pantalla de abajo para su texto)
@@ -632,7 +635,13 @@ int main(void)
 #else
 	psx_bios = (u8 *)openbios_bin;   // la BIOS se usa desde la propia ROM, sin copiarla
 #endif
-	if (!psx_init() || !dyn_init(isDSiMode())) {
+#ifdef NO_SND
+	spu_cache_size = 0;   // banco de pruebas sin sonido (EXTRA=-DNO_SND)
+	psx_init();
+#else
+	if (psx_init()) snd_init(isDSiMode());   // la caché de sonido antes que la del dynarec, que se queda el resto
+#endif
+	if (!psx_ram || !dyn_init(isDSiMode())) {
 		printf("Sin memoria.\n");
 		for (;;) swiWaitForVBlank();
 	}

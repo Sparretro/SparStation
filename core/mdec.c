@@ -22,7 +22,8 @@ static u32 out_len, out_pos, out_cap;
 static u32 ctrl;
 static int qt_pos, qt_color, sc_pos;
 
-static enum { IDLE, DECODE, QUANT, SCALE } state;
+enum { IDLE, DECODE, QUANT, SCALE };
+static u32 state;   // u32 y no el enum: en ARM los enum ocupan 1 byte y el estado guardado no casaría con el del PC
 
 void mdec_reset(void)
 {
@@ -314,15 +315,22 @@ u32 mdec_status(void)
 
 int mdec_out_available(void) { return out_pos < out_len; }
 
-// Los búferes se guardan con su longitud; al cargar se hacen a medida
-static void buf_state(PsxState *s, void **buf, u32 *cap, u32 len)
+// Los búferes se guardan con su longitud; al cargar se hacen a medida. Si no hay memoria (modo DS) el
+// contenido se salta y el búfer queda vacío (devuelve 0): un vídeo a medias se pierde, el resto del estado no.
+static int buf_state(PsxState *s, void **buf, u32 *cap, u32 len)
 {
 	if (s->load && len > *cap) {
-		*buf = realloc(*buf, len);
+		void *nb = realloc(*buf, len);
+		if (!nb) {
+			static u8 skip[256];
+			for (u32 o = 0; o < len; o += sizeof skip) psx_state_io(s, skip, len - o < sizeof skip ? len - o : sizeof skip);
+			return 0;
+		}
+		*buf = nb;
 		*cap = len;
-		if (!*buf) { *cap = 0; s->ok = 0; return; }
 	}
 	if (len) psx_state_io(s, *buf, len);
+	return 1;
 }
 
 void mdec_state(PsxState *s)
@@ -334,7 +342,7 @@ void mdec_state(PsxState *s)
 	STATE(s, in_len);
 	STATE(s, out_len); STATE(s, out_pos);
 	in_bytes = in_len * 2;
-	{ u32 cap = in_cap * 2; void *b = in_buf; buf_state(s, &b, &cap, in_bytes); in_buf = b; in_cap = cap / 2; }
-	{ void *b = out_buf; buf_state(s, &b, &out_cap, out_len); out_buf = b; }
+	{ u32 cap = in_cap * 2; void *b = in_buf; if (!buf_state(s, &b, &cap, in_bytes)) in_len = 0; in_buf = b; in_cap = cap / 2; }
+	{ void *b = out_buf; if (!buf_state(s, &b, &out_cap, out_len)) out_len = out_pos = 0; out_buf = b; }
 	if (s->load) check_scale();
 }

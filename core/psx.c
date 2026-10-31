@@ -130,6 +130,7 @@ void psx_run_frame(void)
 		gpu_set_line(line);
 		run_until(line_start + PSX_LINE_CYCLES);
 		line_start += PSX_LINE_CYCLES;
+		spu_advance(PSX_LINE_CYCLES);
 		timers_hblank();
 		if (psx_line_cb) psx_line_cb();
 		if (line == PSX_VBLANK_LINE - 1) {
@@ -143,60 +144,6 @@ void psx_run_frame(void)
 #endif
 }
 
-// ---- SPU: de momento solo guarda registros y RAM de sonido para que los juegos no se cuelguen ----
-static u16 spu_regs[256];
-u16 *spu_mem;   // RAM de sonido (512 KB): si el frontend no la pone antes de psx_reset, se reserva aquí
-static u32 spu_addr;
-
-void spu_reset(void)
-{
-	if (!spu_mem) spu_mem = malloc(512 * 1024);
-	if (spu_mem) memset(spu_mem, 0, 512 * 1024);
-	memset(spu_regs, 0, sizeof spu_regs);
-	spu_addr = 0;
-}
-
-u32 spu_read16(u32 off)
-{
-	off &= 0x1fe;
-	if (off == 0x1ae) return spu_regs[0x1aa / 2] & 0x3f;   // SPUSTAT refleja el modo de SPUCNT
-	if (off == 0x1a6) return spu_addr >> 3;
-	return spu_regs[off / 2];
-}
-
-void spu_write16(u32 off, u32 v)
-{
-	off &= 0x1fe;
-	spu_regs[off / 2] = (u16)v;
-	if (off == 0x1a6) spu_addr = (v & 0xffff) << 3;
-	else if (off == 0x1a8) {
-		if (spu_mem) spu_mem[(spu_addr >> 1) & 0x3ffff] = (u16)v;
-		spu_addr = (spu_addr + 2) & 0x7ffff;
-	}
-}
-
-void spu_dma_write(u32 v)
-{
-	spu_write16(0x1a8, v & 0xffff);
-	spu_write16(0x1a8, v >> 16);
-}
-
-u32 spu_dma_read(void)
-{
-	u32 v = 0;
-	if (spu_mem) {
-		v = spu_mem[(spu_addr >> 1) & 0x3ffff] | (spu_mem[((spu_addr + 2) >> 1) & 0x3ffff] << 16);
-	}
-	spu_addr = (spu_addr + 4) & 0x7ffff;
-	return v;
-}
-
-void spu_state(PsxState *s)
-{
-	STATE(s, spu_regs);
-	STATE(s, spu_addr);
-	if (spu_mem) psx_state_io(s, spu_mem, 512 * 1024);
-}
 
 // ---- estados guardados ----
 #define STATE_MAGIC 0x54535053u   // "SPST"

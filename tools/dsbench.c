@@ -77,8 +77,20 @@ static void video(const void *data, unsigned w, unsigned h, size_t pitch)
 		}
 }
 
-static void audio(int16_t l, int16_t r) { (void)l; (void)r; }
-static size_t audio_batch(const int16_t *d, size_t n) { (void)d; return n; }
+// DSB_WAV=archivo: guarda el sonido de la DS (estéreo, 16 bits, a la frecuencia que da el núcleo)
+static FILE *wavf;
+static uint32_t wav_frames;
+static void audio(int16_t l, int16_t r) { int16_t s[2] = { l, r }; if (wavf) { fwrite(s, 2, 2, wavf); wav_frames++; } }
+static size_t audio_batch(const int16_t *d, size_t n) { if (wavf) { fwrite(d, 4, n, wavf); wav_frames += (uint32_t)n; } return n; }
+static void wav_finish(unsigned rate)
+{
+	uint32_t h[11] = { 0x46464952, 36 + wav_frames * 4, 0x45564157, 0x20746d66, 16, 0x00020001, rate, rate * 4, 0x00100004, 0x61746164, wav_frames * 4 };
+	if (!wavf) return;
+	fseek(wavf, 0, SEEK_SET);
+	fwrite(h, 4, 11, wavf);
+	fclose(wavf);
+	wavf = NULL;
+}
 // Pulsaciones simuladas: DSB_PRESS="start:300:60" pulsa START desde el frame 300 durante 60 frames
 static int cur_frame;
 static void poll(void) {}
@@ -183,6 +195,7 @@ int main(int argc, char **argv)
 		gi.data = buf;
 		gi.size = (size_t)n;
 	}
+	if (getenv("DSB_WAV") && (wavf = fopen(getenv("DSB_WAV"), "wb"))) fseek(wavf, 44, SEEK_SET);
 	if (!retro_load_game(&gi)) { fprintf(stderr, "no carga la ROM\n"); return 1; }
 	frames = atoi(argv[3]);
 	F(retro_get_memory_data, void *(*)(unsigned));
@@ -288,6 +301,7 @@ int main(int argc, char **argv)
 		for (size_t o = 0; r && o + 16 <= rn; o += 4)
 			if (!memcmp(r + o, "SPDBGSTG", 8)) { uint32_t *s = (uint32_t *)(r + o + 8); printf("STAGE %u (n=%u vbl=%u dyn=%u)\n", s[0], s[1], s[2], s[3]); break; }
 	}
+	wav_finish((unsigned)(wav_frames * 59.8261 / (frames > 0 ? frames : 1) + 0.5));   // frecuencia sacada de lo recibido
 	if (frame) save_png(argv[4]);
 	printf("ok %ux%u\n", fw, fh);
 	return 0;
