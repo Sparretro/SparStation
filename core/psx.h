@@ -191,7 +191,18 @@ typedef struct {
 	void (*sector)(u32 lba, const u8 *raw);   // sector de audio que pasa el filtro, en el momento de leerlo
 	void (*stop)(void);                       // el juego para el CD o salta a otro sitio
 	void (*mute)(int on);
+	void (*cdda)(u32 lba, u32 end);           // audio de CD (pistas de audio): suena desde lba hasta end (sin incluir)
 } CdAudioHw;
+// Pistas del disco (las del .cue). start: LBA del INDEX 01 desde el principio del disco; pre: el del INDEX 00
+// (donde empieza su pausa previa; = start si no tiene). Sin pistas, el disco es una sola de datos.
+typedef struct { u8 audio; u32 start, pre; } PsxTrack;
+void cdrom_set_tracks(const PsxTrack *t, int n);
+// .cue con varias pistas (cue.c): archivos seguidos en el disco y las pistas que contienen
+#define CUE_MAX_FILES 100
+typedef struct { char path[256]; u32 start, sectors; } CueFile;
+typedef struct { CueFile file[CUE_MAX_FILES]; int nfile; PsxTrack trk[99]; int ntrk; u32 total; } CueDisc;
+int cue_parse(const char *cue_path, const char *dir, CueDisc *d, u32 (*file_sectors)(const char *path));
+int cue_locate(const CueDisc *d, u32 lba, u32 *sector_in_file);
 extern const CdAudioHw *cd_audio_hw;
 typedef struct { s32 old[2], older[2]; } XaDecoder;   // historia del filtro por canal (se pone a cero al empezar)
 // Descodifica un sector XA (4032 muestras mono o 2016 pares L/R intercalados en out); devuelve muestras por
@@ -294,6 +305,8 @@ void gpu_state(PsxState *s);
 void gte_state(PsxState *s);
 void mdec_state(PsxState *s);
 void cdrom_state(PsxState *s);
+void cdrom_state_ext(PsxState *s);   // lo añadido después (va al final del estado: los viejos no lo tienen)
+void cdrom_ext_defaults(void);
 void sio_state(PsxState *s);
 void timers_state(PsxState *s);
 void spu_state(PsxState *s);

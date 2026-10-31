@@ -12,6 +12,31 @@ static psx_sector_reader reader;
 static void *reader_user;
 static u32 disc_sectors;
 
+// Pistas (las del .cue) y audio de CD: con Play la posición avanza en el tiempo de la PS1 (75 sectores por
+// segundo) y el frontend toca la pista a su velocidad real. Sin pistas, el disco es una sola de datos.
+static PsxTrack trk[99];
+static int ntrk;
+static u32 playing, play_due, report_tens;   // u32 (no int/u8 sueltos): el estado guardado igual en el PC y la DS
+
+void cdrom_set_tracks(const PsxTrack *t, int n)
+{
+	if (n > 99) n = 99;
+	if (n < 0) n = 0;
+	memcpy(trk, t, (size_t)n * sizeof *t);
+	ntrk = n;
+}
+
+static int tracks(void) { return ntrk ? ntrk : 1; }
+static u32 trk_start(int i) { return ntrk ? trk[i].start : 0; }
+static u32 trk_pre(int i) { return ntrk ? trk[i].pre : 0; }
+
+static int track_of(u32 lba)   // la pista (0..) en la que cae lba, contando su pausa previa
+{
+	int i = 0;
+	while (i + 1 < tracks() && lba >= trk_pre(i + 1)) i++;
+	return i;
+}
+
 static u8 index_reg, int_enable, int_flag;
 static u8 params[16], nparams;
 static u8 resp[16], resp_len, resp_pos;
@@ -52,7 +77,10 @@ void cdrom_reset(void)
 	seek_lba = cur_lba = 0;
 	seek_pending = reading = 0;
 	data_len = data_pos = 0;
+	cdrom_ext_defaults();
 }
+
+void cdrom_ext_defaults(void) { playing = 0; play_due = 0; report_tens = 0xff; }
 
 static void push(u8 irq, u32 delay, int n, const u8 *d)
 {
@@ -77,6 +105,26 @@ static void error(u8 code)
 
 static u32 sector_time(void) { return (mode & 0x80) ? PSX_CPU_HZ / 150 : PSX_CPU_HZ / 75; }
 
+// Posición del cabezal como la da el subcanal Q (GetlocP): pista, índice (0 en la pausa previa), tiempo dentro
+// de la pista (en la pausa, lo que falta para empezar) y tiempo absoluto; todo en BCD
+static void subq(u8 d[8])
+{
+	int i = track_of(cur_lba);
+	u32 st = trk_start(i), a = cur_lba + 150, r = cur_lba >= st ? cur_lba - st : st - cur_lba;
+	d[0] = bcd((u32)i + 1);
+	d[1] = cur_lba >= st ? 1 : 0;
+	d[2] = bcd(r / 4500); d[3] = bcd(r / 75 % 60); d[4] = bcd(r % 75);
+	d[5] = bcd(a / 4500); d[6] = bcd(a / 75 % 60); d[7] = bcd(a % 75);
+}
+
+// Hasta dónde suena una pista: con AutoPause (modo bit 1) hasta la siguiente; si no, hasta el final del disco
+static u32 play_end(void)
+{
+	int i = track_of(cur_lba);
+	if ((mode & 2) && i + 1 < tracks()) return trk_pre(i + 1);
+	return disc_sectors;
+}
+
 #ifdef PSX_CDLOG
 // Pruebas: las órdenes al CD (orden | parámetros << 8), para comparar el PC con la DS (DSB_MAGIC=SPCDLOG_)
 struct { char magic[8]; u32 n, e[8192]; } cd_log = { "SPCDLOG_" };
@@ -92,9 +140,13 @@ static void command(u8 cmd)
 #ifdef PSX_CDLOG
 	CDLOG(cmd | (u32)params[0] << 8 | (u32)params[1] << 16 | (u32)params[2] << 24);
 #endif
-	if (cd_audio_hw && (cmd == 0x08 || cmd == 0x09 || cmd == 0x0a || cmd == 0x15 || cmd == 0x16 ||
-	                    ((cmd == 0x06 || cmd == 0x1b) && seek_pending)))
-		cd_audio_hw->stop();   // el cabezal se para o salta: lo que sonaba del XA se acaba
+	if (cmd == 0x08 || cmd == 0x09 || cmd == 0x0a || cmd == 0x15 || cmd == 0x16 || cmd == 0x06 || cmd == 0x1b) {
+		// el cabezal se para o salta: lo que sonaba del XA se acaba (leer seguido no lo corta); y una pista de
+		// audio se acaba con cualquiera de estas
+		int moves = cmd != 0x06 && cmd != 0x1b ? 1 : seek_pending;
+		if (cd_audio_hw && (moves || playing)) cd_audio_hw->stop();
+		playing = 0;
+	}
 	switch (cmd) {
 	case 0x01: push_stat(3, 25000); stat &= ~ST_SHELL; if (reader) stat |= ST_MOTOR; break;   // Getstat
 	case 0x02:   // Setloc
@@ -103,7 +155,21 @@ static void command(u8 cmd)
 		seek_pending = 1;
 		push_stat(3, 25000);
 		break;
-	case 0x03: push_stat(3, 25000); break;   // Play: el audio CD todavía no suena
+	case 0x03: {   // Play [pista]: sin pista (o 0), desde Setloc o desde donde esté el cabezal
+		int t = nparams ? (int)unbcd(params[0]) : 0;
+		if (t >= 1 && t <= tracks()) { cur_lba = trk_start(t - 1); seek_pending = 0; }
+		else if (seek_pending) { cur_lba = seek_lba; seek_pending = 0; }
+		if (cd_audio_hw && playing) cd_audio_hw->stop();
+		reading = 0;
+		playing = 1;
+		report_tens = 0xff;
+		stat = (stat & ~(ST_READ | ST_SEEK)) | ST_PLAY | ST_MOTOR;
+		push_stat(3, 25000);
+		play_due = psx_cycles + sector_time() + 25000;
+		psx_schedule(play_due);
+		if (cd_audio_hw && cd_audio_hw->cdda && !muted) cd_audio_hw->cdda(cur_lba, play_end());
+		break;
+	}
 	case 0x06: case 0x1b:                     // ReadN / ReadS
 		if (!reader) { error(0x80); break; }
 		if (seek_pending) { cur_lba = seek_lba; seek_pending = 0; }
@@ -143,17 +209,18 @@ static void command(u8 cmd)
 	case 0x0e: mode = params[0]; push_stat(3, 25000); break;      // Setmode
 	case 0x0f: { u8 d[5] = { stat, mode, 0, 0, 0 }; push(3, 25000, 5, d); break; }   // Getparam
 	case 0x10: push(3, 25000, 8, last_header); break;            // GetlocL
-	case 0x11: {   // GetlocP
-		u32 a = cur_lba + 150, r = cur_lba;
-		u8 d[8] = { 1, 1, bcd(r / 4500), bcd(r / 75 % 60), bcd(r % 75), bcd(a / 4500), bcd(a / 75 % 60), bcd(a % 75) };
+	case 0x11: {   // GetlocP: pista, índice, tiempo dentro de la pista y tiempo absoluto
+		u8 d[8];
+		subq(d);
 		push(3, 25000, 8, d);
 		break;
 	}
-	case 0x13: { u8 d[3] = { stat, 1, 1 }; push(3, 25000, 3, d); break; }   // GetTN
-	case 0x14: {   // GetTD
-		u32 a = (params[0] == 0) ? disc_sectors + 150 : 150;
-		u8 d[3] = { stat, bcd(a / 4500), bcd(a / 75 % 60) };
-		push(3, 25000, 3, d);
+	case 0x13: { u8 d[3] = { stat, 1, bcd((u32)tracks()) }; push(3, 25000, 3, d); break; }   // GetTN
+	case 0x14: {   // GetTD: comienzo de la pista (0: final del disco)
+		u32 t = unbcd(params[0]), a;
+		if (t > (u32)tracks()) { error(0x10); break; }
+		a = (t == 0 ? disc_sectors : trk_start((int)t - 1)) + 150;
+		{ u8 d[3] = { stat, bcd(a / 4500), bcd(a / 75 % 60) }; push(3, 25000, 3, d); }
 		break;
 	}
 	case 0x15: case 0x16:   // SeekL / SeekP
@@ -200,12 +267,43 @@ int cdrom_next_event(u32 *when)
 	int have = 0;
 	if (qn && !int_flag) { *when = q_due; have = 1; }
 	if (reading && (!have || TIME_BEFORE(read_due, *when))) { *when = read_due; have = 1; }
+	if (playing && (!have || TIME_BEFORE(play_due, *when))) { *when = play_due; have = 1; }
 	return have;
+}
+
+// Un sector de audio de CD más (en el tiempo de la PS1): informes y fin de pista
+static void play_tick(void)
+{
+	u32 prev = cur_lba;
+	play_due += sector_time();
+	if (TIME_BEFORE(play_due, psx_cycles)) play_due = psx_cycles + sector_time();   // tras un estado cargado
+	cur_lba++;
+	if (cur_lba >= disc_sectors || ((mode & 2) && track_of(cur_lba) != track_of(prev))) {
+		// final del disco, o de la pista con AutoPause: el cabezal se para y avisa (INT4)
+		playing = 0;
+		stat &= ~ST_PLAY;
+		if (cur_lba >= disc_sectors) cur_lba = disc_sectors ? disc_sectors - 1 : 0;
+		if (cd_audio_hw) cd_audio_hw->stop();
+		push_stat(4, 0);
+		return;
+	}
+	if ((mode & 4) && !int_flag && !qn) {   // Report: un INT1 cada vez que cambian las decenas del sector
+		u8 d[8];
+		subq(d);
+		if ((d[7] >> 4) != report_tens) {
+			u8 r[8] = { stat, d[0], d[1], 0, 0, 0, 0, 0 };
+			report_tens = d[7] >> 4;
+			if (d[7] & 0x10) { r[3] = d[2]; r[4] = (u8)(0x80 | d[3]); r[5] = d[4]; }   // alterna: tiempo de la pista
+			else { r[3] = d[5]; r[4] = d[6]; r[5] = d[7]; }                           // y tiempo absoluto
+			push(1, 0, 8, r);
+		}
+	}
 }
 
 void cdrom_tick(void)
 {
 	if (qn && !int_flag && !TIME_BEFORE(psx_cycles, q_due)) fire();
+	if (playing && !TIME_BEFORE(psx_cycles, play_due)) play_tick();
 	if (reading && !TIME_BEFORE(psx_cycles, read_due)) {
 		if (int_flag || qn) { read_due = psx_cycles + 2000; return; }   // la CPU aún no atendió la anterior
 		int ok;
@@ -336,6 +434,13 @@ void cdrom_state(PsxState *s)
 	STATE(s, seek_pending); STATE(s, reading); STATE(s, read_due);
 	STATE(s, sector); STATE(s, last_header);
 	STATE(s, data_fifo); STATE(s, data_len); STATE(s, data_pos);
+}
+
+// Lo que se añadió con el audio de CD (al final del estado): la reproducción en curso
+void cdrom_state_ext(PsxState *s)
+{
+	STATE(s, playing); STATE(s, play_due); STATE(s, report_tens);
+	if (s->load && s->ok && playing && cd_audio_hw && cd_audio_hw->cdda && !muted) cd_audio_hw->cdda(cur_lba, play_end());
 }
 
 // ---- XA-ADPCM: 18 grupos de 128 bytes por sector; en 4 bits, 8 unidades de 28 muestras por grupo ----

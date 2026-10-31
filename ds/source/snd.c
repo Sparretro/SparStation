@@ -198,9 +198,13 @@ static void xa_sector(u32 lba, const u8 *raw)
 }
 
 // Una vez por frame: llena el anillo leyendo el disco por delante; para los canales al acabarse
+static void da_fill(void);
+static struct { int active, ended; u32 next_lba, end_lba, timer, t0, written; } da;
+
 void snd_xa_pump(void)
 {
 	u32 played;
+	if (da.active) { da_fill(); return; }   // una pista de audio de CD en vez del XA
 	if (!xa.active) return;
 	played = xa_played();
 	if (xa.ended && played >= xa.written) { xa_halt(); return; }
@@ -229,11 +233,74 @@ void snd_xa_pump(void)
 	}
 }
 
-static void xa_stop(void) { xa_halt(); xa.valid = 0; }
-static void xa_mute(int on) { xa_muted = on; if (xa.active) xa_volume(); }
-static const CdAudioHw snd_cd = { xa_sector, xa_stop, xa_mute };
+// ---- audio de CD (pistas de audio) ----
+// Con Play, la pista suena desde aquí a su velocidad real: se lee por delante (sectores de 588 pares L/R a
+// 44100 Hz) en el mismo anillo y los mismos canales que el XA (el lector del CD solo toca una cosa a la vez).
+static int (*da_read)(void *user, u32 lba, u8 *out);
+static s16 da_sector_buf[588 * 2];
+
+static u32 da_played(void) { return (fast_ticks() - da.t0) / (2 * da.timer); }
+
+static void da_halt(void)
+{
+	if (da.active) soundStop((1u << CH_XL) | (1u << CH_XR));
+	da.active = 0;
+}
+
+static void da_fill(void)
+{
+	u32 played = da_played();
+	if (da.ended && played >= da.written) { da_halt(); return; }
+	if (da.written < played) {   // se vació (un frame muy largo): lo que queda en el anillo es viejo
+		dmaFillWords(0, xa_buf[0], XR * 2);
+		dmaFillWords(0, xa_buf[1], XR * 2);
+		DC_FlushRange(xa_buf[0], XR * 2);
+		DC_FlushRange(xa_buf[1], XR * 2);
+		da.written = played + 512;
+	}
+	while (!da.ended && da.written - played < XA_LEAD) {
+		u32 w = da.written % XR;
+		if (da.next_lba >= da.end_lba || !da_read || !da_read(NULL, da.next_lba, (u8 *)da_sector_buf)) { da.ended = 1; break; }
+		da.next_lba++;
+		for (int i = 0; i < 588; i++) {
+			xa_buf[0][(w + i) % XR] = da_sector_buf[i * 2];
+			xa_buf[1][(w + i) % XR] = da_sector_buf[i * 2 + 1];
+		}
+		if (w + 588 <= XR) { DC_FlushRange(&xa_buf[0][w], 588 * 2); DC_FlushRange(&xa_buf[1][w], 588 * 2); }
+		else { DC_FlushRange(xa_buf[0], XR * 2); DC_FlushRange(xa_buf[1], XR * 2); }
+		da.written += 588;
+	}
+}
+
+static void da_play(u32 lba, u32 end)
+{
+	xa_halt();
+	xa.valid = 0;
+	da_halt();
+	memset(&da, 0, sizeof da);
+	da.next_lba = lba;
+	da.end_lba = end;
+	da.timer = soundTimerFromHz(44100);
+	dmaFillWords(0, xa_buf[0], XR * 2);
+	dmaFillWords(0, xa_buf[1], XR * 2);
+	da.t0 = fast_ticks();
+	da_fill();
+	DC_FlushRange(xa_buf[0], XR * 2);
+	DC_FlushRange(xa_buf[1], XR * 2);
+	soundPreparePcm(CH_XL, 2047, 0, da.timer, SoundMode_Repeat, SoundFmt_Pcm16, xa_buf[0], 0, XR / 2);
+	soundPreparePcm(CH_XR, 2047, 127, da.timer, SoundMode_Repeat, SoundFmt_Pcm16, xa_buf[1], 0, XR / 2);
+	soundStart((1u << CH_XL) | (1u << CH_XR));
+	da.t0 = fast_ticks();
+	da.active = 1;
+	if (xa_muted) xa_volume();
+}
+
+static void xa_stop(void) { xa_halt(); xa.valid = 0; da_halt(); }
+static void xa_mute(int on) { xa_muted = on; if (xa.active || da.active) xa_volume(); }
+static const CdAudioHw snd_cd = { xa_sector, xa_stop, xa_mute, da_play };
 
 void snd_set_disc(int (*read)(void *user, u32 lba, u8 *out)) { xa_read = read; }
+void snd_set_cdda(int (*read)(void *user, u32 lba, u8 *out)) { da_read = read; }
 
 void snd_init(int dsi)
 {

@@ -142,45 +142,53 @@ static int vram_diff(const char *path)
 static FILE *disc;
 
 static FILE *lba_log;   // --lbas archivo: anota cada sector leído (para montar discos reducidos)
+static CueDisc cue;          // archivos del disco (un .bin suelto: uno solo)
+static FILE *cue_f[CUE_MAX_FILES];
 
 static int read_sector(void *user, u32 lba, u8 *out)
 {
+	u32 s;
+	int i = cue_locate(&cue, lba, &s);
 	(void)user;
 	if (lba_log) fprintf(lba_log, "%u\n", lba);
-	if (fseek(disc, (long)lba * 2352, SEEK_SET)) return 0;
-	return fread(out, 1, 2352, disc) == 2352;
+	if (i < 0) return 0;
+	if (!cue_f[i] && !(cue_f[i] = fopen(cue.file[i].path, "rb"))) return 0;
+	if (fseek(cue_f[i], (long)s * 2352, SEEK_SET)) return 0;
+	return fread(out, 1, 2352, cue_f[i]) == 2352;
+}
+
+static u32 file_sectors(const char *path)
+{
+	FILE *f = fopen(path, "rb");
+	long n;
+	if (!f) return 0;
+	fseek(f, 0, SEEK_END);
+	n = ftell(f);
+	fclose(f);
+	return (u32)(n / 2352);
 }
 
 static int open_disc(const char *path)
 {
-	char bin[1024];
 	const char *ext = strrchr(path, '.');
-	strncpy(bin, path, sizeof bin - 1);
-	bin[sizeof bin - 1] = 0;
 	if (ext && (!strcmp(ext, ".cue") || !strcmp(ext, ".CUE"))) {
-		// FILE "nombre.bin" BINARY, relativo a la carpeta del .cue
-		FILE *c = fopen(path, "r");
-		char line[1024];
-		if (!c) return 0;
-		while (fgets(line, sizeof line, c)) {
-			char *q1 = strchr(line, '"'), *q2 = q1 ? strchr(q1 + 1, '"') : NULL;
-			if (strstr(line, "FILE") && q1 && q2) {
-				const char *slash = strrchr(path, '/');
-				const char *bs = strrchr(path, '\\');
-				int dirlen;
-				if (bs > slash) slash = bs;
-				dirlen = slash ? (int)(slash - path + 1) : 0;
-				*q2 = 0;
-				snprintf(bin, sizeof bin, "%.*s%s", dirlen, path, q1 + 1);
-				break;
-			}
-		}
-		fclose(c);
+		// los FILE van relativos a la carpeta del .cue
+		char dir[1024];
+		const char *slash = strrchr(path, '/'), *bs = strrchr(path, '\\');
+		if (bs > slash) slash = bs;
+		snprintf(dir, sizeof dir, "%.*s", slash ? (int)(slash - path + 1) : 0, path);
+		if (!cue_parse(path, dir, &cue, file_sectors) || !cue.file[0].sectors) { fprintf(stderr, "no puedo abrir %s\n", path); return 0; }
+	} else {
+		memset(&cue, 0, sizeof cue);
+		snprintf(cue.file[0].path, sizeof cue.file[0].path, "%s", path);
+		cue.file[0].sectors = cue.total = file_sectors(path);
+		cue.nfile = 1;
+		if (!cue.total) { fprintf(stderr, "no puedo abrir %s\n", path); return 0; }
 	}
-	disc = fopen(bin, "rb");
-	if (!disc) { fprintf(stderr, "no puedo abrir %s\n", bin); return 0; }
-	fseek(disc, 0, SEEK_END);
-	cdrom_set_disc(read_sector, NULL, (u32)(ftell(disc) / 2352));
+	disc = cue_f[0] = fopen(cue.file[0].path, "rb");
+	if (!disc) return 0;
+	cdrom_set_disc(read_sector, NULL, cue.total);
+	cdrom_set_tracks(cue.trk, cue.ntrk);
 	return 1;
 }
 
@@ -235,6 +243,7 @@ static void report_profile(void)
 }
 
 static void xa_next(s32 *l, s32 *r);
+static void cdda_next(s32 *l, s32 *r);
 // ---- sonido: --wav archivo mezcla las voces como lo haría el hardware de la DS (44100 Hz, estéreo) ----
 static struct { const s16 *pcm; u32 len, pos, pitch, l, r; s32 loop; int on; } pcv[24];
 static FILE *wav;
@@ -266,6 +275,7 @@ static void pc_mix(u32 n)
 			}
 		}
 		xa_next(&L, &R);
+		cdda_next(&L, &R);
 		buf[i * 2] = (s16)(L > 32767 ? 32767 : L < -32768 ? -32768 : L);
 		buf[i * 2 + 1] = (s16)(R > 32767 ? 32767 : R < -32768 ? -32768 : R);
 	}
@@ -295,9 +305,26 @@ static void pc_xa_sector(u32 lba, const u8 *raw)
 		xa_w++;
 	}
 }
-static void pc_xa_stop(void) { xa_r_fix = 0; xa_w = 0; memset(&xa_dec, 0, sizeof xa_dec); }
+// Audio de CD en el PC: los sectores de la pista se leen al ritmo de la emulación (588 pares L/R a 44100 Hz cada uno)
+static struct { int on; u32 lba, end, pos; s16 buf[588 * 2]; } cdda;
+u32 pc_cdda_sectors;
+static void pc_cdda(u32 lba, u32 end) { cdda.on = 1; cdda.lba = lba; cdda.end = end; cdda.pos = 588; }
+static void cdda_next(s32 *l, s32 *r)
+{
+	if (!cdda.on) return;
+	if (cdda.pos >= 588) {
+		if (cdda.lba >= cdda.end || !read_sector(NULL, cdda.lba, (u8 *)cdda.buf)) { cdda.on = 0; return; }
+		cdda.lba++;
+		cdda.pos = 0;
+		pc_cdda_sectors++;
+	}
+	*l += cdda.buf[cdda.pos * 2];
+	*r += cdda.buf[cdda.pos * 2 + 1];
+	cdda.pos++;
+}
+static void pc_xa_stop(void) { xa_r_fix = 0; xa_w = 0; memset(&xa_dec, 0, sizeof xa_dec); cdda.on = 0; }
 static void pc_xa_mute(int on) { (void)on; }
-static const CdAudioHw pc_cd = { pc_xa_sector, pc_xa_stop, pc_xa_mute };
+static const CdAudioHw pc_cd = { pc_xa_sector, pc_xa_stop, pc_xa_mute, pc_cdda };
 static void xa_next(s32 *l, s32 *r)
 {
 	u32 i = xa_r_fix >> 16;
@@ -435,7 +462,7 @@ int main(int argc, char **argv)
 #ifdef PSX_TRACE_IO
 	{ extern u32 gp0_hist[256]; for (int i = 0; i < 256; i++) if (gp0_hist[i]) printf("GP0 %02x x%u\n", i, gp0_hist[i]); }
 #endif
-	if (wav) { wav_header(wav, wav_samples); fclose(wav); printf("sonido: %.1f s\n", wav_samples / 44100.0); }
+	if (wav) { wav_header(wav, wav_samples); fclose(wav); printf("sonido: %.1f s (XA %u sectores, CD-DA %u)\n", wav_samples / 44100.0, pc_xa_sectors, pc_cdda_sectors); }
 	if (card_path && psx_memcard_writes) {
 		FILE *cf = fopen(card_path, "wb");
 		printf("tarjeta: %u sectores escritos -> %s\n", psx_memcard_writes, card_path);

@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <sys/stat.h>
 #include "psx.h"
 #include "hud.h"
 #include "gx.h"
@@ -92,60 +93,63 @@ static int open_subset(void)
 // Salida de texto de la PS1 en la consola de abajo (solo lo que no sea ruido de la BIOS)
 static void tty_out(int c) { putchar(c); }
 
-static int read_sector(void *user, u32 lba, u8 *out)
+// El disco son los archivos de su .cue (una pista por archivo, como los volcados de redump) seguidos. Hay tres
+// lectores, cada uno con su archivo abierto y su posición: el del CD (lo que lee el juego), el del audio XA y el
+// de las pistas de audio, que leen por delante (snd.c). Si compartieran archivo, cada lectura saltaría de un
+// sitio a otro del disco: en la SD, buscar cuesta y se pierde el búfer.
+static CueDisc cue;
+typedef struct { FILE *f; int fi, buf; long pos; } DiscRd;
+static DiscRd rd_cd = { NULL, -1, 32 * 1024, -1 }, rd_xa = { NULL, -1, 16 * 1024, -1 }, rd_da = { NULL, -1, 16 * 1024, -1 };
+
+static int disc_read(DiscRd *r, u32 lba, u8 *out)
 {
-	static long pos = -1;   // dónde quedó el archivo: leyendo seguido no hace falta fseek (en la SD cuesta)
-	long want = (long)lba * 2352;
-	(void)user;
-	if (want != pos && fseek(disc, want, SEEK_SET)) { pos = -1; return 0; }
-	if (fread(out, 1, 2352, disc) != 2352) { pos = -1; return 0; }
-	pos = want + 2352;
+	u32 s;
+	int i = cue_locate(&cue, lba, &s);
+	long want;
+	if (i < 0) return 0;
+	if (i != r->fi) {   // otro archivo (otra pista): se cambia el que tiene abierto
+		if (r->f) fclose(r->f);
+		r->f = fopen(cue.file[i].path, "rb");
+		r->fi = r->f ? i : -1;
+		r->pos = -1;
+		if (!r->f) return 0;
+		setvbuf(r->f, NULL, _IOFBF, (size_t)r->buf);
+	}
+	want = (long)s * 2352;
+	if (want != r->pos && fseek(r->f, want, SEEK_SET)) { r->pos = -1; return 0; }   // leyendo seguido, sin fseek
+	if (fread(out, 1, 2352, r->f) != 2352) { r->pos = -1; return 0; }
+	r->pos = want + 2352;
 	return 1;
 }
 
-// El audio XA se lee por delante (snd.c) con su propio archivo abierto: si compartiera el del CD, cada lectura
-// saltaría de un sitio a otro del disco y se perdería el búfer
-static FILE *disc_xa;
+static int read_sector(void *user, u32 lba, u8 *out) { (void)user; return disc_read(&rd_cd, lba, out); }
+static int read_sector_xa(void *user, u32 lba, u8 *out) { (void)user; return disc_read(&rd_xa, lba, out); }
+static int read_sector_da(void *user, u32 lba, u8 *out) { (void)user; return disc_read(&rd_da, lba, out); }
 
-static int read_sector_xa(void *user, u32 lba, u8 *out)
+static u32 file_sectors(const char *path)
 {
-	static long pos = -1;
-	long want = (long)lba * 2352;
-	(void)user;
-	if (want != pos && fseek(disc_xa, want, SEEK_SET)) { pos = -1; return 0; }
-	if (fread(out, 1, 2352, disc_xa) != 2352) { pos = -1; return 0; }
-	pos = want + 2352;
-	return 1;
+	struct stat st;
+	return stat(path, &st) ? 0 : (u32)(st.st_size / 2352);
 }
 
-// Abre un .cue (busca su .bin en la misma carpeta) o un .bin directamente
+// Abre un .cue (con todas sus pistas, en la misma carpeta) o un .bin directamente
 static int open_disc(const char *path)
 {
-	char bin[512];
 	const char *ext = strrchr(path, '.');
-	snprintf(bin, sizeof bin, "%s", path);
 	if (ext && strcasecmp(ext, ".cue") == 0) {
-		FILE *c = fopen(path, "r");
-		char line[512];
-		if (!c) return 0;
-		while (fgets(line, sizeof line, c)) {
-			char *q1 = strchr(line, '"'), *q2 = q1 ? strchr(q1 + 1, '"') : NULL;
-			if (strstr(line, "FILE") && q1 && q2) {
-				*q2 = 0;
-				snprintf(bin, sizeof bin, GAMES_DIR "/%s", q1 + 1);
-				break;
-			}
-		}
-		fclose(c);
+		if (!cue_parse(path, GAMES_DIR "/", &cue, file_sectors) || !cue.file[0].sectors) return 0;
+	} else {
+		memset(&cue, 0, sizeof cue);
+		snprintf(cue.file[0].path, sizeof cue.file[0].path, "%s", path);
+		cue.file[0].sectors = cue.total = file_sectors(path);
+		cue.nfile = 1;
+		if (!cue.total) return 0;
 	}
-	disc = fopen(bin, "rb");
-	if (!disc) return 0;
-	setvbuf(disc, NULL, _IOFBF, 32 * 1024);
-	fseek(disc, 0, SEEK_END);
-	cdrom_set_disc(read_sector, NULL, (u32)(ftell(disc) / 2352));
-	disc_xa = fopen(bin, "rb");
-	if (disc_xa) setvbuf(disc_xa, NULL, _IOFBF, 16 * 1024);
-	snd_set_disc(disc_xa ? read_sector_xa : read_sector);
+	{ u8 probe[2352]; if (!read_sector(NULL, 0, probe)) return 0; }
+	cdrom_set_disc(read_sector, NULL, cue.total);
+	cdrom_set_tracks(cue.trk, cue.ntrk);
+	snd_set_disc(read_sector_xa);
+	snd_set_cdda(read_sector_da);
 	return 1;
 }
 
@@ -240,6 +244,13 @@ static void apply_cfg(void)
 	dyn_set_cpu_scale(opt_cpu ? 256u * 100 / (u32)cpu_pct[opt_cpu] : auto_scale);
 }
 
+static u32 name_hash(const char *s)   // FNV-1a sin distinguir mayúsculas (FAT tampoco las distingue)
+{
+	u32 h = 2166136261u;
+	for (; *s; s++) h = (h ^ (u32)(*s >= 'A' && *s <= 'Z' ? *s + 32 : *s)) * 16777619u;
+	return h;
+}
+
 static int pick_game(char *out, size_t outlen)
 {
 	static char names[MAX_GAMES][128];
@@ -248,19 +259,35 @@ static int pick_game(char *out, size_t outlen)
 	struct dirent *e;
 	if (!d) return 0;
 	load_cfg();
-	while ((e = readdir(d)) && n < MAX_GAMES) {
-		const char *ext = strrchr(e->d_name, '.');
-		if (ext && (!strcasecmp(ext, ".cue") || !strcasecmp(ext, ".bin"))) snprintf(names[n++], 128, "%s", e->d_name);
+	{   // primera pasada: los .bin que usa algún .cue (sus pistas) no salen en la lista
+		static u32 used[512];
+		int nused = 0;
+		while ((e = readdir(d))) {
+			const char *ext = strrchr(e->d_name, '.');
+			char path[300], line[300];
+			FILE *c;
+			if (!ext || strcasecmp(ext, ".cue")) continue;
+			snprintf(path, sizeof path, GAMES_DIR "/%s", e->d_name);
+			if (!(c = fopen(path, "r"))) continue;
+			while (fgets(line, sizeof line, c) && nused < 512) {
+				char *q1 = strchr(line, '"'), *q2 = q1 ? strchr(q1 + 1, '"') : NULL;
+				if (strstr(line, "FILE") && q1 && q2) { *q2 = 0; used[nused++] = name_hash(q1 + 1); }
+			}
+			fclose(c);
+		}
+		rewinddir(d);
+		while ((e = readdir(d)) && n < MAX_GAMES) {
+			const char *ext = strrchr(e->d_name, '.');
+			int hide = 0;
+			if (!ext || (strcasecmp(ext, ".cue") && strcasecmp(ext, ".bin"))) continue;
+			if (!strcasecmp(ext, ".bin")) {
+				u32 h = name_hash(e->d_name);
+				for (int k = 0; k < nused && !hide; k++) hide = used[k] == h;
+			}
+			if (!hide) snprintf(names[n++], 128, "%s", e->d_name);
+		}
 	}
 	closedir(d);
-	for (int i = 0; i < n; i++) {   // un .bin con su .cue al lado: solo el .cue
-		const char *ext = strrchr(names[i], '.');
-		int stem = (int)(ext - names[i]), dup = 0;
-		if (strcasecmp(ext, ".bin")) continue;
-		for (int j = 0; j < n && !dup; j++)
-			dup = j != i && !strncasecmp(names[j], names[i], stem) && !strcasecmp(names[j] + stem, ".cue");
-		if (dup) { memmove(names[i], names[i + 1], (size_t)(n - i - 1) * sizeof names[0]); n--; i--; }
-	}
 	if (!n) return 0;
 	for (;;) {
 		int keys;

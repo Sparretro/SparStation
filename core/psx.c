@@ -214,6 +214,10 @@ static int state_all(PsxState *s)
 	sio_state(s);
 	timers_state(s);
 	spu_state(s);
+	if (s->ok) {   // lo añadido después va al final: un estado viejo se acaba antes y se queda con lo de por defecto
+		cdrom_state_ext(s);
+		if (!s->ok && s->load) { s->ok = 1; cdrom_ext_defaults(); }
+	}
 	return s->ok;
 }
 
