@@ -412,6 +412,7 @@ typedef struct { s32 mac1, mac2, z12, ir1, ir2, ir3; u32 n, fl; s16 sx[3], sy[3]
 _Static_assert(offsetof(RtpOut, ir1) == 12 && offsetof(RtpOut, n) == 24 && offsetof(RtpOut, fl) == 28 &&
                offsetof(RtpOut, sx) == 32 && offsetof(RtpOut, sy) == 38 && offsetof(RtpOut, sz) == 44, "RtpOut");
 void gte_rtpt_asm(const GteRegs *g, RtpOut *o, s32 lo, const u8 *unr_tab);
+void gte_rtps_asm(const GteRegs *g, RtpOut *o, s32 lo, const u8 *unr_tab);
 __asm__(
 "	.text\n"
 "	.arm\n"
@@ -532,6 +533,15 @@ __asm__(
 "	str r11, [r1, #28]\n"
 "	pop {r4-r11, pc}\n"
 "	.size gte_rtpt_asm, . - gte_rtpt_asm\n"
+"	.global gte_rtps_asm\n"             // RTPS: solo el vértice 0
+"	.type gte_rtps_asm, %function\n"
+"gte_rtps_asm:\n"
+"	push {r4-r11, lr}\n"
+"	mov r11, #0\n"
+"	RTPV 0\n"
+"	str r11, [r1, #28]\n"
+"	pop {r4-r11, pc}\n"
+"	.size gte_rtps_asm, . - gte_rtps_asm\n"
 "	.purgem RTPROW\n"
 "	.purgem PROJ\n"
 "	.purgem RTPV\n"
@@ -562,7 +572,36 @@ static __attribute__((noinline)) void rtpt12f(void)
 		FLAG |= fl;
 	}
 }
+
+// RTPS: lo mismo que rtp12f(0, 1) con el vértice en ensamblador
+static __attribute__((noinline)) void rtps12f(void)
+{
+	RtpOut o;
+	if (((u32)(TR[0] + 0x40000000) | (u32)(TR[1] + 0x40000000) | (u32)(TR[2] + 0x40000000)) >= 0x80000000u) {
+		rtp12f(0, 1);
+		return;
+	}
+	gte_rtps_asm(&psx_core.gte, &o, lm ? 0 : -0x8000, unr);
+	SZ[0] = SZ[1]; SZ[1] = SZ[2]; SZ[2] = SZ[3]; SZ[3] = o.sz[0];
+	SX[0] = SX[1]; SX[1] = SX[2]; SX[2] = o.sx[0];
+	SY[0] = SY[1]; SY[1] = SY[2]; SY[2] = o.sy[0];
+	MAC[1] = o.mac1; MAC[2] = o.mac2; MAC[3] = o.z12;
+	IR[1] = (s16)o.ir1; IR[2] = (s16)o.ir2; IR[3] = (s16)o.ir3;
+	{
+		u32 fl = o.fl;
+		s64 d = (s64)o.n * DQA + DQB;
+		s32 ir0 = (s32)(d >> 12);
+		if (d > 0x7fffffffLL) fl |= 1u << 16;
+		else if (d < -0x80000000LL) fl |= 1u << 15;
+		MAC[0] = (s32)d;
+		if (ir0 < 0) { ir0 = 0; fl |= 1u << 12; } else if (ir0 > 0x1000) { ir0 = 0x1000; fl |= 1u << 12; }
+		IR[0] = (s16)ir0;
+		FLAG |= fl;
+	}
+}
 #else
+static void rtps12f(void) { rtp12f(0, 1); }
+
 // RTPT entera (lo mismo que rtp12f de los vértices 0, 1 y 2): la matriz y la traslación se leen una vez, y MAC/IR
 // solo se escriben al final (los de los dos primeros vértices los pisa el tercero); las banderas, de los tres
 static __attribute__((noinline)) void rtpt12f(void)
@@ -916,7 +955,7 @@ void gte_reset(void)
 }
 
 #define GTE_ENTRY(name, s, body) static void name(u32 op) { sf = s; lm = (op >> 10) & 1; FLAG = 0; body }
-GTE_ENTRY(e_rtps, 12, rtp12f(0, 1);)
+GTE_ENTRY(e_rtps, 12, rtps12f();)
 GTE_ENTRY(e_rtpt, 12, rtpt12f();)
 GTE_ENTRY(e_nclip, 0, (void)op; nclip();)
 GTE_ENTRY(e_dpcs, 12, if (dpc_fast_ok()) dpc12f(RGBC); else dpc(RGBC);)
