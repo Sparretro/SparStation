@@ -92,7 +92,7 @@ enum {
 };
 static int scale_is_standard;
 
-static void idct_1d(s32 *o, s32 i0, s32 i1, s32 i2, s32 i3, s32 i4, s32 i5, s32 i6, s32 i7, int shift_even)
+static inline __attribute__((always_inline)) void idct_1d(s32 *o, s32 i0, s32 i1, s32 i2, s32 i3, s32 i4, s32 i5, s32 i6, s32 i7, int shift_even)
 {
 	s32 z1 = (i2 + i6) * F0541;
 	s32 t2 = z1 - i6 * F1847, t3 = z1 + i2 * F0765;
