@@ -89,7 +89,7 @@ static void io_write(u32 p, u32 v, int size)
 	if (off >= 0x50 && off < 0x60) return;
 	if (off == 0x60) { ram_size = v; return; }
 	if (off == 0x70) { irq_stat &= v; irq_update(); return; }
-	if (off == 0x74) { irq_mask = v & 0x7ff; irq_update(); return; }
+	if (off == 0x74) { irq_mask = v & 0x7ff; irq_update(); psx_schedule(psx_cycles); return; }   // un temporizador puede empezar a interrumpir
 	if (off >= 0x80 && off < 0x100) {
 		if (size < 4) {
 			// Escritura parcial: se mezcla con el valor actual. En DICR, los bits de «acuse» (24-30) de los

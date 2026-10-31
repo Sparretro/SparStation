@@ -146,6 +146,7 @@ void timer_write(u32 off, u32 v)
 		break;
 	case 8: t->target = v & 0xffff; break;
 	}
+	psx_schedule(psx_cycles);   // su próxima interrupción puede haber cambiado: recalcular los eventos
 }
 
 void timers_state(PsxState *s)
