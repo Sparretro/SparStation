@@ -79,11 +79,18 @@ static void tm_sync(int i)
 	t_last[i] = psx_cycles;
 }
 
-void timers_sync(void) { tm_sync(0); tm_sync(1); tm_sync(2); }
+// Al final de cada tramo y al leer I_STAT: solo los que pueden interrumpir (los demás se calculan al leerlos)
+void timers_sync(void)
+{
+	for (int i = 0; i < 3; i++)
+		if (tm[i].mode & 0x30) tm_sync(i);
+}
+
+static void timers_sync_all(void) { tm_sync(0); tm_sync(1); tm_sync(2); }
 
 void timers_line_origin(u32 c)
 {
-	timers_sync();
+	timers_sync_all();
 	line_origin = c;
 }
 
@@ -147,7 +154,7 @@ void timer_write(u32 off, u32 v)
 
 void timers_state(PsxState *s)
 {
-	if (!s->load) timers_sync();
+	if (!s->load) timers_sync_all();
 	STATE(s, tm);
 	if (s->load) t_last[0] = t_last[1] = t_last[2] = line_origin = psx_cycles;
 }
