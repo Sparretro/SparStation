@@ -178,6 +178,9 @@ void dma_write(u32 off, u32 v)
 	case 8:
 		if (ch == CH_OTC) v = (v & 0x51000000) | 2;
 		chcr[ch] = v;
+#ifdef PSX_CDLOG
+		{ extern void cdlog_dma(u32 ch, u32 madr, u32 bcr, u32 chcr); cdlog_dma(ch, madr[ch], bcr[ch], v); }
+#endif
 		if ((v & (1 << 24)) && (dpcr & (8u << (ch * 4)))) {
 			int sync = (v >> 9) & 3;
 			if (sync != 0 || (v & (1 << 28))) run(ch);

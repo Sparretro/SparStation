@@ -464,3 +464,15 @@ void cdrom_boot_state(void)
 	int_enable = 0x1f;
 	if (reader) stat |= ST_MOTOR;
 }
+
+#ifdef PSX_CDLOG
+void cdlog_dma(u32 ch, u32 madr, u32 bcr, u32 chcr)   // pruebas: arranques de DMA en el mismo registro
+{
+	CDLOG(0x20000000u | ch << 24 | (madr & 0xffffff));
+	CDLOG(bcr);
+	CDLOG(chcr);
+}
+#endif
+#ifdef PSX_CDLOG
+void cdlog_any(u32 v) { CDLOG(v); }
+#endif

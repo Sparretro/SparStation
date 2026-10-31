@@ -240,6 +240,9 @@ void mdec_write_cmd(u32 v)
 	switch (state) {
 	case IDLE:
 		cmd = v;
+#ifdef PSX_CDLOG
+		{ extern void cdlog_any(u32 v); cdlog_any(0x30000000u | (v >> 4)); }
+#endif
 		switch (v >> 29) {
 		case 1:
 			state = DECODE;
@@ -308,6 +311,9 @@ u32 mdec_read_words(u32 *dst, u32 n)
 
 void mdec_write_ctrl(u32 v)
 {
+#ifdef PSX_CDLOG
+	{ extern void cdlog_any(u32 v); cdlog_any(0x31000000u | (v >> 8)); }
+#endif
 	if (v & 0x80000000) mdec_reset();
 	ctrl = v & 0x60000000;
 }

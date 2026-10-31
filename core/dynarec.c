@@ -32,7 +32,9 @@
 #include <unistd.h>
 #endif
 
+#ifndef MAX_BLOCK
 #define MAX_BLOCK 64
+#endif
 #ifndef DYN_DS_SLOTS
 #define DYN_DS_SLOTS 0x2000   // huecos de la tabla de bloques en el modo DS (potencia de 2; el banco de pruebas usa más)
 #endif
