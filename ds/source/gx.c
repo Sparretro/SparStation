@@ -33,7 +33,7 @@
 static u32 list_buf[2][LIST_WORDS + 2] __attribute__((aligned(32)));
 static u32 *list = list_buf[0];
 static int list_cur;
-static int ln, npolys;
+static int ln, npolys, nverts;   // el hardware admite 2048 polígonos y 6144 vértices por frame
 static u32 frame_no;
 // Fondo BG3 (la VRAM de la PS1 copiada a la pantalla): con el 3D solo hace falta copiarlo si el juego escribió
 // en la zona mostrada (vídeos, imágenes subidas). Por franjas de 16 filas: cambiado desde la última copia, y
@@ -405,7 +405,7 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 	// negro con a = brillo de F. Con textura de 4 bits, el brillo de cada texel va en su alfa (A3I5) y el
 	// del color de los vértices en el alfa del polígono.
 	int addlike = p->semi >= 2, a3 = 0, vb = 0, ramp = 0;   // a3 (A3I5 por página) desactivado: llenaba la caché
-	if (npolys >= MAX_POLYS) return;
+	if (npolys >= MAX_POLYS || nverts + n > 6144) return;
 	if (w != last_w || h != last_h) { kx = (8192 << 8) / w; ky = (8192 << 8) / h; last_w = w; last_h = h; }
 	// Con el bit de máscara (comprobar y poner) la PS1 solo pinta sobre lo que no lo tiene: en Silent Hill son
 	// velos de niebla que tiñen solo al personaje (el fondo y la niebla ya tienen la marca). La DS no puede
@@ -497,6 +497,7 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 	}
 	ln = (int)(o - list);
 	npolys++;
+	nverts += n;
 }
 
 static void gx_vram_written(int x, int y, int w, int h)
@@ -545,7 +546,7 @@ static void gx_flip(int drawn)
 		}
 		commit_on = any;
 	}
-	ln = npolys = 0;
+	ln = npolys = nverts = 0;
 	frame_no++;
 	STAGE(13);
 	gx_bg_hidden = opaque;
@@ -587,6 +588,6 @@ void gx_init(void)
 	tex_reset();
 	pal_reset();
 	ramp_init();
-	ln = npolys = 0;
+	ln = npolys = nverts = 0;
 	GFX_FLUSH = 1;
 }
