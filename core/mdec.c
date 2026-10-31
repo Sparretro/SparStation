@@ -295,6 +295,17 @@ u32 mdec_read_data(void)
 	return v;
 }
 
+// Hasta n palabras enteras de la salida de golpe (la DMA de salida de los vídeos); devuelve cuántas
+u32 mdec_read_words(u32 *dst, u32 n)
+{
+	u32 k = (out_len - out_pos) / 4;
+	if (out_pos >= out_len || (out_pos & 3)) return 0;
+	if (k > n) k = n;
+	memcpy(dst, out_buf + out_pos, k * 4);
+	out_pos += k * 4;
+	return k;
+}
+
 void mdec_write_ctrl(u32 v)
 {
 	if (v & 0x80000000) mdec_reset();

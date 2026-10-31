@@ -1163,14 +1163,26 @@ static void vram_copy(void)
 	if (gpu_hw) gpu_hw->vram_written(dx, dy, w, h);
 }
 
-static void load_pixel(u16 c)
+// Subida a la VRAM de n palabras seguidas (2 píxeles cada una): una división al empezar y luego fila a fila
+// (los vídeos suben así cada imagen; píxel a píxel con load_pixel era lo que más costaba). Devuelve las usadas.
+static u32 load_words(const u32 *w, u32 n)
 {
-	if (load_i < load_total) {
-		int x = load_x + load_i % load_w, y = load_y + load_i / load_w;
-		u16 *d = &VRAM(x, y);
-		if (!(g.check_mask && (*d & 0x8000))) *d = c | (g.set_mask << 15);
-		load_i++;
+	u32 used = 0, x, y, setm = (u32)g.set_mask << 15;
+	u16 *row;
+	if (load_i >= load_total) return 0;
+	x = load_i % load_w;
+	y = load_i / load_w;
+	row = &psx_vram[((load_y + y) & 511) * 1024];
+	while (used < n && load_i < load_total) {
+		u32 v = w[used++];
+		for (int k = 0; k < 2 && load_i < load_total; k++, v >>= 16) {
+			u16 *d = &row[(load_x + x) & 1023];
+			if (!(g.check_mask && (*d & 0x8000))) *d = (u16)v | (u16)setm;
+			load_i++;
+			if (++x == (u32)load_w) { x = 0; y++; row = &psx_vram[((load_y + y) & 511) * 1024]; }
+		}
 	}
+	return used;
 }
 
 // Palabras que necesita cada comando GP0 (0 = no es de dibujo/datos)
@@ -1257,8 +1269,7 @@ static void execute_cmd(void)
 void gpu_write_gp0(u32 v)
 {
 	if (mode == M_LOAD) {
-		load_pixel((u16)v);
-		load_pixel((u16)(v >> 16));
+		load_words(&v, 1);
 		if (load_i >= load_total) mode = M_CMD;
 		return;
 	}
@@ -1276,6 +1287,14 @@ void gpu_write_gp0_n(const u32 *w, u32 n)
 {
 	while (n) {
 		u32 need;
+		if (mode == M_LOAD) {   // datos de una subida a la VRAM: de golpe
+			u32 k = load_words(w, n);
+			if (load_i >= load_total) mode = M_CMD;
+			if (!k) { gpu_write_gp0(*w++); n--; continue; }
+			w += k;
+			n -= k;
+			continue;
+		}
 		if (mode != M_CMD || fifo_n || (need = (u32)cmd_len(w[0] >> 24)) > n) { gpu_write_gp0(*w++); n--; continue; }
 #ifndef PSX_GPUSTAT
 		if (gpu_hw && (w[0] >> 29) == 1) {   // polígono (20h-3Fh) con dibujo por hardware: directo

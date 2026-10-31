@@ -38,6 +38,14 @@ static u32 mdec_out_left, mdec_out_addr;
 static void mdec_out_pump(void)
 {
 	while (mdec_out_left && mdec_out_available()) {
+		u32 room = (0x200000 - (mdec_out_addr & 0x1ffffc)) / 4, k;
+		k = mdec_read_words(ram32(mdec_out_addr), mdec_out_left < room ? mdec_out_left : room);
+		if (k) {   // de golpe (los vídeos sacan así cada macrobloque)
+			dyn_ram_written_if(mdec_out_addr & 0x1ffffc, k * 4);
+			mdec_out_addr += k * 4;
+			mdec_out_left -= k;
+			continue;
+		}
 		*ram32(mdec_out_addr) = mdec_read_data();
 		DYN_CHECK_WRITE(mdec_out_addr);
 		mdec_out_addr += 4;
@@ -111,6 +119,11 @@ static void run(int ch)
 #ifdef PSX_TRACE_IO
 		if (ch == CH_CDROM) printf("DMA3 -> %06x  %u palabras (bcr=%08x chcr=%08x)\n", addr, words, bcr[ch], c);
 #endif
+		if (ch == CH_GPU && from_ram && step == 4 && (addr & 0x1ffffc) + words * 4 <= 0x200000) {   // de golpe (subidas a la VRAM)
+			gpu_write_gp0_n(ram32(addr), words);
+			addr += words * 4;
+			words = 0;
+		}
 		while (words--) {
 			if (from_ram) {
 				u32 v = *ram32(addr);

@@ -196,6 +196,7 @@ void mdec_reset(void);
 void mdec_write_cmd(u32 v);
 void mdec_write_ctrl(u32 v);
 u32 mdec_read_data(void);
+u32 mdec_read_words(u32 *dst, u32 n);   // salida de golpe (palabras enteras); devuelve cuántas
 u32 mdec_status(void);
 int mdec_out_available(void);
 void dma_mdec_kick(void);   // el MDEC tiene datos nuevos: reanuda el DMA de salida
