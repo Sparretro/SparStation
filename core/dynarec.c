@@ -1372,6 +1372,44 @@ static int emit_op(u32 op, u32 pc, int ninstr)
 		put(rt, d);
 		return 1;
 	}
+	case 0x2a: case 0x2e: {   // SWL, SWR: leer la palabra alineada, mezclar y escribirla (como un SW normal)
+		int x, v;
+		x = get(rs, R0);
+		a_addi(R0, x, simm, R1);
+		a_dp_imm(C_AL, OP_BIC, 0, R0, R0, 3);
+		a_dp_imm(C_AL, OP_TST, 1, 0, R0, arm_imm(0x1f800000));
+		a_dp_reg(C_EQ, OP_MOV, 0, R1, 0, R0, SH_LSL, 11);
+		a_mem_regsh(C_EQ, 1, 0, R2, RRAM, R1, SH_LSR, 11);
+		a_b(C_NE, 1, ld_handler[M_W][R2]);
+		x = get(rs, R3);
+		a_addi(R3, x, simm, R1);
+		a_dp_imm(C_AL, OP_AND, 0, R3, R3, 3);
+		a_dp_reg(C_AL, OP_MOV, 0, R3, 0, R3, SH_LSL, 3);   // s = (dirección & 3) * 8
+		v = get(rt, R1);
+		if ((op >> 26) == 0x2a) {   // SWL: (w & (FFFFFF00 << s)) | (rt >> (24 - s))
+			a_dp_imm(C_AL, OP_MVN, 0, R0, 0, 0xff);
+			a_dp_regsh(C_AL, OP_MOV, 0, R0, 0, R0, SH_LSL, R3);
+			a_dp_reg(C_AL, OP_AND, 0, R2, R2, R0, SH_LSL, 0);
+			a_dp_imm(C_AL, OP_RSB, 0, R0, R3, 24);
+			a_dp_regsh(C_AL, OP_MOV, 0, R0, 0, v, SH_LSR, R0);
+		} else {                    // SWR: (w & ~(FFFFFFFF << s)) | (rt << s)
+			a_dp_imm(C_AL, OP_MVN, 0, R0, 0, 0);
+			a_dp_regsh(C_AL, OP_MOV, 0, R0, 0, R0, SH_LSL, R3);
+			a_dp_reg(C_AL, OP_BIC, 0, R2, R2, R0, SH_LSL, 0);
+			a_dp_regsh(C_AL, OP_MOV, 0, R0, 0, v, SH_LSL, R3);
+		}
+		a_dp_reg(C_AL, OP_ORR, 0, R2, R2, R0, SH_LSL, 0);
+		x = get(rs, R0);
+		a_addi(R0, x, simm, R1);
+		a_dp_imm(C_AL, OP_BIC, 0, R0, R0, 3);
+		a_dp_imm(C_AL, OP_TST, 1, 0, R0, arm_imm(0x1f800000));
+		a_dp_reg(C_EQ, OP_MOV, 0, R1, 0, R0, SH_LSL, 11);
+		a_mem_regsh(C_EQ, 0, 0, R2, RRAM, R1, SH_LSR, 11);
+		a_mem_regsh(C_EQ, 1, 1, R3, RPAGES, R1, SH_LSR, 11 + DYN_PAGE_BITS);   // ¿había código traducido en esa página?
+		a_dp_imm(C_EQ, OP_CMP, 1, 0, R3, 0);
+		a_b(C_NE, 1, st_handler[M_W][R2]);
+		return 1;
+	}
 	case 0x28: emit_store(M_BU, rs, rt, simm); return 1;  // SB
 	case 0x29: emit_store(M_HU, rs, rt, simm); return 1;  // SH
 	case 0x2b: emit_store(M_W, rs, rt, simm); return 1;   // SW
