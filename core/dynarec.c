@@ -962,6 +962,30 @@ static int sp_mem_op(u32 op)
 }
 
 // Elige qué registros MIPS van en registros ARM: los más usados del bloque (al menos dos veces)
+static int psyq_vsync(u32 pc);
+static int vsync_poll_call(u32 pc);
+
+// Superbloques: un salto condicional sin enlace que no sea de un bucle de espera no corta el bloque; se sigue
+// traduciendo por el camino de no saltar (el de saltar sale enlazado como siempre)
+// Límite del superbloque y no seguir por código que ya tiene su propio bloque: cada destino de salto empieza
+// otro superbloque, y sin esto el mismo camino se traduciría muchas veces (la caché se llenaba)
+#define SB_MAX 32
+static block_fn *slot(u32 pc);
+static int has_block(u32 pc)
+{
+	block_fn *s = slot(pc);
+	return s && *s && (*s)[-1] == pc;
+}
+
+static int sb_cont(u32 op, u32 cur, u32 pc)
+{
+	u32 o = op >> 26, rs = (op >> 21) & 31, rt = (op >> 16) & 31;
+	u32 target = cur + 4 + ((u32)(s32)(s16)(op & 0xffff) << 2);
+	int cond = (o == 0x01 && rs && (rt & 0x1e) != 0x10) || ((o == 0x04 || o == 0x05) && rs != rt) || ((o == 0x06 || o == 0x07) && rs);
+	if (!cond) return 0;
+	return target != pc && !psyq_vsync(target) && !vsync_poll_call(target);
+}
+
 static void alloc_regs(u32 pc)
 {
 	u8 uses[32] = { 0 };
@@ -974,13 +998,16 @@ static void alloc_regs(u32 pc)
 		u32 op = fetch_op(cur), r, w, m;
 		int last = 0;
 		if (++n > MAX_BLOCK || ends_block(op)) last = 1;
+		int cont = 0;
 		if (is_branch(op)) {   // con su delay slot
-			u32 r2, w2;
-			op_regs(fetch_op(cur + 4), &r2, &w2);
-			sp_ops += sp_mem_op(fetch_op(cur + 4));
+			u32 r2, w2, dop = fetch_op(cur + 4);
+			op_regs(dop, &r2, &w2);
+			sp_ops += sp_mem_op(dop);
 			for (m = r2 | w2; m; m &= m - 1) uses[__builtin_ctz(m)] += 1;
 			seen |= r2 | w2;
-			last = 1;
+			// superbloque: tras un salto condicional se sigue por el camino de no saltar (igual que compile)
+			if (sb_cont(op, cur, pc) && n + 2 < SB_MAX && !has_block(cur + 8) && !is_branch(dop) && !ends_block(dop)) { cont = 1; n++; wr_before |= w2; }
+			else last = 1;
 		}
 		sp_ops += sp_mem_op(op);
 		op_regs(op, &r, &w);
@@ -994,6 +1021,7 @@ static void alloc_regs(u32 pc)
 		for (m = w; m; m &= m - 1) uses[__builtin_ctz(m)]++;
 		seen |= r | w;
 		if (last) break;
+		if (cont) cur += 4;   // el delay slot ya está contado
 	}
 	memset(rg, 0, sizeof rg);
 	for (int i = 0; i < 32; i++) rg[i].host = -1;
@@ -1444,7 +1472,7 @@ static void branch_operands(u32 op, int *a, int *b, int tmp1, int tmp2)
 static block_fn compile(u32 pc, block_fn *s)
 {
 	u32 *start, *entry, *cold_start, cur = pc;
-	int n = 0;
+	int n = 0, tot = 0;   // n: instrucciones del tramo actual (para los ciclos); tot: de todo el superbloque
 
 	if (emit_ptr + MAX_BLOCK * 48 + 512 > cold_base || cold_ptr + MAX_BLOCK * 16 + 256 > code_end) flush_all();
 	start = emit_ptr;
@@ -1476,14 +1504,15 @@ static block_fn compile(u32 pc, block_fn *s)
 	for (;;) {
 		u32 op = fetch_op(cur);
 		n++;
+		tot++;
 		if (is_branch(op)) {
 			u32 dop = fetch_op(cur + 4), dr, dw, operands, clobbered;
 			u32 o = op >> 26, rs = (op >> 21) & 31, rt = (op >> 16) & 31, rd = (op >> 11) & 31;
 			u32 simm = (u32)(s32)(s16)(op & 0xffff), target = cur + 4 + (simm << 2);
-			int dynamic = 0, cond_kind = 0, link_reg = 0;   // cond_kind: 0 = siempre, 1 = condicional, 2 = nunca
+			int dynamic = 0, cond_kind = 0, link_reg = 0, goon = 0;   // cond_kind: 0 = siempre, 1 = condicional, 2 = nunca
 			int late, a, b;
 			if (is_branch(dop) || ends_block(dop)) {
-				if (n == 1) { emit_ptr = start; cold_ptr = cold_start; return NULL; }   // que lo haga el intérprete
+				if (tot == 1) { emit_ptr = start; cold_ptr = cold_start; return NULL; }   // que lo haga el intérprete
 				flush_regs();
 				set_pc_const(cur);
 				exit_block(n - 1);
@@ -1527,6 +1556,7 @@ static block_fn compile(u32 pc, block_fn *s)
 			}
 			if (link_reg) put_const(link_reg, cur + 8);
 			n++;
+			tot++;
 			if (dop) emit_op(dop, cur + 4, n);
 			flush_regs();
 			if (dynamic) {   // JR/JALR: buscar el bloque con el despachador
@@ -1563,7 +1593,8 @@ static block_fn compile(u32 pc, block_fn *s)
 				if (idle) emit_idle(target);
 				else link_site(target);
 				land(not_taken);
-				link_site(cur + 8);
+				goon = !idle && sb_cont(op, cur, pc) && tot + 2 < SB_MAX && !has_block(cur + 8);
+				if (!goon) link_site(cur + 8);   // si no, el bloque sigue aquí mismo (superbloque)
 				begin_cold();   // sin tiempo: volver a C por el camino que toque
 				land(out);
 				if (late) c = branch_cond(op, a, b);
@@ -1574,13 +1605,22 @@ static block_fn compile(u32 pc, block_fn *s)
 				exit_pc(target);
 				end_cold();
 			}
+			if (goon) {   // seguir tras el delay slot; los ciclos de lo anterior ya están sumados
+				pv_after(op);
+				rng_after(op);
+				pv_after(dop);
+				rng_after(dop);
+				cur += 8;
+				n = 0;
+				continue;
+			}
 			cur += 4;
 			break;
 		}
 		if (op && !emit_op(op, cur, n)) break;
 		pv_after(op);
 		rng_after(op);
-		if (n >= MAX_BLOCK) {
+		if (tot >= MAX_BLOCK) {
 			exit_to(cur + 4, n);
 			break;
 		}
