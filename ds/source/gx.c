@@ -227,11 +227,26 @@ static void pal_dirty(int x, int y, int w, int h)
 #define NSUB 192
 #define SUB_BYTES 2048
 #define RAMP_SUB 176   // la rampa está en el byte 0x58000
-typedef struct { s16 x, y, cx, cy; u8 depth, units, used, start; u16 h; u32 stamp, rows[8]; } TexEnt;   // used = 0: libre; rows: filas ya copiadas (bit = fila de la página)
+typedef struct { s16 x, y, cx, cy; u8 depth, units, used, start; u16 h; s16 next; u32 stamp, rows[8]; } TexEnt;   // used = 0: libre; rows: filas ya copiadas (bit = fila de la página); next: siguiente de su página
 static TexEnt tex[NSUB];     // la entrada i ocupa los huecos i .. i+units-1 (alineada a su tamaño)
 static s16 sub_owner[NSUB];   // entrada que ocupa cada hueco (-1: ninguna)
+static s16 page_head[128];    // primera entrada de cada página (32 páginas x 4 profundidades): buscar sin recorrer las 192
 
-static void tex_reset(void) { memset(tex, 0, sizeof tex); memset(sub_owner, -1, sizeof sub_owner); }
+static int page_key(int x, int y, int depth) { return ((y >> 8) & 1) << 4 | ((x >> 6) & 15) | ((depth - 1) & 3) << 5; }
+
+static void tex_reset(void)
+{
+	memset(tex, 0, sizeof tex);
+	memset(sub_owner, -1, sizeof sub_owner);
+	memset(page_head, -1, sizeof page_head);
+}
+
+static void tex_unlink(int k)   // quita la entrada k de la lista de su página
+{
+	s16 *pp = &page_head[page_key(tex[k].x, tex[k].y, tex[k].depth)];
+	while (*pp >= 0 && *pp != k) pp = &tex[*pp].next;
+	if (*pp == k) *pp = tex[k].next;
+}
 
 static int src_w(int depth) { return depth == 1 || depth == 4 ? 64 : depth == 2 ? 128 : 256; }   // medias palabras por fila
 static int dst_row(int depth) { return depth == 1 ? 128 : depth == 3 ? 512 : 256; }              // bytes por fila
@@ -349,7 +364,7 @@ static int tex_get(int x, int y, int depth, int cx, int cy, int v0, int v1)
 		tex_ensure(&tex[last], last, v0, v1);
 		return last;
 	}
-	for (int i = 0; i < NSUB; i++)
+	for (int i = page_head[page_key(x, y, depth)]; i >= 0; i = tex[i].next)
 		if (tex_has(&tex[i], x, y, depth, v0, v1)) {
 			tex[i].stamp = frame_no;
 			tex_ensure(&tex[i], i, v0, v1);
@@ -380,10 +395,16 @@ static int tex_get(int x, int y, int depth, int cx, int cy, int v0, int v1)
 		int k = sub_owner[s];
 		if (k >= 0 && tex[k].used) {
 			for (int q = k; q < k + tex[k].units; q++) sub_owner[q] = -1;
+			tex_unlink(k);
 			tex[k].used = 0;
 		}
 	}
 	for (int s = best; s < best + units; s++) sub_owner[s] = (s16)best;
+	{
+		s16 *head = &page_head[page_key(x, y, depth)];
+		tex[best].next = *head;
+		*head = (s16)best;
+	}
 	tex[best].x = (s16)x; tex[best].y = (s16)y; tex[best].cx = (s16)cx; tex[best].cy = (s16)cy;
 	tex[best].depth = (u8)depth; tex[best].units = (u8)units; tex[best].used = 1; tex[best].stamp = frame_no;
 	tex[best].start = (u8)start; tex[best].h = (u16)h;
