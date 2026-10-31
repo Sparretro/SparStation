@@ -51,7 +51,7 @@ static u32 slot_mask;
 
 // Código fijo al principio de la caché: entrar desde C, salir a C, enlazar y despachar
 static void (*dyn_enter)(Cpu *c, u8 *ram, u8 *pages, block_fn body);
-static u32 *stub_exit, *stub_link, *stub_dispatch, *stub_exit_pc, *stub_sp_fail;
+static u32 *stub_exit, *stub_link, *stub_dispatch, *stub_exit_pc, *stub_sp_fail, *stub_scr_fail;
 static u32 gen;              // sube en cada vaciado: un enlace pendiente de una caché vieja no se parchea
 u8 dyn_chain;                // 0 = volver a C en cada bloque (psx_hook_pc); 1 = salvo vectores A0/B0/C0 (psx_tty)
 PSX_FAST static u32 dyn_tmp; // condición o destino de salto guardado cuando el delay slot pisa sus registros
@@ -190,6 +190,14 @@ static void emit_stubs(void)
 	a_str(R0, RCPU, OFF_PC);
 	a_push((1u << R3) | (1u << R12));
 	{ extern void dyn_sp_fail(u32 pc); a_b(C_AL, 1, (const void *)dyn_sp_fail); }
+	a_pop((1u << R3) | (1u << R12));
+	a_b(C_AL, 0, stub_exit);
+	// igual con la base de la scratchpad (ver scr_reg)
+	stub_scr_fail = emit_ptr;
+	a_ldr(R0, LR, 0);
+	a_str(R0, RCPU, OFF_PC);
+	a_push((1u << R3) | (1u << R12));
+	{ extern void dyn_scr_fail(u32 pc); a_b(C_AL, 1, (const void *)dyn_scr_fail); }
 	a_pop((1u << R3) | (1u << R12));
 	a_b(C_AL, 0, stub_exit);
 	// enlazar: se llega con BL desde el final de un bloque; la palabra siguiente al BL es el PC destino
@@ -408,6 +416,21 @@ static u32 *sp_fail[2];               // saltos de la comprobación de entrada q
 static u32 sp_unsafe[256];             // PC de bloques donde falló (tabla abierta)
 static int sp_unsafe_n;
 
+// Scratchpad: si al traducir un registro vale una dirección fija de la scratchpad (SH: s0 = 1F800000) y el
+// bloque lo usa de base al menos dos veces, se comprueba una vez al entrar que sigue valiendo eso; entonces
+// «lbu a0, 912(s0)» es un solo LDRB sobre la DTCM. Si al entrar no vale eso, se retraduce sin el atajo.
+static int scr_reg, scr_ok;            // registro MIPS (0 = ninguno) y si aún vale scr_val en este punto
+static u32 scr_val, *scr_fail;
+static u32 scr_unsafe[256];
+static int scr_unsafe_n;
+
+static int pc_in(const u32 *tab, u32 pc)
+{
+	for (u32 i = (pc >> 2) & 255, k = 0; k < 256 && tab[i]; i = (i + 1) & 255, k++)
+		if (tab[i] == pc) return 1;
+	return 0;
+}
+
 static int sp_is_unsafe(u32 pc)
 {
 	for (u32 i = (pc >> 2) & 255, k = 0; k < 256 && sp_unsafe[i]; i = (i + 1) & 255, k++)
@@ -448,6 +471,7 @@ static void put(int mr, int r)
 {
 	if (!mr) return;
 	if (mr == 29) hsp_ok = 0;
+	if (mr == scr_reg) scr_ok = 0;
 	rg[mr].isconst = 0;
 	if (rg[mr].host >= 0) {
 		rg[mr].valid = 1;
@@ -464,6 +488,7 @@ static void put_const(int mr, u32 k)
 {
 	if (!mr) return;
 	if (mr == 29) hsp_ok = 0;
+	if (mr == scr_reg) scr_ok = 0;
 	rg[mr].isconst = 1;
 	rg[mr].k = k;
 	rg[mr].stale = 1;
@@ -490,6 +515,7 @@ static void flush_regs(void)
 static void forget(u32 written_mask)
 {
 	if (written_mask & (1u << 29)) hsp_ok = 0;
+	if (written_mask & (1u << scr_reg) & ~1u) scr_ok = 0;
 	written_mask &= ~1u;
 	stale_mask &= ~written_mask;
 	while (written_mask) {
@@ -667,6 +693,71 @@ static void pv_after(u32 op)
 	pv_ok |= 1;
 }
 
+
+// Rangos al traducir: valores pequeños sin signo (lbu, andi, sll de ellos) y punteros a la scratchpad
+// sacados de la base comprobada (scr_reg) más un valor pequeño. «addu a0, a0, s0» con a0 = byte << 2 queda
+// dentro de la scratchpad seguro, y «lw a0, 0(a0)» se lee de la DTCM sin mirar nada.
+enum { RK_NONE, RK_SMALL, RK_SCR };   // RK_SMALL: [lo, hi]; RK_SCR: dirección 1F800000 + [lo, hi]
+static struct { u8 kind; u32 lo, hi; } rng[32];
+
+static void rng_start(void) { memset(rng, 0, sizeof rng); }
+
+static void rng_after(u32 op)
+{
+	u32 o = op >> 26, rs = (op >> 21) & 31, rt = (op >> 16) & 31, rd = (op >> 11) & 31, f = op & 0x3f, r, w;
+	int dst = -1, kind = RK_NONE;
+	u32 lo = 0, hi = 0;
+	op_regs(op, &r, &w);
+	if (o == 0x24) { dst = (int)rt; kind = RK_SMALL; hi = 255; }                          // LBU
+	else if (o == 0x25) { dst = (int)rt; kind = RK_SMALL; hi = 0xffff; }                   // LHU
+	else if (o == 0x0c) { dst = (int)rt; kind = RK_SMALL; hi = op & 0xffff; }              // ANDI
+	else if (o == 0 && f == 0x00 && rng[rt].kind == RK_SMALL && rng[rt].hi < 0x10000 && ((op >> 6) & 31) <= 15) {   // SLL
+		u32 sa = (op >> 6) & 31;
+		dst = (int)rd; kind = RK_SMALL; lo = rng[rt].lo << sa; hi = rng[rt].hi << sa;
+	} else if (o == 0 && f == 0x02 && rng[rt].kind == RK_SMALL) {                             // SRL
+		u32 sa = (op >> 6) & 31;
+		dst = (int)rd; kind = RK_SMALL; lo = rng[rt].lo >> sa; hi = rng[rt].hi >> sa;
+	} else if (o == 0 && f == 0x21) {                                                        // ADDU
+		const int pair[2][2] = { { (int)rs, (int)rt }, { (int)rt, (int)rs } };   // probar los dos órdenes
+		u32 base = scr_val - 0x1f800000;
+		dst = (int)rd;
+		for (int k = 0; k < 2; k++) {
+			int a = pair[k][0], b = pair[k][1];
+			if (rng[b].kind != RK_SMALL || rng[b].hi >= 0x400) continue;
+			if (a == scr_reg && scr_ok) { kind = RK_SCR; lo = base + rng[b].lo; hi = base + rng[b].hi; break; }
+			if (rng[a].kind == RK_SCR) { kind = RK_SCR; lo = rng[a].lo + rng[b].lo; hi = rng[a].hi + rng[b].hi; break; }
+			if (rng[a].kind == RK_SMALL && rng[a].hi < 0x10000) { kind = RK_SMALL; lo = rng[a].lo + rng[b].lo; hi = rng[a].hi + rng[b].hi; break; }
+		}
+	} else if (o == 0x09 && (rng[rs].kind == RK_SCR || (rs == (u32)scr_reg && scr_ok))) {    // ADDIU sobre la scratchpad
+		s32 im = (s16)op;
+		u32 l0 = rng[rs].kind == RK_SCR ? rng[rs].lo : scr_val - 0x1f800000, h0 = rng[rs].kind == RK_SCR ? rng[rs].hi : l0;
+		dst = (int)rt;
+		if ((s32)l0 + im >= 0) { kind = RK_SCR; lo = l0 + (u32)im; hi = h0 + (u32)im; }
+	}
+	for (u32 m = w; m; m &= m - 1) rng[__builtin_ctz(m)].kind = RK_NONE;
+	if (dst > 0 && kind != RK_NONE && hi < 0x10000 && lo <= hi) { rng[dst].kind = (u8)kind; rng[dst].lo = lo; rng[dst].hi = hi; }
+	rng[0].kind = RK_NONE;
+}
+
+// ¿rs + simm cae seguro dentro de la scratchpad (bytes [0, 0x400))?
+static int scr_derived(int rs, u32 simm, int bytes)
+{
+	s32 lo, hi;
+	if (!rs || rng[rs].kind != RK_SCR) return 0;
+	lo = (s32)rng[rs].lo + (s32)simm;
+	hi = (s32)rng[rs].hi + (s32)simm + bytes;
+	return lo >= 0 && hi <= 0x400;
+}
+
+// Acceso por un puntero derivado: dirección en la DS = r11 + off_scr + (rs - 1F800000) + simm
+static void scr_derived_mem(int load, int size, int rs, u32 simm, int r)
+{
+	int x = get(rs, R0);
+	a_dp_imm(C_AL, OP_SUB, 0, R1, x, arm_imm(0x1f800000));
+	a_dp_reg(C_AL, OP_ADD, 0, R1, R1, RCPU, SH_LSL, 0);
+	mem_off(C_AL, load, size, r, R1, off_scr + (s32)simm);
+}
+
 // ¿rs + simm apuntará a la scratchpad? (SH tiene s0 = 1F800000 casi siempre)
 static int scratch_hint(int rs, u32 simm)
 {
@@ -703,6 +794,8 @@ static void load_to(int size, int rs, u32 simm, int d)
 {
 	static const int hsh[5] = { 0, 3, 1, 2, 0 };
 	if (rs == 29 && hsp_ok) { mem_off(C_AL, 1, size, d, RHSP, (s32)simm); return; }   // pila (ver RHSP)
+	if (rs == scr_reg && scr_ok && scr_val - 0x1f800000 + simm < 0x400) { mem_off(C_AL, 1, size, d, RCPU, off_scr + (int)(scr_val - 0x1f800000 + simm)); return; }
+	if (scr_derived(rs, simm, size == M_W ? 4 : size <= M_HU ? 2 : 1)) { scr_derived_mem(1, size, rs, simm, d); return; }
 	if (is_const(rs)) {
 		u32 a = const_of(rs) + simm, off;
 		if (ram_const(a, &off)) mem_off(C_AL, 1, size, d, RRAM, (int)off);
@@ -737,6 +830,8 @@ static void emit_load(int size, int rs, int rt, u32 simm)
 static void store_from(int size, int rs, u32 simm, int v)
 {
 	if (rs == 29 && hsp_ok) { mem_off(C_AL, 0, size, v, RHSP, (s32)simm); return; }
+	if (rs == scr_reg && scr_ok && scr_val - 0x1f800000 + simm < 0x400) { mem_off(C_AL, 0, size, v, RCPU, off_scr + (int)(scr_val - 0x1f800000 + simm)); return; }
+	if (scr_derived(rs, simm, size == M_W ? 4 : size <= M_HU ? 2 : 1)) { scr_derived_mem(0, size, rs, simm, v); return; }
 	if (is_const(rs)) {
 		u32 a = const_of(rs) + simm, off;
 		if (ram_const(a, &off)) {
@@ -870,6 +965,8 @@ static void alloc_regs(u32 pc)
 	u32 seen = 0;
 	int n = 0;
 	int sp_ops = 0;
+	u8 scr_uses[32] = { 0 };
+	u32 wr_before = 0;
 	for (u32 cur = pc;; cur += 4) {
 		u32 op = fetch_op(cur), r, w, m;
 		int last = 0;
@@ -884,6 +981,12 @@ static void alloc_regs(u32 pc)
 		}
 		sp_ops += sp_mem_op(op);
 		op_regs(op, &r, &w);
+		{   // base de la scratchpad conocida al entrar y aún sin cambiar
+			u32 o = op >> 26, rs = (op >> 21) & 31;
+			if (((o >= 0x20 && o <= 0x2e) || o == 0x32 || o == 0x3a) && rs && !(wr_before & (1u << rs)) &&
+			    (pv[rs] & 0xfffffc00) == 0x1f800000) scr_uses[rs]++;
+			wr_before |= w;
+		}
 		for (m = r; m; m &= m - 1) uses[__builtin_ctz(m)]++;
 		for (m = w; m; m &= m - 1) uses[__builtin_ctz(m)]++;
 		seen |= r | w;
@@ -893,6 +996,11 @@ static void alloc_regs(u32 pc)
 	for (int i = 0; i < 32; i++) rg[i].host = -1;
 	stale_mask = 0;
 	use_hsp = hsp_ok = sp_ops >= 2 && lin(pc) < 0x200000 && !sp_is_unsafe(pc);
+	scr_reg = scr_ok = 0;
+	if (!pc_in(scr_unsafe, pc) && scr_unsafe_n < 200)
+		for (int i = 1; i < 32; i++)
+			if (scr_uses[i] >= 2 && (!scr_reg || scr_uses[i] > scr_uses[scr_reg])) scr_reg = i;
+	if (scr_reg) { scr_ok = 1; scr_val = pv[scr_reg]; }
 	for (int h = 0; h < 5 && seen; h++) {
 		if (use_hsp && host_pool[h] == RHSP) continue;
 		int best = 0;
@@ -1334,6 +1442,7 @@ static block_fn compile(u32 pc, block_fn *s)
 	start = emit_ptr;
 	cold_start = cold_ptr;
 	pv_start();
+	rng_start();
 	alloc_regs(pc);
 	emit(pc);   // cabecera: el PC virtual con el que se tradujo
 	entry = emit_ptr;
@@ -1348,6 +1457,12 @@ static block_fn compile(u32 pc, block_fn *s)
 		a_dp_reg(C_AL, OP_ADD, 0, RHSP, RRAM, R0, SH_LSR, 11);
 		sp_fail[0] = fail1;
 		sp_fail[1] = fail2;
+	}
+	if (scr_reg) {   // base de la scratchpad: ¿sigue valiendo lo mismo?
+		int x = get(scr_reg, R0), k = arm_imm(scr_val);
+		if (k >= 0) a_dp_imm(C_AL, OP_CMP, 1, 0, x, k);
+		else { a_movi(R1, scr_val); a_dp_reg(C_AL, OP_CMP, 1, 0, x, R1, SH_LSL, 0); }
+		scr_fail = fwd(C_NE);
 	}
 
 	for (;;) {
@@ -1456,6 +1571,7 @@ static block_fn compile(u32 pc, block_fn *s)
 		}
 		if (op && !emit_op(op, cur, n)) break;
 		pv_after(op);
+		rng_after(op);
 		if (n >= MAX_BLOCK) {
 			exit_to(cur + 4, n);
 			break;
@@ -1468,6 +1584,13 @@ static block_fn compile(u32 pc, block_fn *s)
 		land(sp_fail[0]);
 		land(sp_fail[1]);
 		a_b(C_AL, 1, stub_sp_fail);
+		emit(pc);
+		end_cold();
+	}
+	if (scr_reg) {
+		begin_cold();
+		land(scr_fail);
+		a_b(C_AL, 1, stub_scr_fail);
 		emit(pc);
 		end_cold();
 	}
@@ -1492,6 +1615,19 @@ void dyn_sp_fail(u32 pc)
 	}
 	if (s && *s && (*s)[-1] == pc) *s = NULL;
 	if (l < 0x200000) unlink_page(l >> DYN_PAGE_BITS, l, l + 4);   // los saltos ya parcheados hacia él, también
+}
+
+// Lo llama stub_scr_fail: la base de la scratchpad del bloque de pc no valía lo que se supuso
+void dyn_scr_fail(u32 pc)
+{
+	block_fn *s = slot(pc);
+	u32 l = lin(pc), i;
+	if (scr_unsafe_n < 256) {
+		for (i = (pc >> 2) & 255; scr_unsafe[i] && scr_unsafe[i] != pc; i = (i + 1) & 255) { }
+		if (!scr_unsafe[i]) { scr_unsafe[i] = pc; scr_unsafe_n++; }
+	}
+	if (s && *s && (*s)[-1] == pc) *s = NULL;
+	if (l < 0x200000) unlink_page(l >> DYN_PAGE_BITS, l, l + 4);
 }
 
 // Lo llama el enlazador (stub_link) desde el final de un bloque: busca o traduce el destino y, si
