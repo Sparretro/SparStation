@@ -93,6 +93,7 @@ extern u8 dyn_pages[DYN_NPAGES];   // trozos de RAM con código traducido
 void dyn_smc(u32 ram_off);         // la RAM cambió en una página con código: invalidarla
 void dyn_ram_written(u32 ram_off, u32 len);
 int dyn_init(int big);
+void dyn_set_cpu_scale(u32 scale);   // cambia psx_cpu_scale en marcha (sin volver a traducir)
 void dyn_run(u32 until);
 void dyn_cache_use(u32 *used, u32 *size);   // bytes de la caché de código ocupados / total
 void dyn_regions(u32 r[6]);   // zonas de la caché de código (para el perfilador)

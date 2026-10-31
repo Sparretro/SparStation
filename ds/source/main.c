@@ -130,11 +130,25 @@ static int open_disc(const char *path)
 
 // Ajustes de velocidad: se eligen en la lista de juegos y se guardan en la SD
 #define CFG_PATH GAMES_DIR "/sparstation.cfg"
-static int opt_quality, opt_skip, opt_cpu;   // calidad 0-3, frames saltados 0-3, CPU 0-2
+static int opt_quality, opt_skip, opt_cpu;   // calidad 0-3, frames saltados 0-3, CPU 0 = auto, 1-5 = cpu_pct
 static int opt_hw = 1;                       // GPU: 1 = motor 3D de la DS (gx.c), 0 = por software
 static int opt_snd = 1;                      // sonido (voces de la SPU y audio XA del CD)
 static const char *const quality_name[4] = { "normal", "rapida", "muy rapida", "baja res" };
-static const int cpu_pct[3] = { 100, 85, 70 };
+static const int cpu_pct[6] = { 0, 100, 85, 70, 50, 35 };
+#define CPU_OPTS 6
+// CPU automática: la PS1 corre con los ciclos justos para que el juego vaya a la velocidad real. Los juegos que
+// miden el tiempo en vblanks (Silent Hill) van a su velocidad con menos imágenes; los demás, igual que al 100%.
+#define AUTO_MIN 256u                 // 100%
+#define AUTO_MAX (256u * 100 / 30)    // 30%
+static u32 auto_scale = AUTO_MIN;
+
+static const char *cpu_name(void)
+{
+	static char s[8];
+	if (!opt_cpu) return "auto";
+	snprintf(s, sizeof s, "%d%%", cpu_pct[opt_cpu]);
+	return s;
+}
 
 static void load_cfg(void)
 {
@@ -148,7 +162,7 @@ static void load_cfg(void)
 	fclose(f);
 	if (opt_quality < 0 || opt_quality > 3) opt_quality = 0;
 	if (opt_skip < 0 || opt_skip > 3) opt_skip = 0;
-	if (opt_cpu < 0 || opt_cpu > 2) opt_cpu = 0;
+	if (opt_cpu < 0 || opt_cpu >= CPU_OPTS) opt_cpu = 0;
 }
 
 static void save_cfg(void)
@@ -201,7 +215,8 @@ static void apply_cfg(void)
 	gpu_rows_for(opt_quality > 2 ? 2 : opt_quality, 192);
 	gpu_half_x = opt_quality == 3;   // baja res: además, la mitad de los píxeles de cada línea
 	gpu_frameskip = (u8)opt_skip;
-	psx_cpu_scale = (u16)(256 * 100 / cpu_pct[opt_cpu]);
+	auto_scale = AUTO_MIN;
+	dyn_set_cpu_scale(opt_cpu ? 256u * 100 / (u32)cpu_pct[opt_cpu] : auto_scale);
 }
 
 static int pick_game(char *out, size_t outlen)
@@ -238,7 +253,7 @@ static int pick_game(char *out, size_t outlen)
 		printf("\x1b[15;0H\x1b[36;1mAjustes de velocidad\x1b[37;1m\n");
 		printf("L/R    calidad: %s\n", quality_name[opt_quality]);
 		printf("SELECT saltar frames: %d\n", opt_skip);
-		printf("Y      CPU PS1: %d%%\n", cpu_pct[opt_cpu]);
+		printf("Y      CPU PS1: %s\n", cpu_name());
 		printf("X      GPU: %s\n", opt_hw ? "3D de la DS (rapida)" : "software (exacta)");
 		printf("B      sonido: %s\n", opt_snd ? "si" : "no");
 		printf("\x1b[37m(calidad: solo GPU software)\x1b[37;1m\n");
@@ -250,7 +265,7 @@ static int pick_game(char *out, size_t outlen)
 		if (keys & KEY_R) opt_quality = (opt_quality + 1) % 4;
 		if (keys & KEY_L) opt_quality = (opt_quality + 3) % 4;
 		if (keys & KEY_SELECT) opt_skip = (opt_skip + 1) % 4;
-		if (keys & KEY_Y) opt_cpu = (opt_cpu + 1) % 3;
+		if (keys & KEY_Y) opt_cpu = (opt_cpu + 1) % CPU_OPTS;
 		if (keys & KEY_X) opt_hw ^= 1;
 		if (keys & KEY_B) opt_snd ^= 1;
 		if (keys & KEY_A) break;
@@ -605,7 +620,7 @@ static void run_loop(const char *title, int use_log)
 #endif
 	if (title) {
 		char info[48];
-		snprintf(info, sizeof info, "%s, salto %d, CPU %d%%", quality_name[opt_quality], opt_skip, cpu_pct[opt_cpu]);
+		snprintf(info, sizeof info, "%s, salto %d, CPU %s", quality_name[opt_quality], opt_skip, cpu_name());
 		hud_start(title, use_log, info);
 	}
 	for (;;) {
@@ -629,6 +644,12 @@ static void run_loop(const char *title, int use_log)
 		psx_prof[PROF_FRAME] += t0;
 		hud_frame(t0);
 		frames++;
+		{   // no ir más rápido que la consola: tiempo en quintos de vblank de la DS (un frame PAL dura 6)
+			static u32 lim_base, lim_t;
+			lim_t += gpu_disp.pal ? 6 : 5;
+			if ((vblanks - lim_base) * 5 > lim_t + 10) lim_base = vblanks - lim_t / 5;   // atrasados: no recuperar a saltos
+			while ((s32)(lim_t - (vblanks - lim_base) * 5) > 0) swiWaitForVBlank();
+		}
 		bench.frames++;
 #ifdef PSX_SMCLOG
 		{ extern u32 psx_frame_no; psx_frame_no = bench.frames; }
@@ -638,6 +659,14 @@ static void run_loop(const char *title, int use_log)
 		bench.ram = psx_ram;
 		{ u32 used, size; extern u32 *dyn_code_base(void); dyn_cache_use(&used, &size); bench.code = (u32)dyn_code_base(); bench.code_used = used; }
 		if (vblanks - last >= 60) {   // un segundo real
+			if (!opt_cpu && frames) {   // CPU automática: acercar el trabajo de cada frame al tiempo de un frame real
+				u32 target = (gpu_disp.pal ? 33514000u / 50 : 33514000u / 60) * 92 / 100;
+				u32 want = (u32)((u64)auto_scale * (psx_prof[PROF_FRAME] / (u32)frames) / target);
+				auto_scale = (auto_scale + want) / 2;
+				if (auto_scale < AUTO_MIN) auto_scale = AUTO_MIN;
+				if (auto_scale > AUTO_MAX) auto_scale = AUTO_MAX;
+				dyn_set_cpu_scale(auto_scale);
+			}
 			bench_second();
 			if (title) hud_second(frames, vblanks - last);
 			else { memset(psx_prof, 0, sizeof psx_prof); memset(&psx_stat, 0, sizeof psx_stat); }
@@ -665,7 +694,7 @@ int main(void)
 	fb[1] = fb[0] + 256 * 256;   // banco B, base de mapa 8
 	dmaFillHalfWords(0x8000, fb[0], 2 * 256 * 256 * 2);
 
-	printf("SparStation v10 - PS1 en DSi\nby Spar Retro\n\n");
+	printf("SparStation v11 - PS1 en DSi\nby Spar Retro\n\n");
 #ifdef PSX_SELFTEST
 	if (!nitroFSInit(NULL) || !pak_init() || !load_bios()) {
 		printf("Pruebas: falta nitro:/bios.bin\no el Expansion Pak.\n");
@@ -720,6 +749,9 @@ int main(void)
 #endif
 #ifdef BENCH_SKIP
 			opt_skip = BENCH_SKIP;   // y saltando frames (EXTRA=-DBENCH_SKIP=n)
+#endif
+#ifdef BENCH_CPU
+			opt_cpu = BENCH_CPU;
 #endif
 			apply_cfg();
 #endif

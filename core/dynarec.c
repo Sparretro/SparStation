@@ -78,6 +78,11 @@ static s32 link_head[DYN_NPAGES], link_n, link_max;
 #define OFF_LO ((int)offsetof(Cpu, lo))
 #define OFF_PC ((int)offsetof(Cpu, pc))
 static int off_cyc, off_until, off_tmp, off_scr;   // respecto a &cpu (todo en la DTCM)
+// Ciclos de n instrucciones con la CPU a psx_cpu_scale: el código traducido los lee de aquí (r11 + off_ctab),
+// así la velocidad de la CPU se cambia en marcha (modo automático) sin volver a traducir nada
+#define CYC_TAB 72
+static PSX_FAST u32 cyc_tab[CYC_TAB];
+static int off_ctab = -1;
 
 static void sync_code(void *p, u32 len)
 {
@@ -311,12 +316,26 @@ int dyn_init(int big)
 	if (!near_cpu(&psx_cycles, 0, &off_cyc) || !near_cpu(&psx_run_until, 0, &off_until) ||
 	    !near_cpu(&dyn_tmp, 0, &off_tmp) || !near_cpu(psx_scratch, 1023, &off_scr))
 		return 0;
+	if (!near_cpu(cyc_tab, CYC_TAB * 4, &off_ctab)) off_ctab = -1;
+	dyn_set_cpu_scale(psx_cpu_scale);
 	memset(link_head, 0xff, sizeof link_head);
 	emit_stubs();
 	return 1;
 }
 
 u32 *dyn_code_base(void) { return code_buf; }
+
+static void flush_all(void);
+void dyn_set_cpu_scale(u32 scale)
+{
+	if (scale == psx_cpu_scale && cyc_tab[1]) return;
+	psx_cpu_scale = (u16)scale;
+	for (int n = 0; n < CYC_TAB; n++) {
+		u32 c = ((u32)n * 2 * scale) >> 8;
+		cyc_tab[n] = c ? c : 1;
+	}
+	if (off_ctab < 0 && code_buf) flush_all();   // sin tabla: los ciclos van dentro del código
+}
 
 
 void dyn_cache_use(u32 *used, u32 *size)
@@ -596,8 +615,17 @@ static void set_pc_const(u32 v)
 // Suma los ciclos de ninstr instrucciones al contador (r12); flags MI si aún queda tiempo
 static void emit_cycles(int ninstr)
 {
-	u32 c = ((u32)ninstr * 2 * psx_cpu_scale) >> 8;   // <= 130: cabe como inmediato
-	a_dp_imm(C_AL, OP_ADD, 1, RCYC, RCYC, arm_imm(c ? c : 1));
+	u32 c;
+	if (off_ctab >= 0 && ninstr < CYC_TAB) {
+		a_ldr(R1, RCPU, off_ctab + ninstr * 4);   // r1 está libre en todas las salidas
+		a_dp_reg(C_AL, OP_ADD, 1, RCYC, RCYC, R1, SH_LSL, 0);
+		return;
+	}
+	c = ((u32)ninstr * 2 * psx_cpu_scale) >> 8;
+	if (!c) c = 1;
+	if (c > 255) { a_dp_imm(C_AL, OP_ADD, 0, RCYC, RCYC, arm_imm(c & ~255u)); c &= 255; }   // CPU lenta: no cabe en un inmediato
+	if (c) a_dp_imm(C_AL, OP_ADD, 1, RCYC, RCYC, arm_imm(c));
+	else a_dp_imm(C_AL, OP_CMP, 1, 0, RCYC, 0);   // los flags (MI si queda tiempo) sin sumar nada
 }
 
 // Vuelve a C (cpu.pc ya puesto y los registros ya en memoria)

@@ -8,4 +8,4 @@
 cd "$(dirname "$0")/.."
 touch ds/source/main.c
 export DSB_PSX=${DSB_PSX:-100:600}
-EXTRA="-DBENCH_QUALITY=2 -DBENCH_SKIP=1 -DBENCH_VRAM_PAK -DDYN_DS_RESERVE_KB=160 -DDYN_DS_SLOTS=0x80000 -DDYN_SLOTS_AT=0x09300000 -DNO_SND $EXTRA" sh tools/bench.sh ${2:-nitro_shg} 16000 -1 ${1:-ref} 2>/dev/null | grep -E 'BENCH|ms/frame|DSi'
+EXTRA="-DBENCH_QUALITY=2 -DBENCH_SKIP=1 -DBENCH_CPU=${CPU:-1} -DBENCH_VRAM_PAK -DDYN_DS_RESERVE_KB=160 -DDYN_DS_SLOTS=0x80000 -DDYN_SLOTS_AT=0x09300000 -DNO_SND $EXTRA" sh tools/bench.sh ${2:-nitro_shg} 16000 -1 ${1:-ref} 2>/dev/null | grep -E 'BENCH|ms/frame|DSi'
