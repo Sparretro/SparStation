@@ -669,15 +669,17 @@ int main(void)
 #else
 	psx_bios = (u8 *)openbios_bin;   // la BIOS se usa desde la propia ROM, sin copiarla
 #endif
+	{
+		int ok = psx_init();
 #ifdef NO_SND
-	spu_cache_size = 0;   // banco de pruebas sin sonido (EXTRA=-DNO_SND)
-	psx_init();
+		spu_cache_size = 0;   // banco de pruebas sin sonido (EXTRA=-DNO_SND)
 #else
-	if (psx_init()) snd_init(isDSiMode());   // la caché de sonido antes que la del dynarec, que se queda el resto
+		if (ok) snd_init(isDSiMode());   // la caché de sonido antes que la del dynarec, que se queda el resto
 #endif
-	if (!psx_ram || !dyn_init(isDSiMode())) {
-		printf("Sin memoria.\n");
-		for (;;) swiWaitForVBlank();
+		if (!ok || !dyn_init(isDSiMode())) {
+			printf("Sin memoria.\n");
+			for (;;) swiWaitForVBlank();
+		}
 	}
 	if (!isDSiMode()) {
 		// En una DS normal (4 MB) no caben los juegos: solo la demo de la BIOS, que sirve para medir,
