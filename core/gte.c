@@ -711,7 +711,7 @@ void (*gte_entry(u32 op))(u32)
 	case 0x2d: return e_avsz3;
 	case 0x2e: return e_avsz4;
 	}
-	if (!s12) return gte_command;
+	if (!s12) return gte_exec;   // el resto también directo: sin trampolín ni contar (MVMVA en Silent Hill)
 	switch (op & 0x3f) {
 	case 0x01: return e_rtps;
 	case 0x30: return e_rtpt;
@@ -724,5 +724,5 @@ void (*gte_entry(u32 op))(u32)
 	case 0x1e: return e_ncs;
 	case 0x20: return e_nct;
 	}
-	return gte_command;
+	return gte_exec;
 }

@@ -485,6 +485,9 @@ static void h_divu(u32 n, u32 d)
 // no lo tiene; isconst: el valor se conoce al traducir (k)
 static struct { s8 host; u8 valid, stale, isconst; u32 k; } rg[32];
 static const int host_pool[5] = { R4, R5, R6, R7, R8 };
+#ifndef DYN_POOL
+#define DYN_POOL 5
+#endif
 
 // Pila: si un bloque accede a memoria con sp, se comprueba una vez al entrar que sp apunta a la RAM y
 // r8 guarda su dirección real en la DS; así «lw s0, 20(sp)» es una sola instrucción ARM. Si no apunta
@@ -1139,7 +1142,7 @@ static void alloc_regs(u32 pc)
 	scr_reg = 0;
 #endif
 	if (scr_reg) { scr_ok = 1; scr_val = pv[scr_reg]; }
-	for (int h = 0; h < 5 && seen; h++) {
+	for (int h = 0; h < DYN_POOL && seen; h++) {
 		if (use_hsp && host_pool[h] == RHSP) continue;
 		int best = 0;
 		for (u32 m = seen; m; m &= m - 1) {
@@ -1288,6 +1291,41 @@ static int emit_op(u32 op, u32 pc, int ninstr)
 			int a = get(rs, R0), b = get(rt, R1);   // a es r0 o asignado; b, r1 o asignado
 			if (a != R0) a_mov(R0, a);
 			if (b != R1) a_mov(R1, b);
+#ifdef ARM9
+			{   // en línea con el divisor por hardware; los casos raros (entre 0, desbordamiento, bit alto en DIVU) en C
+				u32 *slow1, *slow2, *loop, *back;
+				a_dp_imm(C_AL, OP_CMP, 1, 0, R1, 0);
+				slow1 = fwd(C_EQ);
+				if ((op & 0x3f) == 0x1a) {
+					a_dp_imm(C_AL, OP_CMN, 1, 0, R1, 1);   // d == -1: el desbordamiento lo resuelve h_div
+					slow2 = fwd(C_EQ);
+				} else {
+					a_dp_reg(C_AL, OP_ORR, 1, R2, R0, R1, SH_LSL, 0);   // algún bit alto: la división del hardware es con signo
+					slow2 = fwd(C_MI);
+				}
+				a_movi(R2, 0x04000280);   // REG_DIVCNT
+				a_dp_imm(C_AL, OP_MOV, 0, R3, 0, 0);   // 32/32
+				a_str(R3, R2, 0);
+				a_str(R0, R2, 0x10);
+				a_str(R1, R2, 0x18);
+				loop = emit_ptr;
+				a_ldr(R3, R2, 0);
+				a_dp_imm(C_AL, OP_TST, 1, 0, R3, arm_imm(0x8000));
+				a_b(C_NE, 0, loop);
+				a_ldr(R0, R2, 0x20);
+				a_ldr(R1, R2, 0x28);
+				a_str(R0, RCPU, OFF_LO);
+				a_str(R1, RCPU, OFF_HI);
+				back = emit_ptr;
+				begin_cold();
+				land(slow1);
+				land(slow2);
+				call((op & 0x3f) == 0x1a ? (const void *)h_div : (const void *)h_divu);
+				a_b(C_AL, 0, back);
+				end_cold();
+				return 1;
+			}
+#endif
 			call((op & 0x3f) == 0x1a ? (const void *)h_div : (const void *)h_divu);
 			return 1;
 		}

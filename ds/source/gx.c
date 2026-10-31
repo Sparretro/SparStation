@@ -33,7 +33,7 @@
 static u32 list_buf[2][LIST_WORDS + 2] __attribute__((aligned(32)));
 static u32 *list = list_buf[0];
 static int list_cur;
-static int ln, npolys, nverts;   // el hardware admite 2048 polígonos y 6144 vértices por frame
+static int ln, npolys, nverts, semi_id;   // el hardware admite 2048 polígonos y 6144 vértices por frame
 static u32 frame_no;
 // Fondo BG3 (la VRAM de la PS1 copiada a la pantalla): con el 3D solo hace falta copiarlo si el juego escribió
 // en la zona mostrada (vídeos, imágenes subidas). Por franjas de 16 filas: cambiado desde la última copia, y
@@ -443,7 +443,7 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 	attr = (3u << 6) | (1u << 12) | (1u << 13) | ((u32)alpha << 16);
 	// ID: el hardware no pinta un semitransparente sobre otro con el mismo ID. Distintos para que se mezclen;
 	// el mismo (62) para los que usan el bit de máscara de la PS1, que solo dejan pintar cada píxel una vez
-	if (p->semi) attr |= (u32)(p->mask ? 62 : 1 + (npolys % 61)) << 24;
+	if (p->semi) attr |= (u32)(p->mask ? 62 : (semi_id = semi_id >= 61 ? 1 : semi_id + 1)) << 24;
 	o = &list[ln];
 	*o++ = 0x29 | (0x2a << 8) | (0x2b << 16) | (0x40 << 24);   // POLY_FORMAT, TEXIMAGE_PARAM, PLTT_BASE, BEGIN_VTXS
 	*o++ = attr;
