@@ -120,6 +120,7 @@ static struct {
 	u32 rate, timer, t0;          // t0: fast_ticks al arrancar los canales
 	u32 written;                  // muestras por canal escritas desde el arranque
 	u32 first_lba, next_lba, emu_lba;
+	u32 last_match, stride;       // último sector de este canal y distancia entre los suyos (la música va entrelazada)
 	u8 file, chan;
 	XaDecoder dec;
 } xa;
@@ -180,7 +181,7 @@ static void xa_sector(u32 lba, const u8 *raw)
 	xa.timer = soundTimerFromHz(rate);
 	xa.file = raw[16];
 	xa.chan = raw[17];
-	xa.first_lba = xa.emu_lba = lba;
+	xa.first_lba = xa.emu_lba = xa.last_match = lba;
 	xa.next_lba = lba + 1;
 	dmaFillWords(0, xa_buf[0], XR * 2);
 	dmaFillWords(0, xa_buf[1], XR * 2);
@@ -212,9 +213,19 @@ void snd_xa_pump(void)
 	}
 	while (!xa.ended && xa.written - played < XA_LEAD && xa.next_lba - xa.emu_lba < XA_MAX_AHEAD) {
 		const u8 *s = xa_sector_buf;
-		if (!xa_read || !xa_read(NULL, xa.next_lba, xa_sector_buf)) { xa.ended = 1; break; }
-		xa.next_lba++;
-		if (s[15] == 2 && (s[18] & 0x04) && s[16] == xa.file && s[17] == xa.chan) xa_put(s);
+		u32 lba = xa.next_lba;
+		if (xa.stride && lba < xa.last_match + xa.stride) lba = xa.last_match + xa.stride;   // directo al siguiente del canal
+		if (!xa_read || !xa_read(NULL, lba, xa_sector_buf)) { xa.ended = 1; break; }
+		xa.next_lba = lba + 1;
+		if (s[15] == 2 && (s[18] & 0x04) && s[16] == xa.file && s[17] == xa.chan) {
+			u32 d = lba - xa.last_match;
+			xa.stride = d >= 2 && d <= 32 ? d : 0;
+			xa.last_match = lba;
+			xa_put(s);
+		} else if (xa.stride && lba == xa.last_match + xa.stride) {   // el patrón cambió: buscar sector a sector
+			xa.stride = 0;
+			xa.next_lba = xa.last_match + 1;
+		}
 	}
 }
 

@@ -1337,6 +1337,9 @@ void gpu_write_gp0_n(const u32 *w, u32 n)
 
 void gpu_write_gp1(u32 v)
 {
+#ifdef PSX_TTY_GP1
+	{ extern int printf(const char *, ...); if ((v >> 24) != 5) printf("GP1 %08x\n", (unsigned)v); }
+#endif
 	switch (v >> 24) {
 	case 0x00: gpu_reset(); break;
 	case 0x01: fifo_n = 0; mode = M_CMD; break;

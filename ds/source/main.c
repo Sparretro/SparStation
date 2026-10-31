@@ -94,9 +94,28 @@ static void tty_out(int c) { putchar(c); }
 
 static int read_sector(void *user, u32 lba, u8 *out)
 {
+	static long pos = -1;   // dónde quedó el archivo: leyendo seguido no hace falta fseek (en la SD cuesta)
+	long want = (long)lba * 2352;
 	(void)user;
-	if (fseek(disc, (long)lba * 2352, SEEK_SET)) return 0;
-	return fread(out, 1, 2352, disc) == 2352;
+	if (want != pos && fseek(disc, want, SEEK_SET)) { pos = -1; return 0; }
+	if (fread(out, 1, 2352, disc) != 2352) { pos = -1; return 0; }
+	pos = want + 2352;
+	return 1;
+}
+
+// El audio XA se lee por delante (snd.c) con su propio archivo abierto: si compartiera el del CD, cada lectura
+// saltaría de un sitio a otro del disco y se perdería el búfer
+static FILE *disc_xa;
+
+static int read_sector_xa(void *user, u32 lba, u8 *out)
+{
+	static long pos = -1;
+	long want = (long)lba * 2352;
+	(void)user;
+	if (want != pos && fseek(disc_xa, want, SEEK_SET)) { pos = -1; return 0; }
+	if (fread(out, 1, 2352, disc_xa) != 2352) { pos = -1; return 0; }
+	pos = want + 2352;
+	return 1;
 }
 
 // Abre un .cue (busca su .bin en la misma carpeta) o un .bin directamente
@@ -124,7 +143,9 @@ static int open_disc(const char *path)
 	setvbuf(disc, NULL, _IOFBF, 32 * 1024);
 	fseek(disc, 0, SEEK_END);
 	cdrom_set_disc(read_sector, NULL, (u32)(ftell(disc) / 2352));
-	snd_set_disc(read_sector);
+	disc_xa = fopen(bin, "rb");
+	if (disc_xa) setvbuf(disc_xa, NULL, _IOFBF, 16 * 1024);
+	snd_set_disc(disc_xa ? read_sector_xa : read_sector);
 	return 1;
 }
 
@@ -694,7 +715,7 @@ int main(void)
 	fb[1] = fb[0] + 256 * 256;   // banco B, base de mapa 8
 	dmaFillHalfWords(0x8000, fb[0], 2 * 256 * 256 * 2);
 
-	printf("SparStation v12 - PS1 en DSi\nby Spar Retro\n\n");
+	printf("SparStation v13 - PS1 en DSi\nby Spar Retro\n\n");
 #ifdef PSX_SELFTEST
 	if (!nitroFSInit(NULL) || !pak_init() || !load_bios()) {
 		printf("Pruebas: falta nitro:/bios.bin\no el Expansion Pak.\n");
