@@ -1340,6 +1340,38 @@ static int emit_op(u32 op, u32 pc, int ninstr)
 	case 0x23: emit_load(M_W, rs, rt, simm); return 1;    // LW
 	case 0x24: emit_load(M_BU, rs, rt, simm); return 1;   // LBU
 	case 0x25: emit_load(M_HU, rs, rt, simm); return 1;   // LHU
+	case 0x22: case 0x26: {   // LWL, LWR: la palabra alineada (RAM en línea, lo demás por su rutina) y la mezcla
+		int x, cur, d;
+		if (!rt) return 1;
+		x = get(rs, R0);
+		a_addi(R0, x, simm, R1);
+		a_dp_imm(C_AL, OP_BIC, 0, R0, R0, 3);
+		a_dp_imm(C_AL, OP_TST, 1, 0, R0, arm_imm(0x1f800000));
+		a_dp_reg(C_EQ, OP_MOV, 0, R1, 0, R0, SH_LSL, 11);
+		a_mem_regsh(C_EQ, 1, 0, R2, RRAM, R1, SH_LSR, 11);
+		a_b(C_NE, 1, ld_handler[M_W][R2]);
+		x = get(rs, R3);   // la rutina lenta pierde r0-r3: el desplazamiento se calcula después
+		a_addi(R3, x, simm, R1);
+		a_dp_imm(C_AL, OP_AND, 0, R3, R3, 3);
+		a_dp_reg(C_AL, OP_MOV, 0, R3, 0, R3, SH_LSL, 3);   // s = (dirección & 3) * 8
+		cur = get(rt, R1);
+		d = dst(rt, R1);
+		if ((op >> 26) == 0x22) {   // LWL: (rt & (00FFFFFF >> s)) | (w << (24 - s))
+			a_dp_imm(C_AL, OP_RSB, 0, R0, R3, 24);
+			a_dp_regsh(C_AL, OP_MOV, 0, R2, 0, R2, SH_LSL, R0);
+			a_dp_imm(C_AL, OP_MVN, 0, R0, 0, arm_imm(0xff000000));
+			a_dp_regsh(C_AL, OP_MOV, 0, R0, 0, R0, SH_LSR, R3);
+			a_dp_reg(C_AL, OP_AND, 0, d, cur, R0, SH_LSL, 0);
+		} else {           // LWR: (rt & ~(FFFFFFFF >> s)) | (w >> s)
+			a_dp_regsh(C_AL, OP_MOV, 0, R2, 0, R2, SH_LSR, R3);
+			a_dp_imm(C_AL, OP_MVN, 0, R0, 0, 0);
+			a_dp_regsh(C_AL, OP_MOV, 0, R0, 0, R0, SH_LSR, R3);
+			a_dp_reg(C_AL, OP_BIC, 0, d, cur, R0, SH_LSL, 0);
+		}
+		a_dp_reg(C_AL, OP_ORR, 0, d, d, R2, SH_LSL, 0);
+		put(rt, d);
+		return 1;
+	}
 	case 0x28: emit_store(M_BU, rs, rt, simm); return 1;  // SB
 	case 0x29: emit_store(M_HU, rs, rt, simm); return 1;  // SH
 	case 0x2b: emit_store(M_W, rs, rt, simm); return 1;   // SW

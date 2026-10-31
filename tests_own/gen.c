@@ -38,7 +38,7 @@ static void stmt(int d, int depth)
 {
 	int x = R(NV), y = R(NV);
 	ind(d);
-	switch (R(depth < 2 ? 25 : 17)) {
+	switch (R(depth < 2 ? 27 : 17)) {
 	case 0: case 1: case 2: case 3: case 4: case 5: printf("v%d = ", x); expr(); printf(";\n"); break;
 	case 6: printf("b8[(v%d + %d) & 63] = (u8)v%d;\n", y, R(64), x); break;
 	case 7: printf("v%d += b8[(v%d + %d) & 63];\n", x, y, R(64)); break;
@@ -55,6 +55,9 @@ static void stmt(int d, int depth)
 	case 22: printf("{ volatile u32 *p = mpx[v%d & 1]; p[v%d & 15] = v%d; v%d += p[(v%d + 1) & 15]; }\n", y, x, y, x, x); break;
 	case 23: printf("{ volatile u32 *p = mpx[(v%d >> 2) & 1]; ((volatile u16 *)p)[v%d & 31] = (u16)v%d; v%d -= (u32)(s16)((volatile u16 *)p)[(v%d + 3) & 31]; }\n", y, x, y, x, x); break;
 	case 24: printf("{ volatile u32 *p = mpx[v%d & 1]; ((volatile u8 *)p)[v%d & 63] = (u8)v%d; v%d ^= (u32)(s8)((volatile u8 *)p)[(v%d + 5) & 63] + ((volatile u8 *)p)[v%d & 63]; }\n", x, y, x, y, x, y); break;
+	// accesos desalineados: LWL/LWR y SWL/SWR
+	case 25: printf("{ const u8 *q = (const u8 *)mpx[v%d & 1] + (v%d & 7); u32 t; __builtin_memcpy(&t, q, 4); v%d += t; }\n", y, x, x); break;
+	case 26: printf("{ u8 *q = (u8 *)mpx[(v%d >> 3) & 1] + (v%d & 7); u32 t = v%d * 3; __builtin_memcpy(q, &t, 4); }\n", x, y, x); break;
 	case 17: case 18:
 		printf("if ((s32)v%d %s (s32)v%d) {\n", x, R(2) ? "<" : ">=", y);
 		for (int i = R(3) + 1; i; i--) stmt(d + 1, depth + 1);
