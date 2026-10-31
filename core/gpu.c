@@ -1174,7 +1174,7 @@ static void load_pixel(u16 c)
 }
 
 // Palabras que necesita cada comando GP0 (0 = no es de dibujo/datos)
-static int cmd_len(u32 cmd)
+static int cmd_len_calc(u32 cmd)
 {
 	if (cmd >= 0x20 && cmd < 0x40) {
 		int nv = (cmd & 8) ? 4 : 3, tex = (cmd & 4) != 0, gour = (cmd & 0x10) != 0;
@@ -1190,6 +1190,14 @@ static int cmd_len(u32 cmd)
 	if (cmd >= 0xa0 && cmd < 0xe0) return 3;
 	if (cmd == 0x02) return 3;
 	return 1;
+}
+
+// Tabla (se pide en cada paquete de la DMA): se rellena la primera vez
+static u8 cmd_len_tab[256];
+static int cmd_len(u32 cmd)
+{
+	if (!cmd_len_tab[0]) for (int i = 0; i < 256; i++) cmd_len_tab[i] = (u8)cmd_len_calc((u32)i);
+	return cmd_len_tab[cmd & 255];
 }
 
 static void execute_cmd(void)
