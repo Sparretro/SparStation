@@ -311,6 +311,7 @@ static void ramp_init(void)
 static inline u32 rgb5(int r, int g, int b) { return (u32)(r >> 3) | ((u32)(g >> 3) << 5) | ((u32)(b >> 3) << 10); }
 static inline int mod5(int c) { c >>= 2; return c > 31 ? 31 : c; }   // color de modulación: 128 = 1.0
 static u32 inv255[256];   // inv255[m] = 255 * 65536 / m redondeado hacia arriba: (r * inv255[m]) >> 16 == r * 255 / m
+static u8 mod5t[256];     // color de modulación (128 = 1.0) a 5 bits, saturado
 
 static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 {
@@ -321,7 +322,7 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 	static int last_w, last_h;
 	static s32 kx, ky;   // escala a coordenadas de la DS (4.12) por píxel, en 24.8: se recalcula si cambia la resolución
 	u32 attr, teximg = 0, pltt = 0, *o;
-	s32 z;
+	u32 z;
 	int lum = 24, alpha, white = 0, black = 0;
 	// B+F, B-F y B+F/4 no existen en la DS: B+F ~ «pantalla» (B*(1-a) + C*a con a = brillo de F), B-F ~
 	// negro con a = brillo de F. Con textura de 4 bits, el brillo de cada texel va en su alfa (A3I5) y el
@@ -368,35 +369,50 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 	*o++ = teximg;
 	*o++ = pltt;
 	*o++ = n == 4 ? 1 : 0;
-	z = 4000 - npolys * 3;
-	for (int k = 0; k < n; k++) {
-		const GpuHwVtx *q = &v[n == 4 ? order[k] : k];
-		s32 x = (((s32)(q->x - p->ox) * kx) >> 8) - 4096, y = 4096 - (((s32)(q->y - p->oy) * ky) >> 8);
-		u32 col;
-		if (x < -32768) x = -32768; else if (x > 32767) x = 32767;
-		if (y < -32768) y = -32768; else if (y > 32767) y = 32767;
-		if (black) col = 0;
-		else if (white && p->tex) col = 0x7fff;   // el brillo ya va en el alfa
-		else if (white) {   // color llevado a brillo máximo (el brillo va en el alfa): r * 255 / m con la tabla de inversos
-			int m = q->r > q->g ? (q->r > q->b ? q->r : q->b) : (q->g > q->b ? q->g : q->b);
-			u32 k = inv255[m];
-			col = rgb5((int)((q->r * k) >> 16), (int)((q->g * k) >> 16), (int)((q->b * k) >> 16));
+	z = (u32)(4000 - npolys * 3) & 0xffff;
+	{
+		// color de cada vértice: constante, normalizado (aditivos), RGB tal cual o modulación de textura
+		enum { CM_CONST, CM_NORM, CM_RGB, CM_MOD } cm;
+		u32 kcol = 0;
+		int flat = !p->gouraud && !ramp;   // un solo COLOR para todo el polígono (el hardware lo mantiene)
+		if (black) cm = CM_CONST;
+		else if (white && p->tex) { cm = CM_CONST; kcol = 0x7fff; }   // el brillo ya va en el alfa
+		else if (white) cm = CM_NORM;
+		else if (!p->tex) cm = CM_RGB;
+		else if (p->raw) { cm = CM_CONST; kcol = 0x7fff; }
+		else cm = CM_MOD;
+		for (int k = 0; k < n; k++) {
+			const GpuHwVtx *q = &v[n == 4 ? order[k] : k];
+			s32 x = (((s32)(q->x - p->ox) * kx) >> 8) - 4096, y = 4096 - (((s32)(q->y - p->oy) * ky) >> 8);
+			if ((u32)(x + 32768) > 0xffff) x = x < 0 ? -32768 : 32767;
+			if ((u32)(y + 32768) > 0xffff) y = y < 0 ? -32768 : 32767;
+			if (k == 0 || !flat) {
+				u32 col;
+				switch (cm) {
+				case CM_CONST: col = kcol; break;
+				case CM_NORM: {   // color llevado a brillo máximo (el brillo va en el alfa): r * 255 / m con la tabla de inversos
+					int m = q->r > q->g ? (q->r > q->b ? q->r : q->b) : (q->g > q->b ? q->g : q->b);
+					u32 iv = inv255[m];
+					col = rgb5((int)((q->r * iv) >> 16), (int)((q->g * iv) >> 16), (int)((q->b * iv) >> 16));
+					break;
+				}
+				case CM_RGB: col = rgb5(q->r, q->g, q->b); break;
+				default: col = mod5t[q->r] | ((u32)mod5t[q->g] << 5) | ((u32)mod5t[q->b] << 10); break;
+				}
+				*o++ = 0x20 | (0x22 << 8) | (0x23 << 16);   // COLOR, TEXCOORD, VTX_16
+				*o++ = col;
+			} else *o++ = 0x22 | (0x23 << 8);           // TEXCOORD, VTX_16 (el color sigue)
+			if (ramp) {
+				int m = q->r > q->g ? (q->r > q->b ? q->r : q->b) : (q->g > q->b ? q->g : q->b);
+				m >>= p->semi == 4 ? 5 : 3;
+				if (m < 1) m = 1;   // con alfa 0 la DS no pinta y no marcaría el píxel (ver p->mask)
+				if (m > 31) m = 31;
+				*o++ = (8u << 16) | (u32)(m * 16 + 8);
+			} else
+				*o++ = ((u32)(q->v << 4) << 16) | ((u32)(q->u << 4) & 0xffff);
+			*o++ = ((u32)y << 16) | ((u32)x & 0xffff);
+			*o++ = z;
 		}
-		else if (!p->tex) col = rgb5(q->r, q->g, q->b);
-		else if (p->raw) col = 0x7fff;
-		else col = (u32)mod5(q->r) | ((u32)mod5(q->g) << 5) | ((u32)mod5(q->b) << 10);
-		*o++ = 0x20 | (0x22 << 8) | (0x23 << 16);   // COLOR, TEXCOORD, VTX_16
-		*o++ = col;
-		if (ramp) {
-			int m = q->r > q->g ? (q->r > q->b ? q->r : q->b) : (q->g > q->b ? q->g : q->b);
-			m >>= p->semi == 4 ? 5 : 3;
-			if (m < 1) m = 1;   // con alfa 0 la DS no pinta y no marcaría el píxel (ver p->mask)
-			if (m > 31) m = 31;
-			*o++ = (8u << 16) | (u32)(m * 16 + 8);
-		} else
-			*o++ = ((u32)(q->v << 4) << 16) | ((u32)(q->u << 4) & 0xffff);
-		*o++ = ((u32)y << 16) | ((u32)x & 0xffff);
-		*o++ = (u32)z & 0xffff;
 	}
 	ln = (int)(o - list);
 	npolys++;
@@ -486,6 +502,7 @@ void gx_init(void)
 		if (!sh_tex || !sh_pal) { free(sh_tex); free(sh_pal); sh_tex = sh_pal = NULL; }
 	}
 	for (int m = 1; m < 256; m++) inv255[m] = ((255u << 16) + (u32)m - 1) / (u32)m;
+	for (int c = 0; c < 256; c++) mod5t[c] = (u8)mod5(c);
 	tex_reset();
 	pal_reset();
 	ramp_init();
