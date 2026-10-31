@@ -62,7 +62,20 @@ typedef struct {
 	int branching;     // la instrucción anterior fue un salto: la actual está en su delay slot
 	int in_delay;
 } Cpu;
-extern Cpu cpu;
+// Registros de la GTE (gte.c los usa por su nombre). Van delante de cpu, en el mismo bloque de la DTCM: el
+// dynarec los alcanza desde r11 (&cpu) con desplazamientos cortos (las medias palabras admiten hasta 255).
+// Mismos tipos y tamaños de siempre: los estados guardados no cambian.
+typedef struct {
+	u8 RGBC[4] __attribute__((aligned(4)));
+	u8 CF[3][4];   // FIFO de colores RGB0..RGB2
+	u32 RES1, LZCS, LZCR, FLAG;
+	s32 MAC[4], TR[3], BK[3], FC[3], OFX, OFY, DQB;
+	s16 V[3][3], IR[4], SX[3], SY[3], RT[3][3], LM[3][3], LC[3][3], DQA, ZSF3, ZSF4;
+	u16 OTZ, SZ[4], H;
+} GteRegs;
+typedef struct { GteRegs gte; Cpu cpu_; } PsxCore;
+extern PsxCore psx_core;
+#define cpu (psx_core.cpu_)
 extern u32 psx_hook_pc;   // si no es 0, psx_hook() se llama cuando el PC llega aquí
 void psx_hook(void);
 void cpu_reset(void);

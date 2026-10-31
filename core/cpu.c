@@ -2,7 +2,7 @@
 // que muchos juegos y la BIOS dan por hecho.
 #include "psx.h"
 
-PSX_FAST Cpu cpu;
+PSX_FAST PsxCore psx_core;   // registros de la GTE y de la CPU (ver psx.h)
 u32 psx_hook_pc;
 void (*psx_tty)(int c);
 

@@ -2,23 +2,34 @@
 // Sigue la documentación psx-spx, incluida la división UNR exacta que usan los juegos para la perspectiva.
 #include "psx.h"
 
-// Los registros van en la DTCM (PSX_FAST): se tocan en cada operación
-PSX_FAST static s16 V[3][3];
-PSX_FAST static u8 RGBC[4] __attribute__((aligned(4)));
-PSX_FAST static u16 OTZ;
-PSX_FAST static s16 IR[4];
-PSX_FAST static s16 SX[3], SY[3];
-PSX_FAST static u16 SZ[4];
-PSX_FAST static u8 CF[3][4] __attribute__((aligned(4)));   // FIFO de colores RGB0..RGB2
-PSX_FAST static u32 RES1;
-PSX_FAST static s32 MAC[4];
-PSX_FAST static u32 LZCS, LZCR;
-PSX_FAST static s16 RT[3][3], LM[3][3], LC[3][3];
-PSX_FAST static s32 TR[3], BK[3], FC[3];
-PSX_FAST static s32 OFX, OFY, DQB;
-PSX_FAST static u16 H;
-PSX_FAST static s16 DQA, ZSF3, ZSF4;
-PSX_FAST static u32 FLAG;
+// Los registros van en la DTCM, dentro de psx_core justo delante de cpu (psx.h): el dynarec los alcanza desde
+// r11 con desplazamientos cortos. Aquí se usan por su nombre.
+#define V (psx_core.gte.V)
+#define RGBC (psx_core.gte.RGBC)
+#define OTZ (psx_core.gte.OTZ)
+#define IR (psx_core.gte.IR)
+#define SX (psx_core.gte.SX)
+#define SY (psx_core.gte.SY)
+#define SZ (psx_core.gte.SZ)
+#define CF (psx_core.gte.CF)
+#define RES1 (psx_core.gte.RES1)
+#define MAC (psx_core.gte.MAC)
+#define LZCS (psx_core.gte.LZCS)
+#define LZCR (psx_core.gte.LZCR)
+#define RT (psx_core.gte.RT)
+#define LM (psx_core.gte.LM)
+#define LC (psx_core.gte.LC)
+#define TR (psx_core.gte.TR)
+#define BK (psx_core.gte.BK)
+#define FC (psx_core.gte.FC)
+#define OFX (psx_core.gte.OFX)
+#define OFY (psx_core.gte.OFY)
+#define DQB (psx_core.gte.DQB)
+#define H (psx_core.gte.H)
+#define DQA (psx_core.gte.DQA)
+#define ZSF3 (psx_core.gte.ZSF3)
+#define ZSF4 (psx_core.gte.ZSF4)
+#define FLAG (psx_core.gte.FLAG)
 
 PSX_FAST static int sf, lm;
 PSX_FAST static u8 unr[257];
