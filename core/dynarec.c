@@ -268,11 +268,13 @@ int dyn_init(int big)
 	memset(slots, 0, nslots * sizeof(block_fn));
 #else
 	slots = calloc(nslots, sizeof(block_fn));
+	while (!slots && nslots > 0x2000) slots = calloc(nslots >>= 1, sizeof(block_fn));   // sin sitio: más pequeña
 #endif
 	links = malloc(link_max * sizeof(Link));
 	if (big) {
 		code_size = 3 * 1024 * 1024;
 		code_buf = malloc(code_size);
+		while (!code_buf && code_size > 1024 * 1024) code_buf = malloc(code_size -= 512 * 1024);
 		blk_max = 65536;
 		blk_arm = malloc(blk_max * 4);
 		blk_mips = malloc(blk_max * 4);
