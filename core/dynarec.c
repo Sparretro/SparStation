@@ -275,10 +275,12 @@ int dyn_init(int big)
 		code_size = 3 * 1024 * 1024;
 		code_buf = malloc(code_size);
 		while (!code_buf && code_size > 1024 * 1024) code_buf = malloc(code_size -= 512 * 1024);
-		blk_max = 65536;
+#if defined(SPAR_PROF) || defined(PSX_BLKTAB)
+		blk_max = 65536;   // solo para el perfilador (qué bloque MIPS es cada dirección ARM): 512 KB
 		blk_arm = malloc(blk_max * 4);
 		blk_mips = malloc(blk_max * 4);
 		if (!blk_arm || !blk_mips) blk_max = 0;
+#endif
 	} else {   // en modo DS la memoria va muy justa: lo que quede del montón, dejando 704 KB para lo demás
 		code_size = 64 * 1024;
 #ifdef ARM9
