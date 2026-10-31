@@ -1174,7 +1174,22 @@ static u32 load_words(const u32 *w, u32 n)
 	y = load_i / load_w;
 	row = &psx_vram[((load_y + y) & 511) * 1024];
 	while (used < n && load_i < load_total) {
-		u32 v = w[used++];
+		u32 v;
+		if (!g.check_mask && !(((load_x + x) | load_w) & 1)) {   // lo normal: de 2 en 2 píxeles hasta el final de la fila
+			u32 dx = (load_x + x) & 1023, run = (u32)load_w - x, m = setm * 0x10001u;
+			u32 *d = (u32 *)&row[dx];
+			if (dx + run > 1024) run = 1024 - dx;   // la fila da la vuelta a la VRAM: el resto, despacio
+			run >>= 1;
+			if (run > n - used) run = n - used;
+			if (run > (load_total - load_i) >> 1) run = (load_total - load_i) >> 1;
+			for (u32 i = 0; i < run; i++) d[i] = w[used + i] | m;
+			used += run;
+			load_i += run * 2;
+			x += run * 2;
+			if (x == (u32)load_w) { x = 0; y++; row = &psx_vram[((load_y + y) & 511) * 1024]; }
+			if (run) continue;
+		}
+		v = w[used++];
 		for (int k = 0; k < 2 && load_i < load_total; k++, v >>= 16) {
 			u16 *d = &row[(load_x + x) & 1023];
 			if (!(g.check_mask && (*d & 0x8000))) *d = (u16)v | (u16)setm;
