@@ -1,5 +1,10 @@
 // DMA: las transferencias se hacen de golpe al arrancarlas; la CPU no se entera de que hubo pausa.
 #include "psx.h"
+#ifdef PSX_DYNAREC
+#define dyn_ram_written_if(o, l) dyn_ram_written(o, l)
+#else
+#define dyn_ram_written_if(o, l) ((void)0)
+#endif
 #ifdef PSX_TRACE_IO
 #include <stdio.h>
 #endif
@@ -63,8 +68,17 @@ static void run(int ch)
 	}
 
 	if (ch == CH_OTC) {
-		u32 n = bcr[ch] & 0xffff;
+		u32 n = bcr[ch] & 0xffff, lo;
 		if (!n) n = 0x10000;
+		lo = (addr & 0x1ffffc) - (n - 1) * 4;
+		if ((addr & 0x1ffffc) >= (n - 1) * 4) {   // sin dar la vuelta a la RAM: de un tirón y el código traducido una vez
+			u32 *p = ram32(addr), a = addr;
+			for (u32 i = n - 1; i; i--) { *p-- = (a - 4) & 0xffffff; a -= 4; }
+			*p = 0xffffff;
+			dyn_ram_written_if(lo, n * 4);
+			finish(ch);
+			return;
+		}
 		while (n--) {
 			*ram32(addr) = n ? ((addr - 4) & 0xffffff) : 0xffffff;
 			DYN_CHECK_WRITE(addr);
