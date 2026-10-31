@@ -301,6 +301,15 @@ int main(int argc, char **argv)
 		for (size_t o = 0; r && o + 16 <= rn; o += 4)
 			if (!memcmp(r + o, "SPDBGSTG", 8)) { uint32_t *s = (uint32_t *)(r + o + 8); printf("STAGE %u (n=%u vbl=%u dyn=%u)\n", s[0], s[1], s[2], s[3]); break; }
 	}
+	if (getenv("DSB_MAGIC")) {   // DSB_MAGIC=MARCA8:bytes:archivo vuelca lo que hay tras esa marca en la RAM de la DS
+		char mg[9], path[1024];
+		unsigned len;
+		uint8_t *r = retro_get_memory_data ? retro_get_memory_data(2) : NULL;
+		size_t rn = retro_get_memory_size ? retro_get_memory_size(2) : 0;
+		if (sscanf(getenv("DSB_MAGIC"), "%8[^:]:%u:%1023s", mg, &len, path) == 3)
+			for (size_t o = 0; r && o + 8 + len <= rn; o += 4)
+				if (!memcmp(r + o, mg, 8)) { FILE *f = fopen(path, "wb"); if (f) { fwrite(r + o + 8, 1, len, f); fclose(f); } break; }
+	}
 	wav_finish((unsigned)(wav_frames * 59.8261 / (frames > 0 ? frames : 1) + 0.5));   // frecuencia sacada de lo recibido
 	if (frame) save_png(argv[4]);
 	printf("ok %ux%u\n", fw, fh);

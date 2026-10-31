@@ -484,6 +484,9 @@ struct {
 	u32 prof[PROF_N];
 	PsxStats stat;
 } bench = { "SPBENCH" };
+#ifdef PSX_SMCLOG
+u32 psx_frame_no;
+#endif
 
 static void bench_second(void)
 {
@@ -627,6 +630,9 @@ static void run_loop(const char *title, int use_log)
 		hud_frame(t0);
 		frames++;
 		bench.frames++;
+#ifdef PSX_SMCLOG
+		{ extern u32 psx_frame_no; psx_frame_no = bench.frames; }
+#endif
 		bench.vblanks = vblanks;
 		bench.pc = cpu.pc;
 		bench.ram = psx_ram;

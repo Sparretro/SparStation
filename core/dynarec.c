@@ -44,6 +44,11 @@ typedef u32 *block_fn;   // primera instrucción del bloque; la palabra anterior
 
 u32 *emit_ptr;
 u8 dyn_pages[DYN_NPAGES];
+#ifdef PSX_SMCLOG
+struct { char magic[8]; u32 n, e[4096]; } dyn_smc_log = { "SPSMCLOG" };
+struct { char magic[8]; u32 n, e[8192]; } dyn_cmp_log = { "SPCMPLOG" };
+extern u32 psx_frame_no;
+#endif
 static u32 *code_buf, *code_end, *code_start, code_size;
 static u32 *cold_base, *cold_ptr, *hot_save;   // zona fría: [cold_base, code_end)
 // Bloques en orden de dirección ARM (para el perfilador): inicio y PC MIPS; se vacía con la caché
@@ -322,6 +327,9 @@ void dyn_cache_use(u32 *used, u32 *size)
 
 static void flush_all(void)
 {
+#ifdef PSX_SMCLOG
+	if (dyn_cmp_log.n < 8192) dyn_cmp_log.e[dyn_cmp_log.n++] = 0xfa000000 | (u32)(emit_ptr - code_buf);
+#endif
 	STAT_ADD(dyn_flushes, 1);
 	memset(slots, 0, (slot_mask + 1) * sizeof(block_fn));
 	memset(dyn_pages, 0, sizeof dyn_pages);
@@ -365,12 +373,17 @@ static void unlink_page(u32 page, u32 first, u32 last)
 	}
 }
 
-void dyn_smc(u32 off)
+// Parte de cada página que ocupa el código traducido [lo, hi): los juegos guardan datos junto al código
+// (Silent Hill monta paquetes de la GPU en el mismo KB que su bucle principal) y escribirlos no lo borra.
+static u16 code_lo[DYN_NPAGES], code_hi[DYN_NPAGES];
+
+static void smc_page(u32 page, u32 off)
 {
-	u32 page = (off >> DYN_PAGE_BITS) & (DYN_NPAGES - 1);
-	if (!dyn_pages[page]) return;
 	dyn_pages[page] = 0;
 	STAT_ADD(dyn_smc, 1);
+#ifdef PSX_SMCLOG
+	if (dyn_smc_log.n < 4096) dyn_smc_log.e[dyn_smc_log.n++] = (off & 0x1fffff) | (psx_frame_no << 21);
+#endif
 	// la página entera y el final de la anterior (bloques que la cruzan)
 	{
 		u32 first = page << DYN_PAGE_BITS, last = first + (1u << DYN_PAGE_BITS);
@@ -384,9 +397,22 @@ void dyn_smc(u32 off)
 	}
 }
 
+void dyn_smc(u32 off)
+{
+	u32 page = (off >> DYN_PAGE_BITS) & (DYN_NPAGES - 1), o = off & ((1u << DYN_PAGE_BITS) - 1);
+	if (!dyn_pages[page] || o + 4 <= code_lo[page] || o >= code_hi[page]) return;
+	smc_page(page, off);
+}
+
 void dyn_ram_written(u32 off, u32 len)
 {
-	for (u32 a = off & ~((1u << DYN_PAGE_BITS) - 1); a < off + len; a += 1u << DYN_PAGE_BITS) DYN_CHECK_WRITE(a);
+	u32 end = off + len;
+	if (end > 0x200000) end = 0x200000;
+	for (u32 a = off; a < end; a = (a | ((1u << DYN_PAGE_BITS) - 1)) + 1) {
+		u32 page = a >> DYN_PAGE_BITS, base = page << DYN_PAGE_BITS;
+		u32 lo = a - base, hi = (end - base < (1u << DYN_PAGE_BITS) ? end - base : 1u << DYN_PAGE_BITS);
+		if (dyn_pages[page] && lo < code_hi[page] && hi > code_lo[page]) smc_page(page, a);
+	}
 }
 
 // ---- servicios llamados desde el código traducido ----
@@ -1553,7 +1579,13 @@ static void mark_pages(u32 start, u32 end)
 {
 	u32 p0 = start & 0x1fffffff, p1 = end & 0x1fffffff;
 	if (p0 >= 0x800000) return;
-	for (u32 p = (p0 & 0x1fffff) >> DYN_PAGE_BITS; p <= ((p1 & 0x1fffff) >> DYN_PAGE_BITS) && p < DYN_NPAGES; p++) dyn_pages[p] = 1;
+	u32 a0 = p0 & 0x1fffff, a1 = (p1 & 0x1fffff) + 8, pg0 = a0 >> DYN_PAGE_BITS, pg1 = (a1 - 1) >> DYN_PAGE_BITS;
+	for (u32 p = pg0; p <= pg1 && p < DYN_NPAGES; p++) {   // con el delay slot del final
+		u32 base = p << DYN_PAGE_BITS, lo = p == pg0 ? a0 - base : 0, hi = p == pg1 ? a1 - base : 1u << DYN_PAGE_BITS;
+		if (!dyn_pages[p]) { code_lo[p] = (u16)lo; code_hi[p] = (u16)hi; dyn_pages[p] = 1; continue; }
+		if (lo < code_lo[p]) code_lo[p] = (u16)lo;
+		if (hi > code_hi[p]) code_hi[p] = (u16)hi;
+	}
 }
 
 // Compara los operandos de un salto condicional (b < 0: con cero) y devuelve la condición ARM de «se salta»
@@ -1588,6 +1620,10 @@ static block_fn compile(u32 pc, block_fn *s)
 	if (emit_ptr + MAX_BLOCK * 48 + 512 > cold_base || cold_ptr + MAX_BLOCK * 16 + 256 > code_end) flush_all();
 	start = emit_ptr;
 	cold_start = cold_ptr;
+#ifdef PSX_SMCLOG
+	{ static u32 lf; if (lf != psx_frame_no && dyn_cmp_log.n < 8192) { lf = psx_frame_no; dyn_cmp_log.e[dyn_cmp_log.n++] = 0xff000000 | lf; } }
+	if (psx_frame_no >= 100 && dyn_cmp_log.n < 8192) dyn_cmp_log.e[dyn_cmp_log.n++] = pc;
+#endif
 	pv_start();
 	rng_start();
 	alloc_regs(pc);
@@ -1768,6 +1804,9 @@ void dyn_sp_fail(u32 pc)
 {
 	block_fn *s = slot(pc);
 	u32 l = lin(pc), i;
+#ifdef PSX_SMCLOG
+	if (psx_frame_no >= 100 && dyn_cmp_log.n < 8192) dyn_cmp_log.e[dyn_cmp_log.n++] = pc | 1;
+#endif
 	if (sp_unsafe_n < 256) {
 		for (i = (pc >> 2) & 255; sp_unsafe[i] && sp_unsafe[i] != pc; i = (i + 1) & 255) { }
 		if (!sp_unsafe[i]) { sp_unsafe[i] = pc; sp_unsafe_n++; }
@@ -1781,6 +1820,9 @@ void dyn_scr_fail(u32 pc)
 {
 	block_fn *s = slot(pc);
 	u32 l = lin(pc), i;
+#ifdef PSX_SMCLOG
+	if (psx_frame_no >= 100 && dyn_cmp_log.n < 8192) dyn_cmp_log.e[dyn_cmp_log.n++] = pc | 2;
+#endif
 	if (scr_unsafe_n < 256) {
 		for (i = (pc >> 2) & 255; scr_unsafe[i] && scr_unsafe[i] != pc; i = (i + 1) & 255) { }
 		if (!scr_unsafe[i]) { scr_unsafe[i] = pc; scr_unsafe_n++; }
