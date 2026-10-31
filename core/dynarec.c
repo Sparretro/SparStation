@@ -911,7 +911,7 @@ static int ends_block(u32 op)
 }
 
 // Registros MIPS que lee y escribe una instrucción (para elegir cuáles van en registros ARM)
-static void op_regs(u32 op, u32 *r, u32 *w)
+static void op_regs_calc(u32 op, u32 *r, u32 *w)
 {
 	u32 o = op >> 26, rs = (op >> 21) & 31, rt = (op >> 16) & 31, rd = (op >> 11) & 31, f = op & 0x3f;
 	*r = *w = 0;
@@ -945,6 +945,15 @@ static void op_regs(u32 op, u32 *r, u32 *w)
 	}
 	*r &= ~1u;
 	*w &= ~1u;
+}
+
+// Se pide varias veces seguidas para la misma instrucción (asignación, valores, rangos): recordar la última
+static void op_regs(u32 op, u32 *r, u32 *w)
+{
+	static u32 last_op = 0xffffffff, last_r, last_w;
+	if (op != last_op) { op_regs_calc(op, &last_r, &last_w); last_op = op; }
+	*r = last_r;
+	*w = last_w;
 }
 
 static u32 fetch_op(u32 pc)

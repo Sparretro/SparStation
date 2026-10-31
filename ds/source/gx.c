@@ -336,7 +336,7 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 	if (p->mask && p->semi) return;
 	if (addlike) {
 		for (int k = 0; k < n; k++) vb += (v[k].r > v[k].g ? (v[k].r > v[k].b ? v[k].r : v[k].b) : (v[k].g > v[k].b ? v[k].g : v[k].b));
-		vb = p->raw && p->tex ? 128 : vb / n;
+		vb = p->raw && p->tex ? 128 : n == 4 ? vb >> 2 : (vb * 21846) >> 16;   // vb / n sin dividir (n = 3 o 4)
 	}
 	if (p->tex) {
 		int u = tex_get(p->tpx, p->tpy, a3 ? 4 : p->tex, p->cx, p->cy), fmt = a3 ? 1 : p->tex == 1 ? 3 : p->tex == 2 ? 4 : 7;
