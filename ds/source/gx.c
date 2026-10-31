@@ -56,10 +56,9 @@ GxDbg gx_dbg = { "SPDBGSTG", 0, 0, 0, 0 };
 #define STAGE(s) (gx_dbg.stage = (s), gx_dbg.n++)
 
 // ---- paletas: banco E (64 KB) ----
-#define PAL_HASH 512
-typedef struct { s16 x, y; u16 n, off; u8 lum; } PalEnt;   // off en unidades de 16 bytes; n = 0: libre; lum = brillo medio 0-31
+#define PAL_HASH 2048
+typedef struct { s16 x, y; u16 n, slot; u8 lum; } PalEnt;   // n = 0: libre; slot: hueco de su tamaño (ver pal_get); lum = brillo máximo 0-31
 static PalEnt pal[PAL_HASH];
-static u32 pal_top;   // bytes usados
 
 static u16 *bank_lcd(int bank)   // dirección de un banco cuando está en modo LCD
 {
@@ -137,28 +136,72 @@ void gx_vblank(void)
 	commit_on = 0;
 }
 
+// Paletas en huecos fijos con reemplazo del menos usado: 1024 de 16 colores (32 bytes, primeros 32 KB; el 0
+// es la paleta blanca de la rampa) y 64 de 256 colores (512 bytes, los otros 32 KB). Nunca se reutiliza un hueco
+// que ya usa un polígono de este frame: las paletas suben a la VRAM al cambiar de buffer y todos los polígonos
+// del frame verían la última (antes la memoria se vaciaba entera a mitad de frame y salían colores cambiados).
+#define P16_N 1024
+#define P256_N 64
+static u32 p16_used[P16_N], p256_used[P256_N];      // frame_no + 1 del último uso (0 = nunca)
+static s16 p16_owner[P16_N], p256_owner[P256_N];    // entrada de pal[] que lo ocupa (-1 = libre)
+static int p16_hand = 1, p256_hand;
+
 static void pal_reset(void)
 {
 	memset(pal, 0, sizeof pal);
-	pal_top = 16;   // los primeros 16 bytes: paleta blanca de la rampa (ver ramp_init)
+	memset(p16_used, 0, sizeof p16_used);
+	memset(p256_used, 0, sizeof p256_used);
+	for (int i = 0; i < P16_N; i++) p16_owner[i] = -1;
+	for (int i = 0; i < P256_N; i++) p256_owner[i] = -1;
+	p16_hand = 1;
+	p256_hand = 0;
 }
+
+static void pal_mark_used(const PalEnt *e)
+{
+	if (e->n == 16) p16_used[e->slot] = frame_no + 1;
+	else p256_used[e->slot] = frame_no + 1;
+}
+
+static u32 pal_off(const PalEnt *e) { return e->n == 16 ? (u32)e->slot * 32 : 0x8000 + (u32)e->slot * 512; }
 
 // Base de paleta (para PLTT_BASE) con los n colores de la CLUT en (cx, cy). n = 32: los 16 colores
 // llevados a brillo máximo (para A3I5, donde el brillo va en el alfa de cada texel) y 16 negros.
 static u32 pal_get(int cx, int cy, int n, int *lum)
 {
 	STAGE(30);
-	u32 h = ((u32)cy * 64 + (u32)cx / 16 + (n == 256 ? 0x9e37 : n == 32 ? 0x4f1b : 0)) & (PAL_HASH - 1);
+	u32 h = ((u32)cy * 64 + (u32)cx / 16 + (n == 256 ? 0x9e37 : n == 32 ? 0x4f1b : 0)) & (PAL_HASH - 1), off;
 	PalEnt *e = &pal[h];
 	u16 *dst;
-	u32 sum = 0;
-	if (e->n == n && e->x == cx && e->y == cy) { *lum = e->lum; return e->off; }
-	if (pal_top + (u32)n * 2 > 0x10000) pal_reset();
-	if (n == 256) pal_top = (pal_top + 511) & ~511u;
-	e = &pal[h];
-	e->x = (s16)cx; e->y = (s16)cy; e->n = (u16)n; e->off = (u16)(pal_top >> 4);
-	if (sh_pal) { sh_mark(GX_PAL, pal_top, pal_top + (u32)n * 2); dst = sh_pal + pal_top / 2; }
-	else { vramSetBankE(VRAM_E_LCD); dst = bank_lcd(3) + pal_top / 2; }
+	u32 sum = 0, now = frame_no + 1;
+	int small = n == 16, slot = 0;
+	if (e->n == n && e->x == cx && e->y == cy) { pal_mark_used(e); *lum = e->lum; return pal_off(e) >> 4; }
+	// hueco: el siguiente que no se haya usado en este frame (vuelta circular = aproximadamente el más viejo)
+	if (small) {
+		for (int t = 0; t < P16_N; t++) {
+			slot = p16_hand;
+			p16_hand = p16_hand + 1 < P16_N ? p16_hand + 1 : 1;
+			if (p16_used[slot] != now) break;
+		}
+		if (p16_owner[slot] >= 0) pal[p16_owner[slot]].n = 0;
+	} else {
+		for (int t = 0; t < P256_N; t++) {
+			slot = p256_hand;
+			p256_hand = (p256_hand + 1) % P256_N;
+			if (p256_used[slot] != now) break;
+		}
+		if (p256_owner[slot] >= 0) pal[p256_owner[slot]].n = 0;
+	}
+	if (e->n) {   // la entrada tenía otra CLUT: su hueco queda libre
+		if (e->n == 16) p16_owner[e->slot] = -1; else p256_owner[e->slot] = -1;
+	}
+	e->x = (s16)cx; e->y = (s16)cy; e->n = (u16)(small ? 16 : n); e->slot = (u16)slot;
+	if (small) { p16_owner[slot] = (s16)h; p16_used[slot] = now; }
+	else { p256_owner[slot] = (s16)h; p256_used[slot] = now; }
+	e->n = (u16)n;
+	off = small ? (u32)slot * 32 : 0x8000 + (u32)slot * 512;
+	if (sh_pal) { sh_mark(GX_PAL, off, off + (u32)n * 2); dst = sh_pal + off / 2; }
+	else { vramSetBankE(VRAM_E_LCD); dst = bank_lcd(3) + off / 2; }
 	for (int i = 0; i < n; i++) {
 		u16 c = i < (n == 32 ? 16 : n) ? psx_vram[cy * 1024 + ((cx + i) & 1023)] : 0;
 		int r = c & 31, g = (c >> 5) & 31, b = (c >> 10) & 31, m = r > g ? (r > b ? r : b) : (g > b ? g : b);
@@ -167,17 +210,19 @@ static u32 pal_get(int cx, int cy, int n, int *lum)
 		if (c && (u32)m > sum) sum = (u32)m;   // brillo máximo de la CLUT
 	}
 	if (!sh_pal) vramSetBankE(VRAM_E_TEX_PALETTE);
-	pal_top += (u32)n * 2;
 	e->lum = (u8)sum;
 	*lum = e->lum;
-	return e->off;
+	return off >> 4;
 }
 
 static void pal_dirty(int x, int y, int w, int h)
 {
 	for (int i = 0; i < PAL_HASH; i++) {
 		PalEnt *e = &pal[i];
-		if (e->n && e->y >= y && e->y < y + h && e->x < x + w && e->x + e->n > x) e->n = 0;
+		if (e->n && e->y >= y && e->y < y + h && e->x < x + w && e->x + e->n > x) {
+			if (e->n == 16) p16_owner[e->slot] = -1; else p256_owner[e->slot] = -1;
+			e->n = 0;
+		}
 	}
 }
 
