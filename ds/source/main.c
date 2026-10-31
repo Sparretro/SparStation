@@ -132,6 +132,7 @@ static int open_disc(const char *path)
 #define CFG_PATH GAMES_DIR "/sparstation.cfg"
 static int opt_quality, opt_skip, opt_cpu;   // calidad 0-3, frames saltados 0-3, CPU 0-2
 static int opt_hw = 1;                       // GPU: 1 = motor 3D de la DS (gx.c), 0 = por software
+static int opt_snd = 1;                      // sonido (voces de la SPU y audio XA del CD)
 static const char *const quality_name[4] = { "normal", "rapida", "muy rapida", "baja res" };
 static const int cpu_pct[3] = { 100, 85, 70 };
 
@@ -141,7 +142,9 @@ static void load_cfg(void)
 	if (!f) return;
 	if (fscanf(f, "calidad=%d saltar=%d cpu=%d", &opt_quality, &opt_skip, &opt_cpu) != 3) opt_quality = opt_skip = opt_cpu = 0;
 	if (fscanf(f, " gpu3d=%d", &opt_hw) != 1) opt_hw = 1;
+	if (fscanf(f, " sonido=%d", &opt_snd) != 1) opt_snd = 1;
 	opt_hw = opt_hw != 0;
+	opt_snd = opt_snd != 0;
 	fclose(f);
 	if (opt_quality < 0 || opt_quality > 3) opt_quality = 0;
 	if (opt_skip < 0 || opt_skip > 3) opt_skip = 0;
@@ -152,7 +155,7 @@ static void save_cfg(void)
 {
 	FILE *f = fopen(CFG_PATH, "w");
 	if (!f) return;
-	fprintf(f, "calidad=%d saltar=%d cpu=%d\n", opt_quality, opt_skip, opt_cpu);
+	fprintf(f, "calidad=%d saltar=%d cpu=%d\ngpu3d=%d\nsonido=%d\n", opt_quality, opt_skip, opt_cpu, opt_hw, opt_snd);
 	fclose(f);
 }
 
@@ -225,7 +228,8 @@ static int pick_game(char *out, size_t outlen)
 		printf("SELECT saltar frames: %d\n", opt_skip);
 		printf("Y      CPU PS1: %d%%\n", cpu_pct[opt_cpu]);
 		printf("X      GPU: %s\n", opt_hw ? "3D de la DS (rapida)" : "software (exacta)");
-		printf("\x1b[37mcalidad solo cuenta con la GPU\npor software.\x1b[37;1m\n");
+		printf("B      sonido: %s\n", opt_snd ? "si" : "no");
+		printf("\x1b[37m(calidad: solo GPU software)\x1b[37;1m\n");
 		printf("\nA: jugar");
 		fflush(stdout);
 		do { swiWaitForVBlank(); scanKeys(); keys = keysDown(); } while (!keys);
@@ -236,6 +240,7 @@ static int pick_game(char *out, size_t outlen)
 		if (keys & KEY_SELECT) opt_skip = (opt_skip + 1) % 4;
 		if (keys & KEY_Y) opt_cpu = (opt_cpu + 1) % 3;
 		if (keys & KEY_X) opt_hw ^= 1;
+		if (keys & KEY_B) opt_snd ^= 1;
 		if (keys & KEY_A) break;
 	}
 	save_cfg();
@@ -708,6 +713,7 @@ int main(void)
 		for (;;) swiWaitForVBlank();
 	}
 	card_open(game);
+	snd_enable(opt_snd);
 	snprintf(state_path, sizeof state_path, "%.*s.sst", (int)(strrchr(card_path, '.') - card_path), card_path);
 	psx_reset();
 	apply_cfg();

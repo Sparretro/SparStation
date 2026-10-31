@@ -247,3 +247,10 @@ void snd_pause(int on)
 {
 	soundSetMixerVolume(on ? 0 : 127);
 }
+
+// Sonido apagado desde la lista de juegos: la SPU sigue emulándose (el juego la necesita), pero sin tocar nada
+void snd_enable(int on)
+{
+	spu_hw = on ? &snd_hw : NULL;
+	if (!on) cd_audio_hw = NULL;
+}
