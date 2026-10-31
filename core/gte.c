@@ -512,7 +512,8 @@ static void dpc12f(const u8 *c)
 	DPC_CH(0);
 	DPC_CH(1);
 	DPC_CH(2);
-	memmove(CF[0], CF[1], 8);   // CF[0] <- CF[1], CF[1] <- CF[2]
+	memcpy(CF[0], CF[1], 4);   // CF[0] <- CF[1], CF[1] <- CF[2] (de 4 en 4: se integra; memmove era una llamada)
+	memcpy(CF[1], CF[2], 4);
 	CF[2][0] = out0;
 	CF[2][1] = out1;
 	CF[2][2] = out2;

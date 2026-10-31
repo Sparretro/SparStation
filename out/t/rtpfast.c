@@ -5,6 +5,7 @@
 static unsigned rs = 777;
 static unsigned rnd(void) { rs = rs * 1103515245u + 12345u; return rs ^ (rs >> 13); }
 u32 gte_hist[64];
+PsxCore psx_core;
 void psx_state_io(PsxState *s, void *p, u32 len) { (void)s; (void)p; (void)len; }
 static s32 pick32(void) { switch (rnd() & 3) { case 0: return (s32)rnd(); case 1: return (s32)(rnd() % 0x20000) - 0x10000; default: return (s32)(rnd() % 0x2000) - 0x1000; } }
 static s16 pick16(void) { return (rnd() & 3) ? (s16)((int)(rnd() % 0x2000) - 0x1000) : (s16)rnd(); }

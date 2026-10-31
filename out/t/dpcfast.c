@@ -5,6 +5,7 @@
 static unsigned rs = 99;
 static unsigned rnd(void) { rs = rs * 1103515245u + 12345u; return rs ^ (rs >> 13); }
 u32 gte_hist[64];
+PsxCore psx_core;
 void psx_state_io(PsxState *s, void *p, u32 len) { (void)s; (void)p; (void)len; }
 int main(void)
 {
