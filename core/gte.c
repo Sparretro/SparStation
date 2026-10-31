@@ -403,6 +403,166 @@ static __attribute__((noinline)) void rtp12f(int vi, int last)
 	FLAG |= fl;
 }
 
+#if defined(__arm__) && defined(ARM9)
+// RTPT en ensamblador para el ARM946E-S: la parte cara (matriz por vértice, recortes, división UNR y proyección)
+// de los tres vértices. El compilador sacaba la matriz a la pila y rehacía en 64 bits cada fila; aquí cada fila
+// son tres SMULL/SMLAL y una suma (TR << 12 no tiene bits bajos: TR + (suma >> 12) es exacto). Da lo mismo, bit a
+// bit, que rtp12f: el fuzz de instrucciones compara el código traducido de la DS con el intérprete del PC (en C).
+typedef struct { s32 mac1, mac2, z12, ir1, ir2, ir3; u32 n, fl; s16 sx[3], sy[3]; u16 sz[3]; } RtpOut;
+_Static_assert(offsetof(RtpOut, ir1) == 12 && offsetof(RtpOut, n) == 24 && offsetof(RtpOut, fl) == 28 &&
+               offsetof(RtpOut, sx) == 32 && offsetof(RtpOut, sy) == 38 && offsetof(RtpOut, sz) == 44, "RtpOut");
+void gte_rtpt_asm(const GteRegs *g, RtpOut *o, s32 lo, const u8 *unr_tab);
+__asm__(
+"	.text\n"
+"	.arm\n"
+"	.align 2\n"
+// una fila de la matriz: mac = TR + (RT . V) >> 12 en r7; ir recortado a [lo, 7FFFh] en r8; ambos a o
+".macro RTPROW rt, tr, omac, oir, flagbit\n"
+"	ldrsh r8, [r0, #\\rt]\n"
+"	ldrsh r9, [r0, #\\rt+2]\n"
+"	ldrsh r10, [r0, #\\rt+4]\n"
+"	smull r12, lr, r8, r4\n"
+"	smlal r12, lr, r9, r5\n"
+"	smlal r12, lr, r10, r6\n"
+"	ldr r7, [r0, #\\tr]\n"
+"	add r7, r7, r12, lsr #12\n"
+"	add r7, r7, lr, lsl #20\n"
+"	cmp r7, r2\n"
+"	movlt r8, r2\n"
+"	movge r8, r7\n"
+"	cmp r8, #0x8000\n"
+"	movge r8, #0x7f00\n"
+"	orrge r8, r8, #0xff\n"
+"	str r7, [r1, #\\omac]\n"
+"	str r8, [r1, #\\oir]\n"
+"	.if \\flagbit\n"
+"	teq r8, r7\n"
+"	orrne r11, r11, #(1 << \\flagbit)\n"
+"	.endif\n"
+".endm\n"
+// proyección de un eje: n (r7) * ir + OF, desbordamientos (bits 16/15), y recorte a [-400h, 3FFh]
+".macro PROJ irr, ofr, satbit, osx\n"
+"	smull r9, r10, r7, \\irr\n"
+"	adds r9, r9, \\ofr\n"
+"	adc r10, r10, \\ofr, asr #31\n"
+"	cmp r10, r9, asr #31\n"
+"	beq 1f\n"
+"	cmp r10, #0\n"
+"	orrge r11, r11, #(1 << 16)\n"
+"	orrlt r11, r11, #(1 << 15)\n"
+"1:	mov r9, r9, lsr #16\n"
+"	orr r9, r9, r10, lsl #16\n"
+"	add r10, r9, #0x400\n"
+"	cmp r10, #0x800\n"
+"	blo 2f\n"
+"	orr r11, r11, #(1 << \\satbit)\n"
+"	cmp r9, #0\n"                      // -400h o 3FFh (ninguno cabe como inmediato)
+"	mov r9, #0x400\n"
+"	rsblt r9, r9, #0\n"
+"	subge r9, r9, #1\n"
+"2:	strh r9, [r1, #\\osx]\n"
+".endm\n"
+// un vértice entero
+".macro RTPV vi\n"
+"	ldrsh r4, [r0, #96+\\vi*6]\n"
+"	ldrsh r5, [r0, #98+\\vi*6]\n"
+"	ldrsh r6, [r0, #100+\\vi*6]\n"
+"	RTPROW 134, 48, 0, 12, 24\n"
+"	RTPROW 140, 52, 4, 16, 23\n"
+"	RTPROW 146, 56, 8, 20, 0\n"
+"	add r9, r7, #0x8000\n"           // bandera de IR3: mira MAC3 sin lm
+"	cmp r9, #0x10000\n"
+"	orrhs r11, r11, #(1 << 22)\n"
+"	movs r9, r7, lsr #16\n"            // SZ: MAC3 recortado a [0, FFFFh]
+"	moveq r9, r7\n"
+"	mvnne r9, r7, asr #31\n"
+"	movne r9, r9, lsr #16\n"
+"	orrne r11, r11, #(1 << 18)\n"
+"	strh r9, [r1, #44+\\vi*2]\n"
+"	ldrh r10, [r0, #204]\n"            // división UNR: n = H / SZ (como divide())
+"	cmp r10, r9, lsl #1\n"
+"	bhs 4f\n"
+"	clz r12, r9\n"
+"	sub r12, r12, #16\n"
+"	mov lr, r9, lsl r12\n"
+"	sub r8, lr, #0x7f00\n"
+"	sub r8, r8, #0xc0\n"
+"	ldrb r8, [r3, r8, lsr #7]\n"
+"	add r8, r8, #0x100\n"
+"	add r8, r8, #1\n"
+"	mul r7, lr, r8\n"
+"	rsb r7, r7, #0x2000000\n"
+"	add r7, r7, #0x80\n"
+"	mov r7, r7, lsr #8\n"
+"	mul r9, r7, r8\n"
+"	add r9, r9, #0x80\n"
+"	mov r9, r9, lsr #8\n"
+"	mov r10, r10, lsl r12\n"
+"	umull r7, r8, r10, r9\n"
+"	adds r7, r7, #0x8000\n"
+"	adc r8, r8, #0\n"
+"	movs r10, r8, lsr #16\n"
+"	mov r7, r7, lsr #16\n"
+"	orr r7, r7, r8, lsl #16\n"
+"	bne 5f\n"
+"	cmp r7, #0x20000\n"
+"	blo 6f\n"
+"5:	mov r7, #0x20000\n"
+"	sub r7, r7, #1\n"
+"	b 6f\n"
+"4:	orr r11, r11, #(1 << 17)\n"
+"	mov r7, #0x20000\n"
+"	sub r7, r7, #1\n"
+"6:	str r7, [r1, #24]\n"
+"	ldr r8, [r1, #12]\n"
+"	ldr r12, [r0, #84]\n"
+"	PROJ r8, r12, 14, 32+\\vi*2\n"
+"	ldr r8, [r1, #16]\n"
+"	ldr r12, [r0, #88]\n"
+"	PROJ r8, r12, 13, 38+\\vi*2\n"
+".endm\n"
+"	.global gte_rtpt_asm\n"
+"	.type gte_rtpt_asm, %function\n"
+"gte_rtpt_asm:\n"
+"	push {r4-r11, lr}\n"
+"	mov r11, #0\n"
+"	RTPV 0\n"
+"	RTPV 1\n"
+"	RTPV 2\n"
+"	str r11, [r1, #28]\n"
+"	pop {r4-r11, pc}\n"
+"	.size gte_rtpt_asm, . - gte_rtpt_asm\n"
+"	.purgem RTPROW\n"
+"	.purgem PROJ\n"
+"	.purgem RTPV\n"
+);
+
+static __attribute__((noinline)) void rtpt12f(void)
+{
+	RtpOut o;
+	if (((u32)(TR[0] + 0x40000000) | (u32)(TR[1] + 0x40000000) | (u32)(TR[2] + 0x40000000)) >= 0x80000000u) {
+		rtp12f(0, 0); rtp12f(1, 0); rtp12f(2, 1);
+		return;
+	}
+	gte_rtpt_asm(&psx_core.gte, &o, lm ? 0 : -0x8000, unr);
+	SZ[0] = SZ[3]; SZ[1] = o.sz[0]; SZ[2] = o.sz[1]; SZ[3] = o.sz[2];
+	SX[0] = o.sx[0]; SX[1] = o.sx[1]; SX[2] = o.sx[2];
+	SY[0] = o.sy[0]; SY[1] = o.sy[1]; SY[2] = o.sy[2];
+	MAC[1] = o.mac1; MAC[2] = o.mac2; MAC[3] = o.z12;
+	IR[1] = (s16)o.ir1; IR[2] = (s16)o.ir2; IR[3] = (s16)o.ir3;
+	{
+		u32 fl = o.fl;
+		s64 d = (s64)o.n * DQA + DQB;
+		s32 ir0 = (s32)(d >> 12);
+		if (d > 0x7fffffffLL) fl |= 1u << 16;
+		else if (d < -0x80000000LL) fl |= 1u << 15;
+		MAC[0] = (s32)d;
+		if (ir0 < 0) { ir0 = 0; fl |= 1u << 12; } else if (ir0 > 0x1000) { ir0 = 0x1000; fl |= 1u << 12; }
+		IR[0] = (s16)ir0;
+		FLAG |= fl;
+	}
+}
+#else
 // RTPT entera (lo mismo que rtp12f de los vértices 0, 1 y 2): la matriz y la traslación se leen una vez, y MAC/IR
 // solo se escriben al final (los de los dos primeros vértices los pisa el tercero); las banderas, de los tres
 static __attribute__((noinline)) void rtpt12f(void)
@@ -468,6 +628,7 @@ static __attribute__((noinline)) void rtpt12f(void)
 	}
 	FLAG |= fl;
 }
+#endif
 
 // interpolación hacia el color de lejanía (FC) según IR0
 GTE_INL void interpolate_s(s32 m1, s32 m2, s32 m3, int s)
