@@ -1076,7 +1076,10 @@ static void mark_pages(u32 start, u32 end);
 static u32 fetch_op(u32 pc)
 {
 	u32 p = pc & 0x1fffffff;
-	if (fetch_mark && p < 0x800000) mark_pages(p, p);
+	if (fetch_mark && p < 0x800000) {   // lo normal: ya está dentro de lo marcado
+		u32 a = p & 0x1fffff, pg = a >> DYN_PAGE_BITS, o = a & ((1u << DYN_PAGE_BITS) - 1);
+		if (!dyn_pages[pg] || o < code_lo[pg] || o + 4 > code_hi[pg]) mark_pages(p, p);
+	}
 	if (p < 0x800000) return *(u32 *)(psx_ram + (p & 0x1ffffc));
 	return *(u32 *)(psx_bios + (p & 0x7fffc));
 }
