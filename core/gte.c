@@ -403,6 +403,72 @@ static __attribute__((noinline)) void rtp12f(int vi, int last)
 	FLAG |= fl;
 }
 
+// RTPT entera (lo mismo que rtp12f de los vértices 0, 1 y 2): la matriz y la traslación se leen una vez, y MAC/IR
+// solo se escriben al final (los de los dos primeros vértices los pisa el tercero); las banderas, de los tres
+static __attribute__((noinline)) void rtpt12f(void)
+{
+	u32 fl = 0, n = 0;
+	s32 lo = lm ? 0 : -0x8000, mac1 = 0, mac2 = 0, z12 = 0, ir1 = 0, ir2 = 0, ir3 = 0;
+	const s32 t0 = TR[0], t1 = TR[1], t2 = TR[2];
+	const u32 h = H;
+	if (((u32)(t0 + 0x40000000) | (u32)(t1 + 0x40000000) | (u32)(t2 + 0x40000000)) >= 0x80000000u) {
+		rtp12f(0, 0); rtp12f(1, 0); rtp12f(2, 1);
+		return;
+	}
+	for (int vi = 0; vi < 3; vi++) {
+		s32 vx = V[vi][0], vy = V[vi][1], vz = V[vi][2], sx, sy;
+		mac1 = (s32)((((s64)t0 << 12) + (s64)(RT[0][0] * vx) + (s64)(RT[0][1] * vy) + (s64)(RT[0][2] * vz)) >> 12);
+		mac2 = (s32)((((s64)t1 << 12) + (s64)(RT[1][0] * vx) + (s64)(RT[1][1] * vy) + (s64)(RT[1][2] * vz)) >> 12);
+		z12 = (s32)((((s64)t2 << 12) + (s64)(RT[2][0] * vx) + (s64)(RT[2][1] * vy) + (s64)(RT[2][2] * vz)) >> 12);
+		ir1 = mac1 < lo ? lo : mac1 > 0x7fff ? 0x7fff : mac1;
+		ir2 = mac2 < lo ? lo : mac2 > 0x7fff ? 0x7fff : mac2;
+		ir3 = z12 < lo ? lo : z12 > 0x7fff ? 0x7fff : z12;
+		if (ir1 != mac1) fl |= 1u << 24;
+		if (ir2 != mac2) fl |= 1u << 23;
+		if ((u32)(z12 + 0x8000) > 0xffff) fl |= 1u << 22;
+		SZ[0] = SZ[1]; SZ[1] = SZ[2]; SZ[2] = SZ[3];
+		if ((u32)z12 > 0xffff) { SZ[3] = z12 < 0 ? 0 : 0xffff; fl |= 1u << 18; } else SZ[3] = (u16)z12;
+		{
+			u32 sz = SZ[3];
+			if (h >= sz * 2) { fl |= 1u << 17; n = 0x1ffff; }
+			else {
+				int sh = __builtin_clz(sz) - 16;
+				u32 d = sz << sh, u = unr[(d - 0x7fc0) >> 7] + 0x101;
+				u64 q;
+				d = (0x2000080 - (d * u)) >> 8;
+				d = (0x0000080 + (d * u)) >> 8;
+				q = ((u64)(h << sh) * d + 0x8000) >> 16;
+				n = q > 0x1ffff ? 0x1ffff : (u32)q;
+			}
+		}
+		{
+			s64 x = (s64)n * ir1 + OFX, y = (s64)n * ir2 + OFY;
+			sx = (s32)(x >> 16); sy = (s32)(y >> 16);
+			if (x > 0x7fffffffLL || y > 0x7fffffffLL) fl |= 1u << 16;
+			if (x < -0x80000000LL || y < -0x80000000LL) fl |= 1u << 15;
+			MAC[0] = (s32)y;
+			if ((u32)(sx + 0x400) > 0x7ff) { sx = sx < 0 ? -0x400 : 0x3ff; fl |= 1u << 14; }
+			if ((u32)(sy + 0x400) > 0x7ff) { sy = sy < 0 ? -0x400 : 0x3ff; fl |= 1u << 13; }
+			SX[0] = SX[1]; SY[0] = SY[1];
+			SX[1] = SX[2]; SY[1] = SY[2];
+			SX[2] = (s16)sx;
+			SY[2] = (s16)sy;
+		}
+	}
+	MAC[1] = mac1; MAC[2] = mac2; MAC[3] = z12;
+	IR[1] = (s16)ir1; IR[2] = (s16)ir2; IR[3] = (s16)ir3;
+	{
+		s64 d = (s64)n * DQA + DQB;
+		s32 ir0 = (s32)(d >> 12);
+		if (d > 0x7fffffffLL) fl |= 1u << 16;
+		else if (d < -0x80000000LL) fl |= 1u << 15;
+		MAC[0] = (s32)d;
+		if (ir0 < 0) { ir0 = 0; fl |= 1u << 12; } else if (ir0 > 0x1000) { ir0 = 0x1000; fl |= 1u << 12; }
+		IR[0] = (s16)ir0;
+	}
+	FLAG |= fl;
+}
+
 // interpolación hacia el color de lejanía (FC) según IR0
 GTE_INL void interpolate_s(s32 m1, s32 m2, s32 m3, int s)
 {
@@ -636,7 +702,7 @@ static void gte_exec(u32 op)
 		{ s64 v = (s64)ZSF4 * (SZ[0] + SZ[1] + SZ[2] + SZ[3]); set_mac0(v); set_otz(v); }
 		break;
 	case 0x30:   // RTPT
-		if (sf) { rtp12f(0, 0); rtp12f(1, 0); rtp12f(2, 1); }
+		if (sf) rtpt12f();
 		else { rtp(0, 0); rtp(1, 0); rtp(2, 1); }
 		break;
 	case 0x3d:                                            // GPF
@@ -690,7 +756,7 @@ void gte_reset(void)
 
 #define GTE_ENTRY(name, s, body) static void name(u32 op) { sf = s; lm = (op >> 10) & 1; FLAG = 0; body }
 GTE_ENTRY(e_rtps, 12, rtp12f(0, 1);)
-GTE_ENTRY(e_rtpt, 12, rtp12f(0, 0); rtp12f(1, 0); rtp12f(2, 1);)
+GTE_ENTRY(e_rtpt, 12, rtpt12f();)
 GTE_ENTRY(e_nclip, 0, (void)op; nclip();)
 GTE_ENTRY(e_dpcs, 12, if (dpc_fast_ok()) dpc12f(RGBC); else dpc(RGBC);)
 GTE_ENTRY(e_dpct, 12, if (dpc_fast_ok()) { dpc12f(CF[0]); dpc12f(CF[0]); dpc12f(CF[0]); } else { dpc(CF[0]); dpc(CF[0]); dpc(CF[0]); })
