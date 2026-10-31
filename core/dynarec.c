@@ -1080,6 +1080,9 @@ static int sb_cont(u32 op, u32 cur, u32 pc)
 	u32 o = op >> 26, rs = (op >> 21) & 31, rt = (op >> 16) & 31;
 	u32 target = cur + 4 + ((u32)(s32)(s16)(op & 0xffff) << 2);
 	int cond = (o == 0x01 && rs && (rt & 0x1e) != 0x10) || ((o == 0x04 || o == 0x05) && rs != rt) || ((o == 0x06 || o == 0x07) && rs);
+#ifdef DYN_NOSB
+	cond = 0;
+#endif
 	if (!cond) return 0;
 	return target != pc && !psyq_vsync(target) && !vsync_poll_call(target);
 }
@@ -1238,7 +1241,8 @@ static int emit_op(u32 op, u32 pc, int ninstr)
 			}
 			a = get(rt, R0);
 			d = dst(rd, R0);
-			a_dp_reg(C_AL, OP_MOV, 0, d, 0, a, shs[op & 3], sa);
+			// en ARM, LSR #0 y ASR #0 significan «por 32»: desplazar 0 es copiar
+			a_dp_reg(C_AL, OP_MOV, 0, d, 0, a, sa ? shs[op & 3] : SH_LSL, sa);
 			put(rd, d);
 			return 1;
 		}
@@ -1405,6 +1409,10 @@ static int emit_op(u32 op, u32 pc, int ninstr)
 			void (*fn)(u32) = gte_entry(op);
 			s32 d = (s32)((const u8 *)fn - ((const u8 *)emit_ptr + 12));
 			a_movi(R0, op);
+#ifdef DYN_NOGTED
+			call(gte_command);
+			return 1;
+#endif
 			if (d < -0x2000000 || d >= 0x2000000) { call(gte_command); return 1; }
 			a_push((1u << R12) | (1u << LR));
 			a_b(C_AL, 1, (const void *)fn);

@@ -15,3 +15,9 @@ tools/melonds/
 bios/
 *.map
 ds/nitro_klg2/
+ds/nitro_shfmv2/
+tests_own/rawfuzz.c
+tests_own/*.o
+tests_own/*.elf
+tests_own/*.exe
+tests_own/*.pdb
