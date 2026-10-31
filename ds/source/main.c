@@ -222,7 +222,11 @@ static int pick_game(char *out, size_t outlen)
 		int keys;
 		consoleClear();
 		printf("SparStation - elige juego\n(%s)\n\n", GAMES_DIR);
-		for (int i = 0; i < n && i < 12; i++) printf("%c %.28s\n", i == sel ? '>' : ' ', names[i]);
+		{   // caben 11 en pantalla: la ventana sigue a la selección
+			int top = sel < 11 ? 0 : sel - 10;
+			for (int i = top; i < n && i < top + 11; i++) printf("%c %.28s\n", i == sel ? '>' : ' ', names[i]);
+			if (n > 11) printf("\x1b[37m  (%d de %d)\x1b[37;1m\n", sel + 1, n);
+		}
 		printf("\x1b[15;0H\x1b[36;1mAjustes de velocidad\x1b[37;1m\n");
 		printf("L/R    calidad: %s\n", quality_name[opt_quality]);
 		printf("SELECT saltar frames: %d\n", opt_skip);
