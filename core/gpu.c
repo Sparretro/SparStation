@@ -888,6 +888,9 @@ static int hw_poly_packet(const u32 *w)
 
 static void hw_dirty_area(void)   // algo dibujado por software fuera de la pantalla
 {
+#ifdef PSX_GPUSTAT
+	{ extern int gpudump; extern int printf(const char *, ...); if (gpudump && gpu_hw) printf("SOFT cmd=%02x area=%d,%d-%d,%d\n", (unsigned)(fifo[0] >> 24), g.da_x1, g.da_y1, g.da_x2, g.da_y2); }
+#endif
 	if (gpu_hw) pend_touch(g.da_x1, g.da_y1, g.da_x2 - g.da_x1 + 1, g.da_y2 - g.da_y1 + 1, 0);
 	if (gpu_hw) gpu_hw->vram_written(g.da_x1, g.da_y1, g.da_x2 - g.da_x1 + 1, g.da_y2 - g.da_y1 + 1);
 }
@@ -1161,7 +1164,13 @@ static void vram_copy(void)
 	int sx = fifo[1] & 0x3ff, sy = (fifo[1] >> 16) & 0x1ff;
 	int dx = fifo[2] & 0x3ff, dy = (fifo[2] >> 16) & 0x1ff;
 	int w = ((fifo[3] - 1) & 0x3ff) + 1, h = (((fifo[3] >> 16) - 1) & 0x1ff) + 1;
+	// copiarse sobre sí mismo no cambia nada (Pepsiman lo hace en cada frame tras borrar: aquí obligaba a borrar
+	// de verdad y a volver a copiar la pantalla entera)
+	if (sx == dx && sy == dy && !g.set_mask) return;
 	if (gpu_hw) pend_touch(dx, dy, w, h, 0);
+#ifdef PSX_GPUSTAT
+	{ extern int gpudump; extern int printf(const char *, ...); if (gpudump) printf("COPY %d,%d -> %d,%d %dx%d\n", sx, sy, dx, dy, w, h); }
+#endif
 	for (int y = 0; y < h; y++)
 		for (int x = 0; x < w; x++) {
 			u16 c = VRAM(sx + x, sy + y);
@@ -1285,7 +1294,11 @@ static void execute_cmd(void)
 	case 0xe2: g.tw_mx = v & 0x1f; g.tw_my = (v >> 5) & 0x1f; g.tw_ox = (v >> 10) & 0x1f; g.tw_oy = (v >> 15) & 0x1f; break;
 	case 0xe3: g.da_x1 = v & 0x3ff; g.da_y1 = (v >> 10) & 0x1ff; break;
 	case 0xe4: g.da_x2 = v & 0x3ff; g.da_y2 = (v >> 10) & 0x1ff; break;
-	case 0xe5: g.off_x = sx11(v); g.off_y = sx11(v >> 11); break;
+	case 0xe5:
+#ifdef PSX_GPUSTAT
+		{ extern int gpudump; extern int printf(const char *, ...); if (gpudump) printf("AREA %d,%d-%d,%d off=%d,%d disp=%d,%d\n", g.da_x1, g.da_y1, g.da_x2, g.da_y2, (int)sx11(v), (int)sx11(v >> 11), g.disp_x, g.disp_y); }
+#endif
+		g.off_x = sx11(v); g.off_y = sx11(v >> 11); break;
 	case 0xe6: g.set_mask = v & 1; g.check_mask = (v >> 1) & 1; break;
 	}
 }

@@ -88,14 +88,6 @@ static void sh_mark(int k, u32 lo, u32 hi)
 	else { if (lo < pend_lo[k]) pend_lo[k] = lo; if (hi > pend_hi[k]) pend_hi[k] = hi; }
 }
 
-// Bytes [b0, b1) de una textura que empieza en el hueco u (puede ocupar varios)
-static void sh_mark_tex(int u, u32 b0, u32 b1)
-{
-	for (u32 k = b0 >> 15; k <= (b1 - 1) >> 15; k++) {
-		u32 base = k << 15, lo = b0 > base ? b0 - base : 0, hi = b1 < base + 0x8000 ? b1 - base : 0x8000;
-		sh_mark(u + (int)k, lo, hi);
-	}
-}
 
 static void bank_mode(int bank, int lcd)   // 0 = B, 1 = D, 2 = C, 3 = E
 {
@@ -226,22 +218,27 @@ static void pal_dirty(int x, int y, int w, int h)
 	}
 }
 
-// ---- texturas: 12 huecos de 32 KB (banco B = huecos 0-3, D = 4-7, C = 8-11) ----
+// ---- texturas: 192 huecos de 2 KB (banco B = huecos 0-63, D = 64-127, C = 128-191; el 176 es de la rampa) ----
+// Cada entrada es una banda de 16 a 256 filas (potencia de 2) de una página de la PS1, desde la fila del polígono
+// (la DS admite cualquier dirección): casi todos usan un trozo de su página, y así caben muchas más (Pepsiman usa
+// hasta unas 20 páginas por frame y con páginas enteras de 32 KB se echaban unas a otras sin parar).
 // depth 1/2/3 = página de 4/8/15 bits tal cual; 4 = página de 4 bits como A3I5 (8 bits por texel con alfa
 // por texel sacado del brillo de su color en la CLUT cx, cy: para las capas aditivas)
-#define UNITS 12
-typedef struct { s16 x, y, cx, cy; u8 depth, units, used; u32 stamp, rows[8]; } TexEnt;   // used = 0: libre; rows: filas ya copiadas (bit = fila)
-static TexEnt tex[UNITS];   // la entrada i ocupa los huecos i .. i+units-1 (alineada a su tamaño)
+#define NSUB 192
+#define SUB_BYTES 2048
+#define RAMP_SUB 176   // la rampa está en el byte 0x58000
+typedef struct { s16 x, y, cx, cy; u8 depth, units, used, start; u16 h; u32 stamp, rows[8]; } TexEnt;   // used = 0: libre; rows: filas ya copiadas (bit = fila de la página)
+static TexEnt tex[NSUB];     // la entrada i ocupa los huecos i .. i+units-1 (alineada a su tamaño)
+static s16 sub_owner[NSUB];   // entrada que ocupa cada hueco (-1: ninguna)
 
-static void tex_reset(void) { memset(tex, 0, sizeof tex); }
+static void tex_reset(void) { memset(tex, 0, sizeof tex); memset(sub_owner, -1, sizeof sub_owner); }
 
 static int src_w(int depth) { return depth == 1 || depth == 4 ? 64 : depth == 2 ? 128 : 256; }   // medias palabras por fila
 static int dst_row(int depth) { return depth == 1 ? 128 : depth == 3 ? 512 : 256; }              // bytes por fila
-static int units_of(int depth) { return depth == 1 ? 1 : depth == 3 ? 4 : 2; }
 
 static void tex_dirty(int x, int y, int w, int h)
 {
-	for (int i = 0; i < UNITS; i++) {
+	for (int i = 0; i < NSUB; i++) {
 		TexEnt *t = &tex[i];
 		if (!t->used) continue;
 		if (t->x < x + w && t->x + src_w(t->depth) > x && t->y < y + h && t->y + 256 > y) {   // solo esas filas
@@ -253,12 +250,23 @@ static void tex_dirty(int x, int y, int w, int h)
 	}
 }
 
-// Copia la página a los huecos desde u (en modo LCD los bancos B y D no son contiguos: por huecos)
+// Bytes [b0, b1) de la memoria de texturas: se apuntan como cambiados en los trozos de 32 KB que tocan
+static void sh_mark_bytes(u32 b0, u32 b1)
+{
+	for (u32 k = b0 >> 15; k <= (b1 - 1) >> 15; k++) {
+		u32 base = k << 15, lo = b0 > base ? b0 - base : 0, hi = b1 < base + 0x8000 ? b1 - base : 0x8000;
+		sh_mark((int)k, lo, hi);
+	}
+}
+
+// Copia las filas [row0, row1) de la página (dentro de la banda de la entrada) a su sitio desde el hueco u
 static void tex_upload(const TexEnt *t, int u, int row0, int row1)
 {
 	STAGE(20);
 	int tw = src_w(t->depth), rb = dst_row(t->depth);
+	u32 base = (u32)u * SUB_BYTES;
 	u16 lut[256];   // A3I5: un byte de origen (2 texels) -> 2 bytes
+	STAT_ADD(gpu_pixels, (u32)(row1 - row0) * (u32)rb);   // diagnóstico: bytes de textura copiados
 	if (t->depth == 4) {
 		// alfa relativo al color más brillante de la CLUT plantilla (la primera con la que se usa la página):
 		// las demás CLUT de esa página suelen ser la misma con otro brillo, que va en el alfa del polígono
@@ -272,13 +280,11 @@ static void tex_upload(const TexEnt *t, int u, int row0, int row1)
 		for (int i = 0; i < 16; i++) b[i] = (u8)(i | (((m[i] * 7 + mmax / 2) / mmax) << 5));
 		for (int k = 0; k < 256; k++) lut[k] = (u16)(b[k & 15] | (b[k >> 4] << 8));
 	}
-	if (sh_tex) sh_mark_tex(u, (u32)row0 * (u32)rb, (u32)row1 * (u32)rb);
+	if (sh_tex) sh_mark_bytes(base + (u32)(row0 - t->start) * (u32)rb, base + (u32)(row1 - t->start) * (u32)rb);
 	else { vramSetBankB(VRAM_B_LCD); vramSetBankD(VRAM_D_LCD); vramSetBankC(VRAM_C_LCD); }
 	for (int row = row0; row < row1; row++) {
-		u32 byte = (u32)row * (u32)rb;   // posición en la textura
-		int unit = u + (int)(byte >> 15);
-		u16 *dst = sh_tex ? sh_tex + ((u32)unit << 14) + ((byte & 0x7fff) >> 1)
-		                  : bank_lcd(unit >> 2) + ((unit & 3) << 14) + ((byte & 0x7fff) >> 1);
+		u32 byte = base + (u32)(row - t->start) * (u32)rb;   // posición en la memoria de texturas
+		u16 *dst = sh_tex ? sh_tex + (byte >> 1) : bank_lcd((int)(byte >> 17)) + ((byte & 0x1ffff) >> 1);
 		const u16 *src = &psx_vram[((t->y + row) & 511) * 1024];
 		if (t->depth == 3) {
 			for (int k = 0; k < tw; k++) {
@@ -319,52 +325,72 @@ static void tex_ensure(TexEnt *t, int u, int v0, int v1)
 		if (t->rows[r >> 5] & (1u << (r & 31))) { r++; continue; }
 		for (e = r; e <= v1 && !(t->rows[e >> 5] & (1u << (e & 31))); e++) t->rows[e >> 5] |= 1u << (e & 31);
 		tex_upload(t, u, r, e);
-		STAT_ADD(gpu_lines, 1);
 		r = e;
 	}
 }
 
-// Hueco donde está (o se carga) la página; devuelve el primero. Solo se copian las filas [v0, v1] que usa el
-// polígono: una página que vuelve a la caché no se copia entera si el juego usa un trozo.
+static int tex_has(const TexEnt *t, int x, int y, int depth, int v0, int v1)
+{
+	return t->used && t->x == x && t->y == y && t->depth == depth && v0 >= t->start && v1 < t->start + t->h;
+}
+
+// Hueco donde está (o se carga) la banda con las filas [v0, v1] de la página; devuelve el primero. Solo se
+// copian las filas que usa el polígono.
+#ifdef GX_TEXLOG
+struct { char magic[8]; u32 n, e[4096]; } gx_texlog = { "SPTEXLOG" };
+#endif
 static int tex_get(int x, int y, int depth, int cx, int cy, int v0, int v1)
 {
 	static int last = 0;   // los polígonos seguidos suelen usar la misma página
-	int units = units_of(depth), best = 0;
+	int h, start, units, best = -1;
 	u32 best_age = 0;
-	{
-		TexEnt *t = &tex[last];
-		if (t->used && t->x == x && t->y == y && t->depth == depth) {
-			t->stamp = frame_no;
-			tex_ensure(t, last, v0, v1);
-			return last;
-		}
+	if (tex_has(&tex[last], x, y, depth, v0, v1)) {
+		tex[last].stamp = frame_no;
+		tex_ensure(&tex[last], last, v0, v1);
+		return last;
 	}
-	for (int i = 0; i < UNITS; i++) {
-		TexEnt *t = &tex[i];
-		if (t->used && t->x == x && t->y == y && t->depth == depth) {
-			t->stamp = frame_no;
-			tex_ensure(t, i, v0, v1);
+	for (int i = 0; i < NSUB; i++)
+		if (tex_has(&tex[i], x, y, depth, v0, v1)) {
+			tex[i].stamp = frame_no;
+			tex_ensure(&tex[i], i, v0, v1);
 			last = i;
 			return i;
 		}
-	}
-	// el bloque alineado cuyo uso más reciente sea el más viejo (libre = viejísimo)
-	for (int i = 0; i + units <= UNITS - 1; i += units) {   // el hueco 11 es de la rampa
+	// la banda más pequeña (potencia de 2, desde 16 filas) que empieza a la altura del polígono y llega a sus filas
+	start = v0 & ~15;
+	for (h = 16; h < v1 - start + 1; h <<= 1) { }
+	if (start + h > 256) start = 256 - h;
+	units = h * dst_row(depth) / SUB_BYTES;
+	// el bloque alineado cuyo uso más reciente sea el más viejo (libre = viejísimo); los usados en este frame
+	// solo si no queda otro (el 3D dibuja el frame entero al final: pisarlos estropearía sus polígonos)
+	for (int i = 0; i + units <= NSUB; i += units) {
 		u32 newest = 0, age;
-		for (int k = 0; k < UNITS; k++) {   // entradas que tocan [i, i+units)
-			TexEnt *t = &tex[k];
-			if (t->used && k < i + units && k + t->units > i && t->stamp + 1 > newest) newest = t->stamp + 1;
+		if (i <= RAMP_SUB && RAMP_SUB < i + units) continue;
+		for (int s = i; s < i + units; s++) {
+			int k = sub_owner[s];
+			if (k >= 0 && tex[k].used && tex[k].stamp + 1 > newest) newest = tex[k].stamp + 1;
 		}
-		age = frame_no + 1 - newest;
-		if (age > best_age) { best_age = age; best = i; }
+		age = frame_no + 1 - newest;   // 0: usado en este frame
+		if (best < 0 || age > best_age) { best_age = age; best = i; }
 	}
-	for (int k = 0; k < UNITS; k++)
-		if (tex[k].used && k < best + units && k + tex[k].units > best) tex[k].used = 0;
+#ifdef GX_TEXLOG
+	if (gx_texlog.n < 4094) { gx_texlog.e[gx_texlog.n++] = (u32)x | (u32)y << 10 | (u32)depth << 19 | (u32)(best & 3) << 22 | (frame_no & 0xff) << 24; gx_texlog.e[gx_texlog.n++] = (u32)v0 | (u32)v1 << 8 | (u32)best << 16 | (u32)h << 22; }
+#endif
+	for (int s = best; s < best + units; s++) {   // fuera lo que ocupaba esos huecos
+		int k = sub_owner[s];
+		if (k >= 0 && tex[k].used) {
+			for (int q = k; q < k + tex[k].units; q++) sub_owner[q] = -1;
+			tex[k].used = 0;
+		}
+	}
+	for (int s = best; s < best + units; s++) sub_owner[s] = (s16)best;
 	tex[best].x = (s16)x; tex[best].y = (s16)y; tex[best].cx = (s16)cx; tex[best].cy = (s16)cy;
 	tex[best].depth = (u8)depth; tex[best].units = (u8)units; tex[best].used = 1; tex[best].stamp = frame_no;
+	tex[best].start = (u8)start; tex[best].h = (u16)h;
 	memset(tex[best].rows, 0, sizeof tex[best].rows);
 	tex_ensure(&tex[best], best, v0, v1);
-	STAT_ADD(gpu_lines, 1000);   // diagnóstico: páginas nuevas en la caché
+	STAT_ADD(gpu_lines, depth == 1 ? 1 : depth == 2 ? 1000 : 1000000);   // diagnóstico: bandas nuevas (4 bits, 8 bits x1000, 15 bits x1000000)
+	last = best;
 	return best;
 }
 
@@ -400,7 +426,7 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 	static s32 kx, ky;   // escala a coordenadas de la DS (4.12) por píxel, en 24.8: se recalcula si cambia la resolución
 	u32 attr, teximg = 0, pltt = 0, *o;
 	u32 z;
-	int lum = 24, alpha, white = 0, black = 0;
+	int lum = 24, alpha, white = 0, black = 0, vbase = 0;   // vbase: primera fila de la banda de textura
 	// B+F, B-F y B+F/4 no existen en la DS: B+F ~ «pantalla» (B*(1-a) + C*a con a = brillo de F), B-F ~
 	// negro con a = brillo de F. Con textura de 4 bits, el brillo de cada texel va en su alfa (A3I5) y el
 	// del color de los vértices en el alfa del polígono.
@@ -426,7 +452,8 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 			pltt = pal_get(p->cx, p->cy, a3 ? 32 : p->tex == 1 ? 16 : 256, &lum);
 			c0 = psx_vram[p->cy * 1024 + p->cx] == 0;   // índice 0 transparente si su color es 0
 		}
-		teximg = ((u32)u << 12) | (1u << 16) | (1u << 17) | (5u << 20) | (5u << 23) | ((u32)fmt << 26) | ((u32)c0 << 29);
+		vbase = tex[u].start;
+		teximg = ((u32)u << 8) | (1u << 16) | (1u << 17) | (5u << 20) | ((u32)(__builtin_ctz(tex[u].h) - 3) << 23) | ((u32)fmt << 26) | ((u32)c0 << 29);
 	}
 	alpha = alpha_of[p->semi];
 	if (addlike) {
@@ -490,7 +517,7 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 				if (m > 31) m = 31;
 				*o++ = (8u << 16) | (u32)(m * 16 + 8);
 			} else
-				*o++ = ((u32)(q->v << 4) << 16) | ((u32)(q->u << 4) & 0xffff);
+				*o++ = ((u32)((q->v - vbase) << 4) << 16) | ((u32)(q->u << 4) & 0xffff);
 			*o++ = ((u32)y << 16) | ((u32)x & 0xffff);
 			*o++ = z;
 		}
