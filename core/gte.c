@@ -478,6 +478,37 @@ static void dpc_fast(const u8 *c)
 	push_color();
 }
 
+
+// Lo mismo que dpc_fast() + push_color() en una pasada, con las banderas en un registro (FLAG se toca una vez)
+#define DPC_CH(i) do { \
+	s32 m = (s32)c##i << 16, t = ((FC[i] << 12) - m) >> 12, ir, col; \
+	if ((u32)(t + 0x8000) > 0xffff) { t = t < 0 ? -0x8000 : 0x7fff; fl |= 1u << (24 - i); } \
+	t = (t * ir0 + m) >> 12; \
+	MAC[i + 1] = t; \
+	ir = t < lo ? lo : t > 0x7fff ? 0x7fff : t; \
+	if (ir != t) fl |= 1u << (24 - i); \
+	IR[i + 1] = (s16)ir; \
+	col = t >> 4; \
+	if ((u32)col > 255) { col = col < 0 ? 0 : 255; fl |= 1u << (21 - i); } \
+	out##i = (u8)col; \
+} while (0)
+
+static void dpc12f(const u8 *c)
+{
+	u32 fl = 0;
+	s32 ir0 = IR[0], lo = lm ? 0 : -0x8000, c0 = c[0], c1 = c[1], c2 = c[2];
+	u8 out0, out1, out2;
+	DPC_CH(0);
+	DPC_CH(1);
+	DPC_CH(2);
+	memmove(CF[0], CF[1], 8);   // CF[0] <- CF[1], CF[1] <- CF[2]
+	CF[2][0] = out0;
+	CF[2][1] = out1;
+	CF[2][2] = out2;
+	CF[2][3] = RGBC[3];
+	FLAG |= fl;
+}
+
 GTE_INL void nclip(void)
 {
 	// Con SX y SY de 11 bits (lo normal: RTP los recorta) la suma cabe en 32 bits y no hay desbordamiento
@@ -649,8 +680,8 @@ void gte_reset(void)
 GTE_ENTRY(e_rtps, 12, rtp12f(0, 1);)
 GTE_ENTRY(e_rtpt, 12, rtp12f(0, 0); rtp12f(1, 0); rtp12f(2, 1);)
 GTE_ENTRY(e_nclip, 0, (void)op; nclip();)
-GTE_ENTRY(e_dpcs, 12, if (dpc_fast_ok()) dpc_fast(RGBC); else dpc(RGBC);)
-GTE_ENTRY(e_dpct, 12, if (dpc_fast_ok()) { dpc_fast(CF[0]); dpc_fast(CF[0]); dpc_fast(CF[0]); } else { dpc(CF[0]); dpc(CF[0]); dpc(CF[0]); })
+GTE_ENTRY(e_dpcs, 12, if (dpc_fast_ok()) dpc12f(RGBC); else dpc(RGBC);)
+GTE_ENTRY(e_dpct, 12, if (dpc_fast_ok()) { dpc12f(CF[0]); dpc12f(CF[0]); dpc12f(CF[0]); } else { dpc(CF[0]); dpc(CF[0]); dpc(CF[0]); })
 GTE_ENTRY(e_avsz3, 0, { s64 v = (s64)ZSF3 * (SZ[1] + SZ[2] + SZ[3]); set_mac0(v); set_otz(v); })
 GTE_ENTRY(e_avsz4, 0, { s64 v = (s64)ZSF4 * (SZ[0] + SZ[1] + SZ[2] + SZ[3]); set_mac0(v); set_otz(v); })
 GTE_ENTRY(e_ncds, 12, ncd(0);)
