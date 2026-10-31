@@ -124,6 +124,11 @@ static void run(int ch)
 			addr += words * 4;
 			words = 0;
 		}
+		if (ch == CH_MDEC_IN && from_ram && step == 4 && (addr & 0x1ffffc) + words * 4 <= 0x200000) {   // de golpe (vídeos)
+			mdec_write_words(ram32(addr), words);
+			addr += words * 4;
+			words = 0;
+		}
 		while (words--) {
 			if (from_ram) {
 				u32 v = *ram32(addr);

@@ -377,3 +377,23 @@ void mdec_state(PsxState *s)
 	{ void *b = out_buf; if (!buf_state(s, &b, &out_cap, out_len)) out_len = out_pos = 0; out_buf = b; }
 	if (s->load) check_scale();
 }
+
+// Varias palabras de golpe (la DMA de entrada): los datos de decodificar se copian tal cual (cada palabra son sus
+// dos medias palabras en el mismo orden); lo demás, palabra a palabra
+void mdec_write_words(const u32 *w, u32 n)
+{
+	while (n) {
+		if (state == DECODE && words_left > 1) {
+			u32 k = words_left - 1 < n ? words_left - 1 : n;   // la última, por mdec_write_cmd (decodifica)
+			u32 room = (in_cap - in_len) / 2, c = k < room ? k : room;   // sin memoria: lo que no quepa se descarta
+			memcpy(in_buf + in_len, w, c * 4);
+			in_len += c * 2;
+			words_left -= k;
+			w += k;
+			n -= k;
+			continue;
+		}
+		mdec_write_cmd(*w++);
+		n--;
+	}
+}

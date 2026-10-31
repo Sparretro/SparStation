@@ -200,6 +200,7 @@ int xa_decode(const u8 *raw, s16 *out, XaDecoder *d, int *stereo, int *rate);
 // ---- MDEC (vídeo) ----
 void mdec_reset(void);
 void mdec_write_cmd(u32 v);
+void mdec_write_words(const u32 *w, u32 n);   // la DMA de entrada, de golpe
 void mdec_write_ctrl(u32 v);
 u32 mdec_read_data(void);
 u32 mdec_read_words(u32 *dst, u32 n);   // salida de golpe (palabras enteras); devuelve cuántas
