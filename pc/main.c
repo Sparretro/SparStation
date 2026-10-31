@@ -234,6 +234,7 @@ static void report_profile(void)
 	for (u32 a = cpu.cop0[14] - 24; a < cpu.cop0[14] + 16; a += 4) mips_dis(a, bus_read32(a));
 }
 
+static void xa_next(s32 *l, s32 *r);
 // ---- sonido: --wav archivo mezcla las voces como lo haría el hardware de la DS (44100 Hz, estéreo) ----
 static struct { const s16 *pcm; u32 len, pos, pitch, l, r; s32 loop; int on; } pcv[24];
 static FILE *wav;
@@ -264,6 +265,7 @@ static void pc_mix(u32 n)
 				else pcv[v].on = 0;
 			}
 		}
+		xa_next(&L, &R);
 		buf[i * 2] = (s16)(L > 32767 ? 32767 : L < -32768 ? -32768 : L);
 		buf[i * 2 + 1] = (s16)(R > 32767 ? 32767 : R < -32768 ? -32768 : R);
 	}
@@ -271,6 +273,39 @@ static void pc_mix(u32 n)
 	wav_samples += n;
 }
 static const SpuHw pc_spu = { pc_key_on, pc_update, pc_stop, pc_mix };
+
+// XA en el PC: se descodifica al leer el sector y entra en una cola que pc_mix va consumiendo a 44100 Hz
+#define XAQ (1 << 16)
+static s16 xaq[XAQ][2];
+static u32 xa_w, xa_rate = 37800;
+static u64 xa_r_fix;   // posición de lectura en 1/65536 de muestra
+static XaDecoder xa_dec;
+u32 pc_xa_sectors;
+static void pc_xa_sector(u32 lba, const u8 *raw)
+{
+	static s16 buf[4032];
+	int st, rate, n = xa_decode(raw, buf, &xa_dec, &st, &rate);
+	(void)lba;
+	pc_xa_sectors++;
+	if (getenv("XALOG")) printf("XA lba=%u file=%u chan=%u sub=%02x coding=%02x\n", lba, raw[16], raw[17], raw[18], raw[19]);
+	xa_rate = (u32)rate;
+	for (int i = 0; i < n; i++) {
+		xaq[xa_w % XAQ][0] = buf[st ? i * 2 : i];
+		xaq[xa_w % XAQ][1] = buf[st ? i * 2 + 1 : i];
+		xa_w++;
+	}
+}
+static void pc_xa_stop(void) { xa_r_fix = 0; xa_w = 0; memset(&xa_dec, 0, sizeof xa_dec); }
+static void pc_xa_mute(int on) { (void)on; }
+static const CdAudioHw pc_cd = { pc_xa_sector, pc_xa_stop, pc_xa_mute };
+static void xa_next(s32 *l, s32 *r)
+{
+	u32 i = xa_r_fix >> 16;
+	if (i >= xa_w) return;
+	*l += xaq[i % XAQ][0];
+	*r += xaq[i % XAQ][1];
+	xa_r_fix += ((u64)xa_rate << 16) / 44100;
+}
 
 static void wav_header(FILE *f, u32 samples)
 {
@@ -298,7 +333,7 @@ int main(int argc, char **argv)
 		if (!strcmp(argv[i], "--frameskip") && i + 1 < argc) gpu_frameskip = (u8)atoi(argv[i + 1]);
 		if (!strcmp(argv[i], "--rows") && i + 1 < argc) rows_mode = ds_rows = atoi(argv[i + 1]);
 		if (!strcmp(argv[i], "--halfx")) gpu_half_x = 1;
-		if (!strcmp(argv[i], "--wav") && i + 1 < argc && (wav = fopen(argv[i + 1], "wb"))) { wav_header(wav, 0); spu_hw = &pc_spu; }
+		if (!strcmp(argv[i], "--wav") && i + 1 < argc && (wav = fopen(argv[i + 1], "wb"))) { wav_header(wav, 0); spu_hw = &pc_spu; cd_audio_hw = &pc_cd; }
 		// (se aplica tras psx_init)   // como la DS: 1 = filas que se ven, 2 = pares
 	}
 	if (want_prof) {

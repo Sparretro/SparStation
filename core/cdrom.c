@@ -20,6 +20,8 @@ static int qn;
 static u32 q_due;
 
 static u8 mode, stat;
+static u8 filter_file, filter_chan, muted;   // filtro XA (Setfilter) y Mute
+const CdAudioHw *cd_audio_hw;
 static u32 seek_lba, cur_lba;
 static int seek_pending, reading;
 static u32 read_due;
@@ -46,6 +48,7 @@ void cdrom_reset(void)
 	qn = 0;
 	mode = 0;
 	stat = reader ? ST_MOTOR : ST_SHELL;
+	filter_file = filter_chan = muted = 0;
 	seek_lba = cur_lba = 0;
 	seek_pending = reading = 0;
 	data_len = data_pos = 0;
@@ -76,6 +79,9 @@ static u32 sector_time(void) { return (mode & 0x80) ? PSX_CPU_HZ / 150 : PSX_CPU
 
 static void command(u8 cmd)
 {
+	if (cd_audio_hw && (cmd == 0x08 || cmd == 0x09 || cmd == 0x0a || cmd == 0x15 || cmd == 0x16 ||
+	                    ((cmd == 0x06 || cmd == 0x1b) && seek_pending)))
+		cd_audio_hw->stop();   // el cabezal se para o salta: lo que sonaba del XA se acaba
 	switch (cmd) {
 	case 0x01: push_stat(3, 25000); stat &= ~ST_SHELL; if (reader) stat |= ST_MOTOR; break;   // Getstat
 	case 0x02:   // Setloc
@@ -115,7 +121,12 @@ static void command(u8 cmd)
 		stat = reader ? ST_MOTOR : 0;
 		push_stat(2, 70000);
 		break;
-	case 0x0b: case 0x0c: case 0x0d: push_stat(3, 25000); break;   // Mute, Demute, Setfilter
+	case 0x0b: case 0x0c:   // Mute, Demute
+		muted = cmd == 0x0b;
+		if (cd_audio_hw) cd_audio_hw->mute(muted);
+		push_stat(3, 25000);
+		break;
+	case 0x0d: filter_file = params[0]; filter_chan = params[1]; push_stat(3, 25000); break;   // Setfilter
 	case 0x0e: mode = params[0]; push_stat(3, 25000); break;      // Setmode
 	case 0x0f: { u8 d[5] = { stat, mode, 0, 0, 0 }; push(3, 25000, 5, d); break; }   // Getparam
 	case 0x10: push(3, 25000, 8, last_header); break;            // GetlocL
@@ -190,6 +201,15 @@ void cdrom_tick(void)
 			return;
 		}
 		memcpy(last_header, sector + 12, 8);
+		// XA-ADPCM activado: los sectores de audio (submodo bit 2) van a la SPU y no a la CPU; con el filtro, solo
+		// los del archivo/canal elegidos (los demás se ignoran del todo)
+		if ((mode & 0x40) && sector[15] == 2 && (sector[18] & 0x04)) {
+			int pass = !(mode & 0x08) || (sector[16] == filter_file && sector[17] == filter_chan);
+			if (pass && cd_audio_hw) cd_audio_hw->sector(cur_lba, sector);
+			cur_lba++;
+			read_due = psx_cycles + sector_time();
+			return;
+		}
 #ifdef PSX_TRACE_IO
 		printf("CD INT1 sector %u\n", cur_lba);
 #endif
@@ -297,4 +317,41 @@ void cdrom_state(PsxState *s)
 	STATE(s, seek_pending); STATE(s, reading); STATE(s, read_due);
 	STATE(s, sector); STATE(s, last_header);
 	STATE(s, data_fifo); STATE(s, data_len); STATE(s, data_pos);
+}
+
+// ---- XA-ADPCM: 18 grupos de 128 bytes por sector; en 4 bits, 8 unidades de 28 muestras por grupo ----
+int xa_decode(const u8 *raw, s16 *out, XaDecoder *d, int *stereo, int *rate)
+{
+	static const s32 f0[4] = { 0, 60, 115, 98 }, f1[4] = { 0, 0, -52, -55 };
+	u8 coding = raw[19];
+	int st = coding & 1, bits8 = (coding >> 4) & 1, n = 0;
+	*stereo = st;
+	*rate = (coding & 4) ? 18900 : 37800;
+	if (raw[15] != 2 || !(raw[18] & 0x04)) return 0;
+	for (int g = 0; g < 18; g++) {
+		const u8 *grp = raw + 24 + g * 128;
+		int units = bits8 ? 4 : 8;
+		for (int u = 0; u < units; u++) {
+			u8 hdr = grp[4 + u];
+			int shift = hdr & 15, filt = (hdr >> 4) & 3, ch = st ? (u & 1) : 0;
+			s32 *old = &d->old[ch], *older = &d->older[ch];
+			if (shift > 12) shift = 9;
+			for (int j = 0; j < 28; j++) {
+				s32 s;
+				if (bits8) s = (s32)((u32)grp[16 + j * 4 + u] << 24) >> 16;
+				else s = (s32)((u32)((grp[16 + j * 4 + u / 2] >> ((u & 1) * 4)) & 15) << 28) >> 16;
+				s >>= shift;
+				s += (*old * f0[filt] + *older * f1[filt] + 32) >> 6;
+				if (s > 32767) s = 32767;
+				if (s < -32768) s = -32768;
+				*older = *old;
+				*old = s;
+				// mono: las unidades van seguidas; estéreo: pares L/R intercalados en la salida
+				if (st) out[(n / 56 * 28 + j) * 2 + ch] = (s16)s;
+				else out[n + j] = (s16)s;
+			}
+			if (!st || (u & 1)) n += st ? 56 : 28;
+		}
+	}
+	return st ? n / 2 : n;   // muestras por canal
 }

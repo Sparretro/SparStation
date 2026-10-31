@@ -163,6 +163,17 @@ void cdrom_write(u32 reg, u32 v);
 u32 cdrom_dma_word(void);
 int cdrom_next_event(u32 *when);
 void cdrom_tick(void);
+// Audio XA: los sectores de audio que el juego manda a la SPU se le pasan al frontend tal cual (2352 bytes)
+typedef struct {
+	void (*sector)(u32 lba, const u8 *raw);   // sector de audio que pasa el filtro, en el momento de leerlo
+	void (*stop)(void);                       // el juego para el CD o salta a otro sitio
+	void (*mute)(int on);
+} CdAudioHw;
+extern const CdAudioHw *cd_audio_hw;
+typedef struct { s32 old[2], older[2]; } XaDecoder;   // historia del filtro por canal (se pone a cero al empezar)
+// Descodifica un sector XA (4032 muestras mono o 2016 pares L/R intercalados en out); devuelve muestras por
+// canal (0 si no es de audio)
+int xa_decode(const u8 *raw, s16 *out, XaDecoder *d, int *stereo, int *rate);
 
 // ---- MDEC (vídeo) ----
 void mdec_reset(void);

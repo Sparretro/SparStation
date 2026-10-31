@@ -44,7 +44,7 @@ static void watchdog(void)
 	}
 }
 
-static void on_vblank(void) { vblanks++; snd_vblanks++;gx_dbg.vbl++; flip_in_vblank(); if (gpu_hw) gx_vblank(); watchdog(); }
+static void on_vblank(void) { vblanks++; snd_vblanks++; gx_dbg.vbl++; flip_in_vblank(); if (gpu_hw) gx_vblank(); watchdog(); }
 
 static int read_exe(void *user, u8 *dst, u32 len) { return fread(dst, 1, len, (FILE *)user) == len; }
 
@@ -82,6 +82,7 @@ static int open_subset(void)
 	disc = fopen("nitro:/disc.dat", "rb");
 	if (!disc) return 0;
 	cdrom_set_disc(read_subset, NULL, total);
+	snd_set_disc(read_subset);
 	return 1;
 }
 
@@ -120,6 +121,7 @@ static int open_disc(const char *path)
 	setvbuf(disc, NULL, _IOFBF, 32 * 1024);
 	fseek(disc, 0, SEEK_END);
 	cdrom_set_disc(read_sector, NULL, (u32)(ftell(disc) / 2352));
+	snd_set_disc(read_sector);
 	return 1;
 }
 
@@ -585,6 +587,7 @@ static void run_loop(const char *title, int use_log)
 		psx_run_frame();
 		frame_beat++;
 		card_frame();
+		snd_xa_pump();
 		gx_dbg.stage = 2;
 		{ PROF_BEGIN(); present(); PROF_END(PROF_PRESENT); }
 		gx_dbg.stage = 3;
