@@ -1091,6 +1091,27 @@ static int sp_mem_op(u32 op)
 	return ((op >> 21) & 31) == 29 && (o == 0x20 || o == 0x21 || o == 0x23 || o == 0x24 || o == 0x25 || o == 0x28 || o == 0x29 || o == 0x2b);
 }
 
+// Bytes [hsp_lo, hsp_hi) respecto a sp a la entrada que toca el bloque por el atajo de la pila: con la pila en la
+// scratchpad, la entrada comprueba que todo cae dentro de sus 1024 bytes. Los «addiu sp, sp, n» mueven sp y el
+// atajo con él; si sp cambia de otra forma, lo que sigue ya no va por el atajo y no cuenta.
+static s32 hsp_lo, hsp_hi;
+static void sp_range(u32 op, s32 *delta, int *track)
+{
+	u32 o = op >> 26, r, w;
+	if (!*track) return;
+	if (sp_mem_op(op)) {
+		s32 off = *delta + (s32)(s16)(op & 0xffff);
+		int size = (o == 0x23 || o == 0x2b) ? 4 : (o == 0x21 || o == 0x25 || o == 0x29) ? 2 : 1;
+		if (off < hsp_lo) hsp_lo = off;
+		if (off + size > hsp_hi) hsp_hi = off + size;
+	}
+	op_regs(op, &r, &w);
+	if (w & (1u << 29)) {
+		if (o == 0x09 && ((op >> 21) & 31) == 29 && ((op >> 16) & 31) == 29) *delta += (s32)(s16)(op & 0xffff);
+		else *track = 0;
+	}
+}
+
 // Elige qué registros MIPS van en registros ARM: los más usados del bloque (al menos dos veces)
 static int psyq_vsync(u32 pc);
 static int vsync_poll_call(u32 pc);
@@ -1127,6 +1148,10 @@ static void alloc_regs(u32 pc)
 	int sp_ops = 0;
 	u8 scr_uses[32] = { 0 };
 	u32 wr_before = 0;
+	s32 sp_delta = 0;
+	int sp_track = 1;
+	hsp_lo = 0x7fffffff;
+	hsp_hi = -0x7fffffff;
 	for (u32 cur = pc;; cur += 4) {
 		u32 op = fetch_op(cur), r, w, m;
 		int last = 0;
@@ -1136,6 +1161,7 @@ static void alloc_regs(u32 pc)
 			u32 r2, w2, dop = fetch_op(cur + 4);
 			op_regs(dop, &r2, &w2);
 			sp_ops += sp_mem_op(dop);
+			sp_range(dop, &sp_delta, &sp_track);
 			for (m = r2 | w2; m; m &= m - 1) uses[__builtin_ctz(m)] += 1;
 			seen |= r2 | w2;
 			// superbloque: tras un salto condicional se sigue por el camino de no saltar (igual que compile)
@@ -1143,6 +1169,7 @@ static void alloc_regs(u32 pc)
 			else last = 1;
 		}
 		sp_ops += sp_mem_op(op);
+		sp_range(op, &sp_delta, &sp_track);
 		op_regs(op, &r, &w);
 		{   // base de la scratchpad conocida al entrar y aún sin cambiar
 			u32 o = op >> 26, rs = (op >> 21) & 31;
@@ -1778,17 +1805,29 @@ static block_fn compile_block(u32 pc, block_fn *s)
 	alloc_regs(pc);
 	emit(pc);   // cabecera: el PC virtual con el que se tradujo
 	entry = emit_ptr;
-	if (use_hsp) {   // atajo de la pila: sp en la RAM (y no en los primeros 32 KB) -> r8 = su dirección en la DS
+	if (use_hsp) {
+		u32 spv = cpu.r[29] & 0x1fffffff;   // dónde está la pila ahora: así se traduce (si cambia, la entrada falla)
 		int sp = get(29, R0);
-		u32 *fail1, *fail2;
-		a_dp_imm(C_AL, OP_TST, 1, 0, sp, arm_imm(0x1f800000));
-		fail1 = fwd(C_NE);
-		a_dp_reg(C_AL, OP_MOV, 0, R0, 0, sp, SH_LSL, 11);
-		a_dp_imm(C_AL, OP_CMP, 1, 0, R0, arm_imm(0x04000000));
-		fail2 = fwd(C_CC);
-		a_dp_reg(C_AL, OP_ADD, 0, RHSP, RRAM, R0, SH_LSR, 11);
-		sp_fail[0] = fail1;
-		sp_fail[1] = fail2;
+		if (spv >= 0x1f800000 && spv < 0x1f800400 && hsp_lo <= hsp_hi && hsp_hi - hsp_lo <= 0x400) {
+			// pila en la scratchpad (Pepsiman y muchos otros): r8 = su sitio en la copia de la DTCM, si todo lo que
+			// toca el bloque [sp + hsp_lo, sp + hsp_hi) cabe en sus 1024 bytes
+			a_dp_imm(C_AL, OP_BIC, 0, R1, sp, arm_imm(0xe0000000));
+			a_dp_imm(C_AL, OP_SUB, 0, R1, R1, arm_imm(0x1f800000));
+			a_addi(R2, R1, (u32)hsp_lo, R3);
+			a_movi(R3, 0x400u - (u32)(hsp_hi - hsp_lo));
+			a_dp_reg(C_AL, OP_CMP, 1, 0, R2, R3, SH_LSL, 0);
+			sp_fail[0] = fwd(C_HI);
+			sp_fail[1] = NULL;
+			a_dp_reg(C_AL, OP_ADD, 0, RHSP, RCPU, R1, SH_LSL, 0);
+			a_addi(RHSP, RHSP, (u32)off_scr, R3);
+		} else {   // pila en la RAM (y no en los primeros 32 KB) -> r8 = su dirección en la DS
+			a_dp_imm(C_AL, OP_TST, 1, 0, sp, arm_imm(0x1f800000));
+			sp_fail[0] = fwd(C_NE);
+			a_dp_reg(C_AL, OP_MOV, 0, R0, 0, sp, SH_LSL, 11);
+			a_dp_imm(C_AL, OP_CMP, 1, 0, R0, arm_imm(0x04000000));
+			sp_fail[1] = fwd(C_CC);
+			a_dp_reg(C_AL, OP_ADD, 0, RHSP, RRAM, R0, SH_LSR, 11);
+		}
 	}
 	if (scr_reg) {   // base de la scratchpad: ¿sigue valiendo lo mismo?
 		int x = get(scr_reg, R0), k = arm_imm(scr_val);
@@ -1934,7 +1973,7 @@ static block_fn compile_block(u32 pc, block_fn *s)
 	if (use_hsp) {   // salida de los fallos de la comprobación de entrada
 		begin_cold();
 		land(sp_fail[0]);
-		land(sp_fail[1]);
+		if (sp_fail[1]) land(sp_fail[1]);
 		a_b(C_AL, 1, stub_sp_fail);
 		emit(pc);
 		end_cold();
