@@ -25,6 +25,9 @@
 #define GAMES_DIR "sd:/ps1"
 #define MAX_GAMES 64
 
+#ifdef DYN_DUMP_PC
+u32 dyn_dbg_addr[2];
+#endif
 static FILE *disc;
 static volatile u32 vblanks;
 
@@ -586,6 +589,9 @@ static void run_loop(const char *title, int use_log)
 		gx_dbg.stage = 1;
 		psx_run_frame();
 		frame_beat++;
+#ifdef DYN_DUMP_PC
+		{ extern u32 dyn_dbg_addr[2]; gx_dbg.dyn = dyn_dbg_addr[0]; gx_dbg.n = dyn_dbg_addr[1]; }
+#endif
 		card_frame();
 		snd_xa_pump();
 		gx_dbg.stage = 2;

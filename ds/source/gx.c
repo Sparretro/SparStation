@@ -27,7 +27,12 @@
 #endif
 #define LIST_WORDS (MAX_POLYS * 26 + 16)
 
-static u32 list[LIST_WORDS];
+// Dos listas: mientras la DMA lleva una al FIFO del 3D (en segundo plano, modo GXFIFO), los polígonos del frame
+// siguiente se escriben en la otra
+#define GX_DMA 1
+static u32 list_buf[2][LIST_WORDS + 2] __attribute__((aligned(32)));
+static u32 *list = list_buf[0];
+static int list_cur;
 static int ln, npolys;
 static u32 frame_no;
 // Fondo BG3 (la VRAM de la PS1 copiada a la pantalla): con el 3D solo hace falta copiarlo si el juego escribió
@@ -305,6 +310,7 @@ static void ramp_init(void)
 // ---- polígonos ----
 static inline u32 rgb5(int r, int g, int b) { return (u32)(r >> 3) | ((u32)(g >> 3) << 5) | ((u32)(b >> 3) << 10); }
 static inline int mod5(int c) { c >>= 2; return c > 31 ? 31 : c; }   // color de modulación: 128 = 1.0
+static u32 inv255[256];   // inv255[m] = 255 * 65536 / m redondeado hacia arriba: (r * inv255[m]) >> 16 == r * 255 / m
 
 static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 {
@@ -371,7 +377,11 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 		if (y < -32768) y = -32768; else if (y > 32767) y = 32767;
 		if (black) col = 0;
 		else if (white && p->tex) col = 0x7fff;   // el brillo ya va en el alfa
-		else if (white) { int m = q->r > q->g ? (q->r > q->b ? q->r : q->b) : (q->g > q->b ? q->g : q->b); m = m ? m : 1; col = rgb5(q->r * 255 / m, q->g * 255 / m, q->b * 255 / m); }
+		else if (white) {   // color llevado a brillo máximo (el brillo va en el alfa): r * 255 / m con la tabla de inversos
+			int m = q->r > q->g ? (q->r > q->b ? q->r : q->b) : (q->g > q->b ? q->g : q->b);
+			u32 k = inv255[m];
+			col = rgb5((int)((q->r * k) >> 16), (int)((q->g * k) >> 16), (int)((q->b * k) >> 16));
+		}
 		else if (!p->tex) col = rgb5(q->r, q->g, q->b);
 		else if (p->raw) col = 0x7fff;
 		else col = (u32)mod5(q->r) | ((u32)mod5(q->g) << 5) | ((u32)mod5(q->b) << 10);
@@ -412,13 +422,20 @@ static void gx_flip(int drawn)
 	STAGE(10);
 	if (!drawn) return;   // frame saltado: se queda la imagen anterior
 	int opaque = clear_next != 0;
+	while (DMA_CR(GX_DMA) & DMA_BUSY) { }   // la lista anterior aún va camino del FIFO
 	GFX_CLEAR_COLOR = opaque ? clear_next : 63u << 24;
 	clear_next = 0;
 	STAGE(11);
 	while (commit_on) { }   // lo del frame anterior aún no ha llegado a la VRAM (dos frames en una vblank)
-	for (int i = 0; i < ln; i++) GFX_FIFO = list[i];
+	list[ln++] = 0x50;   // SWAP_BUFFERS (orden manual de los semitransparentes): el buffer cambia en la próxima vblank
+	list[ln++] = 1;
+	DC_FlushRange(list, (u32)ln * 4);   // la DMA lee la RAM, no la caché
+	DMA_SRC(GX_DMA) = (u32)list;
+	DMA_DEST(GX_DMA) = 0x04000400;
+	DMA_CR(GX_DMA) = DMA_FIFO | (u32)ln;
+	list_cur ^= 1;
+	list = list_buf[list_cur];
 	STAGE(12);
-	GFX_FLUSH = 1;   // orden manual de los semitransparentes; se cambia de buffer en la próxima vblank
 	if (sh_tex) {   // lo cambiado para este frame va a la VRAM en esa vblank (gx_vblank)
 		int any = 0;
 		for (int k = 0; k < GX_NR; k++) {
@@ -468,6 +485,7 @@ void gx_init(void)
 #endif
 		if (!sh_tex || !sh_pal) { free(sh_tex); free(sh_pal); sh_tex = sh_pal = NULL; }
 	}
+	for (int m = 1; m < 256; m++) inv255[m] = ((255u << 16) + (u32)m - 1) / (u32)m;
 	tex_reset();
 	pal_reset();
 	ramp_init();
