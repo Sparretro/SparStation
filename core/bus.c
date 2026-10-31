@@ -49,7 +49,7 @@ static u32 io_read(u32 p, int size)
 	if (off >= 0x40 && off < 0x50) return sio_read(off - 0x40, size);
 	if (off >= 0x50 && off < 0x60) return off == 0x54 ? 0x5 : 0;   // SIO1: siempre listo, sin nada
 	if (off == 0x60) return ram_size;
-	if (off == 0x70) return irq_stat;
+	if (off == 0x70) { timers_sync(); return irq_stat; }   // un temporizador enmascarado no corta la ejecución: ponerlo al día
 	if (off == 0x74) return irq_mask;
 	if (off >= 0x80 && off < 0x100) return dma_read(off - 0x80);
 	if (off >= 0x100 && off < 0x130) return timer_read(off - 0x100);

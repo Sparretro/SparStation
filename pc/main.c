@@ -448,6 +448,9 @@ int main(int argc, char **argv)
 	for (int i = 1; i + 1 < argc; i++)
 		if (!strcmp(argv[i], "--ref")) printf("VRAM_DIFF %d\n", vram_diff(argv[i + 1]));
 	if (want_prof) report_profile();
+#ifdef PSX_DBGCNT
+	{ extern unsigned dbg_cut[4]; printf("cortes por frame: fin %u cd %u sio %u tmr %u\n", dbg_cut[0] / frames, dbg_cut[1] / frames, dbg_cut[2] / frames, dbg_cut[3] / frames); }
+#endif
 #ifdef PSX_GPUSTAT
 	{
 		extern u32 gpustat[16];

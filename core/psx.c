@@ -104,16 +104,17 @@ void psx_hook(void)
 static void run_until(u32 end)
 {
 	while (TIME_BEFORE(psx_cycles, end)) {
-		u32 t = end, w, start = psx_cycles;
+		u32 t = end, w;
 		if (cdrom_next_event(&w) && TIME_BEFORE(w, t)) t = w;
 		if (sio_next_event(&w) && TIME_BEFORE(w, t)) t = w;
+		if (timers_next_event(&w) && TIME_BEFORE(w, t)) t = w;
 		if (!TIME_BEFORE(psx_cycles, t)) t = psx_cycles + 1;
 #ifdef PSX_DYNAREC
 		dyn_run(t);   // el tiempo de CPU se mide una vez por frame (psx_run_frame): por línea costaba ~2%
 #else
 		cpu_run(t);
 #endif
-		timers_advance(psx_cycles - start);
+		timers_sync();
 		cdrom_tick();
 		sio_tick();
 	}
@@ -127,14 +128,19 @@ void psx_run_frame(void)
 	PROF_BEGIN();
 #endif
 	gpu_disp.frame_done = 0;
-	for (int line = 0; line < PSX_LINES; line++) {
+	timers_line_origin(line_start);
+	// Las líneas se ejecutan de un tirón hasta la vblank o el final del frame (el temporizador 1 cuenta las líneas con
+	// el reloj, GPUSTAT calcula la suya): entrar y salir del dynarec y poner al día los
+	// dispositivos en cada línea costaba un 5 por ciento. Lo de en medio (CD, mando, temporizadores) son eventos.
+	for (int line = 0; line < PSX_LINES;) {
+		int k = psx_line_cb ? 1 : (line < PSX_VBLANK_LINE ? PSX_VBLANK_LINE : PSX_LINES) - line;
 		gpu_set_line(line);
-		run_until(line_start + PSX_LINE_CYCLES);
-		line_start += PSX_LINE_CYCLES;
-		spu_advance(PSX_LINE_CYCLES);
-		timers_hblank();
+		run_until(line_start + (u32)k * PSX_LINE_CYCLES);
+		line_start += (u32)k * PSX_LINE_CYCLES;
+		spu_advance((u32)k * PSX_LINE_CYCLES);
 		if (psx_line_cb) psx_line_cb();
-		if (line == PSX_VBLANK_LINE - 1) {
+		line += k;
+		if (line == PSX_VBLANK_LINE) {
 			psx_irq(PSX_IRQ_VBLANK);
 			gpu_vblank();
 		}

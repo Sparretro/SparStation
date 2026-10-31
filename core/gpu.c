@@ -75,12 +75,25 @@ void gpu_reset(void)
 	update_display();
 }
 
+// Línea actual: psx_run_frame ejecuta varias líneas de un tirón, así que se calcula con el reloj
+static int line_base;
+static u32 line_base_cyc;
+
+static int odd_line_now(void)
+{
+	int line;
+	if (line_base >= PSX_VBLANK_LINE) return 0;
+	if (g.interlace && g.vres) return g.field;
+	line = line_base + (int)((psx_cycles - line_base_cyc) / PSX_LINE_CYCLES);
+	return line >= PSX_VBLANK_LINE ? 0 : line & 1;
+}
+
 u32 gpu_stat(void)
 {
 	u32 s = g.tp_x | (g.tp_y << 4) | (g.semi << 5) | (g.depth << 7) | (g.dither << 9) | (g.draw_display << 10) |
 	        (g.set_mask << 11) | (g.check_mask << 12) | ((g.interlace ? !g.field : 1) << 13) | (g.reverse << 14) | (g.tex_disable << 15) |
 	        (g.hres2 << 16) | (g.hres1 << 17) | (g.vres << 19) | (g.pal << 20) | (g.color24 << 21) |
-	        (g.interlace << 22) | (g.disp_disable << 23) | (g.irq << 24) | (g.dma_dir << 29) | ((u32)g.odd_line << 31);
+	        (g.interlace << 22) | (g.disp_disable << 23) | (g.irq << 24) | (g.dma_dir << 29) | ((u32)odd_line_now() << 31);
 	s |= 1 << 26;                          // listo para comandos
 	s |= (store_i < store_total) << 27;    // listo para mandar VRAM a la CPU
 	s |= 1 << 28;                          // listo para bloques DMA
@@ -92,6 +105,8 @@ u32 gpu_stat(void)
 // GPUSTAT.31: línea par/impar que se está mostrando; en 480i es el campo. Durante la vblank vale 0.
 void gpu_set_line(int line)
 {
+	line_base = line;
+	line_base_cyc = psx_cycles;
 	if (line >= PSX_VBLANK_LINE) g.odd_line = 0;
 	else if (g.interlace && g.vres) g.odd_line = g.field;
 	else g.odd_line = line & 1;

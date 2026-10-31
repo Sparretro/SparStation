@@ -152,8 +152,9 @@ void dma_write(u32 off, u32 v);
 // ---- timers ----
 u32 timer_read(u32 off);
 void timer_write(u32 off, u32 v);
-void timers_advance(u32 cycles);
-void timers_hblank(void);
+void timers_sync(void);              // pone los contadores al día con psx_cycles
+int timers_next_event(u32 *when);    // próxima interrupción posible de un temporizador
+void timers_line_origin(u32 c);      // ciclo en que empieza el frame (las líneas para el modo hblank)
 void timers_reset(void);
 
 // ---- CD-ROM ----
