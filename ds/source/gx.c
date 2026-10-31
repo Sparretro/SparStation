@@ -504,7 +504,7 @@ static void gx_vram_written(int x, int y, int w, int h)
 {
 	tex_dirty(x, y, w, h);
 	pal_dirty(x, y, w, h);
-	if (x < gpu_disp.disp_x + gpu_disp.width && x + w > gpu_disp.disp_x)
+	if (x < gpu_disp.disp_x + (gpu_disp.color24 ? gpu_disp.width * 3 / 2 : gpu_disp.width) && x + w > gpu_disp.disp_x)   // en 24 bits, 1,5 medias palabras por píxel
 		for (int b = y >> 4; b <= (y + h - 1) >> 4; b++) band_dirty[b & 31] = band_content[b & 31] = 1;
 }
 
