@@ -33,6 +33,9 @@
 #endif
 
 #define MAX_BLOCK 64
+#ifndef DYN_DS_SLOTS
+#define DYN_DS_SLOTS 0x2000   // huecos de la tabla de bloques en el modo DS (potencia de 2; el banco de pruebas usa más)
+#endif
 #ifndef DYN_DS_RESERVE_KB
 #define DYN_DS_RESERVE_KB 704   // modo DS: memoria que se deja fuera de la caché de código (los vídeos necesitan ~500 KB)
 #endif
@@ -258,7 +261,7 @@ static int near_cpu(const void *p, int extra, int *off)
 // big: DSi (16 MB) con espacio de sobra; si no, tamaños para una DS de 4 MB
 int dyn_init(int big)
 {
-	u32 nslots = big ? 0x20000 : 0x2000;
+	u32 nslots = big ? 0x20000 : DYN_DS_SLOTS;   // en el modo DS, pocos huecos: los bloques que chocan se retraducen
 	link_max = big ? 65536 : 4096;
 	slots = calloc(nslots, sizeof(block_fn));
 	links = malloc(link_max * sizeof(Link));
@@ -1266,9 +1269,14 @@ static int emit_op(u32 op, u32 pc, int ninstr)
 		put_const(rt, imm << 16);
 		return 1;
 	case 0x12:   // COP2 (GTE): directo, sin pasar por el intérprete
-		if (op & (1 << 25)) {
+		if (op & (1 << 25)) {   // comando: su función directa, sin trampolín (la GTE no mira el reloj; r12 se guarda)
+			void (*fn)(u32) = gte_entry(op);
+			s32 d = (s32)((const u8 *)fn - ((const u8 *)emit_ptr + 12));
 			a_movi(R0, op);
-			call(gte_command);
+			if (d < -0x2000000 || d >= 0x2000000) { call(gte_command); return 1; }
+			a_push((1u << R12) | (1u << LR));
+			a_b(C_AL, 1, (const void *)fn);
+			a_pop((1u << R12) | (1u << LR));
 			return 1;
 		}
 		switch (rs) {

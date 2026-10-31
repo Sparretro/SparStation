@@ -322,7 +322,9 @@ GTE_INL void rtp_s(int vi, int last, int s)
 }
 
 // con sf fijo (12 o 0) los desplazamientos de 64 bits salen mucho más cortos
-static void rtp(int vi, int last) { if (sf) rtp_s(vi, last, 12); else rtp_s(vi, last, 0); }
+static __attribute__((noinline)) void rtp12(int vi, int last) { rtp_s(vi, last, 12); }   // una copia por desplazamiento (la ITCM va justa)
+static __attribute__((noinline)) void rtp0(int vi, int last) { rtp_s(vi, last, 0); }
+static void rtp(int vi, int last) { if (sf) rtp12(vi, last); else rtp0(vi, last); }
 
 // interpolación hacia el color de lejanía (FC) según IR0
 GTE_INL void interpolate_s(s32 m1, s32 m2, s32 m3, int s)
@@ -410,6 +412,18 @@ static void dpc_fast(const u8 *c)
 	push_color();
 }
 
+GTE_INL void nclip(void)
+{
+	// Con SX y SY de 11 bits (lo normal: RTP los recorta) la suma cabe en 32 bits y no hay desbordamiento
+	if ((((u32)(SX[0] + 0x400) | (u32)(SX[1] + 0x400) | (u32)(SX[2] + 0x400) |
+	      (u32)(SY[0] + 0x400) | (u32)(SY[1] + 0x400) | (u32)(SY[2] + 0x400)) & ~0x7ffu) == 0) {
+		MAC[0] = SX[0] * (SY[1] - SY[2]) + SX[1] * (SY[2] - SY[0]) + SX[2] * (SY[0] - SY[1]);
+		return;
+	}
+	set_mac0((s64)SX[0] * SY[1] + (s64)SX[1] * SY[2] + (s64)SX[2] * SY[0] -
+	         (s64)SX[0] * SY[2] - (s64)SX[1] * SY[0] - (s64)SX[2] * SY[1]);
+}
+
 static void gte_exec(u32 op)
 {
 	if (!unr_ready) {
@@ -425,18 +439,7 @@ static void gte_exec(u32 op)
 
 	switch (op & 0x3f) {
 	case 0x01: rtp(0, 1); break;   // RTPS
-	case 0x06: {                    // NCLIP
-		// Con SX y SY de 11 bits (lo normal: RTP los recorta) la suma cabe en 32 bits y no hay desbordamiento
-		if ((((u32)(SX[0] + 0x400) | (u32)(SX[1] + 0x400) | (u32)(SX[2] + 0x400) |
-		      (u32)(SY[0] + 0x400) | (u32)(SY[1] + 0x400) | (u32)(SY[2] + 0x400)) & ~0x7ffu) == 0) {
-			MAC[0] = SX[0] * (SY[1] - SY[2]) + SX[1] * (SY[2] - SY[0]) + SX[2] * (SY[0] - SY[1]);
-			break;
-		}
-		s64 v = (s64)SX[0] * SY[1] + (s64)SX[1] * SY[2] + (s64)SX[2] * SY[0] -
-		        (s64)SX[0] * SY[2] - (s64)SX[1] * SY[0] - (s64)SX[2] * SY[1];
-		set_mac0(v);
-		break;
-	}
+	case 0x06: nclip(); break;      // NCLIP
 	case 0x0c: {   // OP
 		s32 d1 = RT[0][0], d2 = RT[1][1], d3 = RT[2][2];
 		set_mac(1, (s64)d2 * IR[3] - (s64)d3 * IR[2]);
@@ -524,7 +527,7 @@ static void gte_exec(u32 op)
 		{ s64 v = (s64)ZSF4 * (SZ[0] + SZ[1] + SZ[2] + SZ[3]); set_mac0(v); set_otz(v); }
 		break;
 	case 0x30:   // RTPT
-		if (sf) { rtp_s(0, 0, 12); rtp_s(1, 0, 12); rtp_s(2, 1, 12); }
+		if (sf) { rtp12(0, 0); rtp12(1, 0); rtp12(2, 1); }
 		else { rtp(0, 0); rtp(1, 0); rtp(2, 1); }
 		break;
 	case 0x3d:                                            // GPF
@@ -562,4 +565,55 @@ void gte_command(u32 op)
 	{ extern u32 gte_hist[64]; gte_hist[op & 0x3f]++; }
 #endif
 	gte_exec(op);
+}
+
+// ---- entradas directas para el dynarec ----
+// La operación se sabe al traducir: cada una tiene su función (sin decodificar, sin contar, con sf ya fijo),
+// y el código traducido la llama sin pasar por el reloj (la GTE no lo mira). Lo raro va por gte_command.
+void gte_reset(void)
+{
+	for (int i = 0; i < 257; i++) {
+		int v = (0x40000 / (i + 0x100) + 1) / 2 - 0x101;
+		unr[i] = (u8)(v > 0 ? v : 0);
+	}
+	unr_ready = 1;
+}
+
+#define GTE_ENTRY(name, s, body) static void name(u32 op) { sf = s; lm = (op >> 10) & 1; FLAG = 0; body }
+GTE_ENTRY(e_rtps, 12, rtp12(0, 1);)
+GTE_ENTRY(e_rtpt, 12, rtp12(0, 0); rtp12(1, 0); rtp12(2, 1);)
+GTE_ENTRY(e_nclip, 0, (void)op; nclip();)
+GTE_ENTRY(e_dpcs, 12, if (dpc_fast_ok()) dpc_fast(RGBC); else dpc(RGBC);)
+GTE_ENTRY(e_dpct, 12, if (dpc_fast_ok()) { dpc_fast(CF[0]); dpc_fast(CF[0]); dpc_fast(CF[0]); } else { dpc(CF[0]); dpc(CF[0]); dpc(CF[0]); })
+GTE_ENTRY(e_avsz3, 0, { s64 v = (s64)ZSF3 * (SZ[1] + SZ[2] + SZ[3]); set_mac0(v); set_otz(v); })
+GTE_ENTRY(e_avsz4, 0, { s64 v = (s64)ZSF4 * (SZ[0] + SZ[1] + SZ[2] + SZ[3]); set_mac0(v); set_otz(v); })
+GTE_ENTRY(e_ncds, 12, ncd(0);)
+GTE_ENTRY(e_ncdt, 12, ncd(0); ncd(1); ncd(2);)
+GTE_ENTRY(e_nccs, 12, ncc(0);)
+GTE_ENTRY(e_ncct, 12, ncc(0); ncc(1); ncc(2);)
+GTE_ENTRY(e_ncs, 12, nc(0);)
+GTE_ENTRY(e_nct, 12, nc(0); nc(1); nc(2);)
+
+void (*gte_entry(u32 op))(u32)
+{
+	int s12 = (op >> 19) & 1;
+	switch (op & 0x3f) {
+	case 0x06: return e_nclip;
+	case 0x2d: return e_avsz3;
+	case 0x2e: return e_avsz4;
+	}
+	if (!s12) return gte_command;
+	switch (op & 0x3f) {
+	case 0x01: return e_rtps;
+	case 0x30: return e_rtpt;
+	case 0x10: return e_dpcs;
+	case 0x2a: return e_dpct;
+	case 0x13: return e_ncds;
+	case 0x16: return e_ncdt;
+	case 0x1b: return e_nccs;
+	case 0x3f: return e_ncct;
+	case 0x1e: return e_ncs;
+	case 0x20: return e_nct;
+	}
+	return gte_command;
 }

@@ -93,6 +93,8 @@ u32 dyn_block_of(u32 arm_pc);   // PC MIPS del bloque traducido que contiene esa
 u32 gte_read(int reg);
 void gte_write(int reg, u32 v);
 void gte_command(u32 op);
+void gte_reset(void);                 // tablas (antes de ejecutar nada)
+void (*gte_entry(u32 op))(u32);       // función directa para esa operación (para el dynarec)
 // Para el dynarec: dónde vive el registro reg (0-63) si leerlo o escribirlo es solo copiar memoria.
 // Hasta dos trozos: el primero con los 16 o 32 bits bajos, el segundo con los 16 altos. 0 = no es simple.
 typedef struct { void *addr; u8 bits, sign; } GteRegPart;

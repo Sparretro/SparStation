@@ -31,6 +31,7 @@ void psx_reset(void)
 	memset(psx_vram, 0, 1024 * 512 * 2);
 	bus_reset();
 	cpu_reset();
+	gte_reset();
 	gpu_reset();
 	timers_reset();
 	cdrom_reset();

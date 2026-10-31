@@ -97,7 +97,7 @@ int main(int argc, char **argv)
 	if (want) {
 		qsort(hot, nhot, sizeof(Blk), by_n_blk);
 		printf("direcciones de %s:\n", want);
-		for (int i = 0; i < 40 && i < nhot; i++) printf("  %5.2f%%  %08x\n", hot[i].n * 100.0 / total, hot[i].pc);
+		for (int i = 0; i < (getenv("PROF_ALL") ? nhot : 40); i++) printf("  %5.2f%%  %08x\n", hot[i].n * 100.0 / total, hot[i].pc);
 	}
 	return 0;
 }
