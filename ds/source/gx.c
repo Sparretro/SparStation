@@ -230,7 +230,7 @@ static void pal_dirty(int x, int y, int w, int h)
 // depth 1/2/3 = página de 4/8/15 bits tal cual; 4 = página de 4 bits como A3I5 (8 bits por texel con alfa
 // por texel sacado del brillo de su color en la CLUT cx, cy: para las capas aditivas)
 #define UNITS 12
-typedef struct { s16 x, y, cx, cy; u8 depth, units, used; s16 d0, d1; u32 stamp; } TexEnt;   // used = 0: libre; filas [d0, d1) por volver a copiar
+typedef struct { s16 x, y, cx, cy; u8 depth, units, used; u32 stamp, rows[8]; } TexEnt;   // used = 0: libre; rows: filas ya copiadas (bit = fila)
 static TexEnt tex[UNITS];   // la entrada i ocupa los huecos i .. i+units-1 (alineada a su tamaño)
 
 static void tex_reset(void) { memset(tex, 0, sizeof tex); }
@@ -248,8 +248,7 @@ static void tex_dirty(int x, int y, int w, int h)
 			int r0 = y - t->y, r1 = y + h - t->y;
 			if (r0 < 0) r0 = 0;
 			if (r1 > 256) r1 = 256;
-			if (t->d0 == t->d1) { t->d0 = (s16)r0; t->d1 = (s16)r1; }
-			else { if (r0 < t->d0) t->d0 = (s16)r0; if (r1 > t->d1) t->d1 = (s16)r1; }
+			for (int r = r0; r < r1; r++) t->rows[r >> 5] &= ~(1u << (r & 31));   // hay que volver a copiarlas
 		}
 	}
 }
@@ -303,8 +302,31 @@ static void tex_upload(const TexEnt *t, int u, int row0, int row1)
 	if (!sh_tex) { vramSetBankB(VRAM_B_TEXTURE_SLOT0); vramSetBankD(VRAM_D_TEXTURE_SLOT1); vramSetBankC(VRAM_C_TEXTURE_SLOT2); }
 }
 
-// Hueco donde está (o se carga) la página; devuelve el primero
-static int tex_get(int x, int y, int depth, int cx, int cy)
+// Filas [v0, v1] de la página que aún no se han copiado: se copian ahora (por tramos seguidos)
+static void tex_ensure(TexEnt *t, int u, int v0, int v1)
+{
+	int w0 = v0 >> 5, w1 = v1 >> 5, missing = 0;
+	for (int w = w0; w <= w1; w++) {   // lo normal: ya están todas (por palabras de 32 filas)
+		u32 m = ~0u;
+		if (w == w0) m &= ~0u << (v0 & 31);
+		if (w == w1) m &= ~0u >> (31 - (v1 & 31));
+		if ((t->rows[w] & m) != m) { missing = 1; break; }
+	}
+	if (!missing) return;
+	for (int r = v0; r <= v1;) {
+		int e;
+		if (!(r & 31) && t->rows[r >> 5] == ~0u) { r += 32; continue; }
+		if (t->rows[r >> 5] & (1u << (r & 31))) { r++; continue; }
+		for (e = r; e <= v1 && !(t->rows[e >> 5] & (1u << (e & 31))); e++) t->rows[e >> 5] |= 1u << (e & 31);
+		tex_upload(t, u, r, e);
+		STAT_ADD(gpu_lines, 1);
+		r = e;
+	}
+}
+
+// Hueco donde está (o se carga) la página; devuelve el primero. Solo se copian las filas [v0, v1] que usa el
+// polígono: una página que vuelve a la caché no se copia entera si el juego usa un trozo.
+static int tex_get(int x, int y, int depth, int cx, int cy, int v0, int v1)
 {
 	int units = units_of(depth), best = 0;
 	u32 best_age = 0;
@@ -312,7 +334,7 @@ static int tex_get(int x, int y, int depth, int cx, int cy)
 		TexEnt *t = &tex[i];
 		if (t->used && t->x == x && t->y == y && t->depth == depth) {
 			t->stamp = frame_no;
-			if (t->d0 != t->d1) { tex_upload(t, i, t->d0, t->d1); t->d0 = t->d1 = 0; STAT_ADD(gpu_lines, 1); }
+			tex_ensure(t, i, v0, v1);
 			return i;
 		}
 	}
@@ -330,9 +352,9 @@ static int tex_get(int x, int y, int depth, int cx, int cy)
 		if (tex[k].used && k < best + units && k + tex[k].units > best) tex[k].used = 0;
 	tex[best].x = (s16)x; tex[best].y = (s16)y; tex[best].cx = (s16)cx; tex[best].cy = (s16)cy;
 	tex[best].depth = (u8)depth; tex[best].units = (u8)units; tex[best].used = 1; tex[best].stamp = frame_no;
-	tex[best].d0 = tex[best].d1 = 0;
-	tex_upload(&tex[best], best, 0, 256);
-	STAT_ADD(gpu_lines, 1000);   // diagnóstico temporal: subidas de texturas
+	memset(tex[best].rows, 0, sizeof tex[best].rows);
+	tex_ensure(&tex[best], best, v0, v1);
+	STAT_ADD(gpu_lines, 1000);   // diagnóstico: páginas nuevas en la caché
 	return best;
 }
 
@@ -384,7 +406,11 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 		vb = p->raw && p->tex ? 128 : n == 4 ? vb >> 2 : (vb * 21846) >> 16;   // vb / n sin dividir (n = 3 o 4)
 	}
 	if (p->tex) {
-		int u = tex_get(p->tpx, p->tpy, a3 ? 4 : p->tex, p->cx, p->cy), fmt = a3 ? 1 : p->tex == 1 ? 3 : p->tex == 2 ? 4 : 7;
+		int vmin = v[0].v, vmax = v[0].v, u, fmt;
+		for (int k = 1; k < n; k++) { if (v[k].v < vmin) vmin = v[k].v; if (v[k].v > vmax) vmax = v[k].v; }
+		if (vmin < 0 || vmax > 255) { vmin = 0; vmax = 255; }   // se sale de la página (repite): todas
+		u = tex_get(p->tpx, p->tpy, a3 ? 4 : p->tex, p->cx, p->cy, vmin, vmax);
+		fmt = a3 ? 1 : p->tex == 1 ? 3 : p->tex == 2 ? 4 : 7;
 		int c0 = 0;
 		if (p->tex < 3) {
 			pltt = pal_get(p->cx, p->cy, a3 ? 32 : p->tex == 1 ? 16 : 256, &lum);
