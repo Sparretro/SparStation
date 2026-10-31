@@ -38,7 +38,12 @@ extern u8 psx_scratch[1024];
 extern u32 psx_cycles;
 extern u32 psx_run_until;   // hasta dónde corre la CPU ahora; los dispositivos lo adelantan
 // Un dispositivo programó algo para «when»: la CPU debe pararse ahí para atenderlo a tiempo
-static inline void psx_schedule(u32 when) { if ((s32)(when - psx_run_until) < 0) psx_run_until = when; }
+extern u32 psx_sched_req;   // la petición más temprana (cpu_interp_step la recoge: dentro de un paso el plazo es otro)
+static inline void psx_schedule(u32 when)
+{
+	if ((s32)(when - psx_run_until) < 0) psx_run_until = when;
+	if ((s32)(when - psx_sched_req) < 0) psx_sched_req = when;
+}
 
 u32 bus_read32(u32 a);
 u32 bus_read16(u32 a);

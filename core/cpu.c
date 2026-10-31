@@ -499,6 +499,7 @@ int cpu_dyn_irq(void)
 void cpu_interp_step(void)
 {
 	u32 saved_until = psx_run_until;   // cpu_run lo cambia; el despachador del dynarec lo necesita
+	psx_sched_req = saved_until;
 	STAT_ADD(dyn_interp_steps, 1);
 	cpu.next_pc = cpu.pc + 4;
 	cpu.branching = 0;
@@ -508,7 +509,7 @@ void cpu_interp_step(void)
 	if (cpu.lr) cpu.r[cpu.lr] = cpu.lv;
 	cpu.lr = 0;
 	cpu.r[0] = 0;
-	psx_run_until = saved_until;
+	psx_run_until = (s32)(psx_sched_req - saved_until) < 0 ? psx_sched_req : saved_until;   // sin perder lo que pidió una E/S
 }
 
 void cpu_state(PsxState *s)

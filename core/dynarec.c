@@ -419,7 +419,25 @@ static void smc_page(u32 page, u32 off)
 void dyn_smc(u32 off)
 {
 	u32 page = (off >> DYN_PAGE_BITS) & (DYN_NPAGES - 1), o = off & ((1u << DYN_PAGE_BITS) - 1);
+#ifdef DYN_SMC_PAGE
+	if (!dyn_pages[page]) return;
+#else
+#ifdef PSX_SMCLOG
+	if (dyn_pages[page] && (o + 4 <= code_lo[page] || o >= code_hi[page])) {   // descartada: ¿había un bloque que la cubra?
+		u32 first = page << DYN_PAGE_BITS;
+		for (u32 a = first >= 256 ? first - 256 : 0; a < first + (1u << DYN_PAGE_BITS); a += 4) {
+			block_fn *s = &slots[(a >> 2) & slot_mask];
+			if (*s && lin((*s)[-1]) == a && a <= (off & 0x1fffff) && (off & 0x1fffff) < a + 256 && dyn_cmp_log.n < 8189) {
+				dyn_cmp_log.e[dyn_cmp_log.n++] = 0xbad00000 | (psx_frame_no & 0xfffff);
+				dyn_cmp_log.e[dyn_cmp_log.n++] = off & 0x1fffff;
+				dyn_cmp_log.e[dyn_cmp_log.n++] = a | (u32)code_lo[page] << 21;
+				break;
+			}
+		}
+	}
+#endif
 	if (!dyn_pages[page] || o + 4 <= code_lo[page] || o >= code_hi[page]) return;
+#endif
 	smc_page(page, off);
 }
 
@@ -1048,9 +1066,15 @@ static void op_regs(u32 op, u32 *r, u32 *w)
 	*w = last_w;
 }
 
+// Al traducir, toda instrucción leída cuenta como código del bloque (también las que se miran por delante o en el
+// destino de un salto para decidir cómo traducir): si cambian, el bloque se tiene que volver a traducir
+static int fetch_mark;
+static void mark_pages(u32 start, u32 end);
+
 static u32 fetch_op(u32 pc)
 {
 	u32 p = pc & 0x1fffffff;
+	if (fetch_mark && p < 0x800000) mark_pages(p, p);
 	if (p < 0x800000) return *(u32 *)(psx_ram + (p & 0x1ffffc));
 	return *(u32 *)(psx_bios + (p & 0x7fffc));
 }
@@ -1683,11 +1707,14 @@ static void emit_idle(u32 target, int vs_off)
 	exit_pc(target);
 }
 
+#ifndef DYN_HIPAD
+#define DYN_HIPAD 0
+#endif
 static void mark_pages(u32 start, u32 end)
 {
 	u32 p0 = start & 0x1fffffff, p1 = end & 0x1fffffff;
 	if (p0 >= 0x800000) return;
-	u32 a0 = p0 & 0x1fffff, a1 = (p1 & 0x1fffff) + 8, pg0 = a0 >> DYN_PAGE_BITS, pg1 = (a1 - 1) >> DYN_PAGE_BITS;
+	u32 a0 = p0 & 0x1fffff, a1 = (p1 & 0x1fffff) + 4 + DYN_HIPAD, pg0 = a0 >> DYN_PAGE_BITS, pg1 = (a1 - 1) >> DYN_PAGE_BITS;
 	for (u32 p = pg0; p <= pg1 && p < DYN_NPAGES; p++) {   // con el delay slot del final
 		u32 base = p << DYN_PAGE_BITS, lo = p == pg0 ? a0 - base : 0, hi = p == pg1 ? a1 - base : 1u << DYN_PAGE_BITS;
 		if (!dyn_pages[p]) { code_lo[p] = (u16)lo; code_hi[p] = (u16)hi; dyn_pages[p] = 1; continue; }
@@ -1720,7 +1747,17 @@ static void branch_operands(u32 op, int *a, int *b, int tmp1, int tmp2)
 }
 
 // Traduce el bloque que empieza en pc; NULL si no se puede (se interpretará)
+static block_fn compile_block(u32 pc, block_fn *s);
 static block_fn compile(u32 pc, block_fn *s)
+{
+	block_fn f;
+	fetch_mark = 1;
+	f = compile_block(pc, s);
+	fetch_mark = 0;
+	return f;
+}
+
+static block_fn compile_block(u32 pc, block_fn *s)
 {
 	u32 *start, *entry, *cold_start, cur = pc;
 	int n = 0, tot = 0;   // n: instrucciones del tramo actual (para los ciclos); tot: de todo el superbloque
@@ -1730,7 +1767,6 @@ static block_fn compile(u32 pc, block_fn *s)
 	cold_start = cold_ptr;
 #ifdef PSX_SMCLOG
 	{ static u32 lf; if (lf != psx_frame_no && dyn_cmp_log.n < 8192) { lf = psx_frame_no; dyn_cmp_log.e[dyn_cmp_log.n++] = 0xff000000 | lf; } }
-	if (psx_frame_no >= 100 && dyn_cmp_log.n < 8192) dyn_cmp_log.e[dyn_cmp_log.n++] = pc;
 #endif
 	pv_start();
 	rng_start();
@@ -1848,6 +1884,11 @@ static block_fn compile(u32 pc, block_fn *s)
 				if (late) c = branch_cond(op, a, b);
 				else { a_dp_imm(C_AL, OP_CMP, 1, 0, R2, 0); c = C_NE; }
 				not_taken = fwd(c ^ 1);
+				if (idle) {
+#ifdef PSX_SMCLOG
+					if (dyn_cmp_log.n < 8190) { dyn_cmp_log.e[dyn_cmp_log.n++] = 0x1d1e0000 | (psyq_vsync(target) ? 1 : vsync_poll_call(target) ? 2 : 3); dyn_cmp_log.e[dyn_cmp_log.n++] = pc; }
+#endif
+				}
 				if (idle) emit_idle(target, psyq_vsync(target) ? (int)(fetch_op(target) & 0xffff) : -1);
 				else link_site(target);
 				land(not_taken);
@@ -1900,7 +1941,7 @@ static block_fn compile(u32 pc, block_fn *s)
 		emit(pc);
 		end_cold();
 	}
-	mark_pages(pc, cur);
+	mark_pages(pc, cur + 4);   // y el delay slot del final (fetch_op ya marcó lo que se leyó)
 	STAT_ADD(dyn_mips, (cur - pc) / 4 + 1);
 	STAT_ADD(dyn_arm, (u32)(emit_ptr - start));   // solo la zona caliente
 	sync_code(start, (u32)((u8 *)emit_ptr - (u8 *)start));

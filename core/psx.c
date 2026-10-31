@@ -4,6 +4,7 @@
 
 PSX_FAST u32 psx_cycles;
 PSX_FAST u32 psx_run_until;
+PSX_FAST u32 psx_sched_req;
 PSX_FAST u16 psx_cpu_scale = 256;
 void (*psx_line_cb)(void);
 u16 *psx_vram;
@@ -143,6 +144,9 @@ static void run_until(u32 end)
 		if (!TIME_BEFORE(psx_cycles, t)) t = psx_cycles + 1;
 #ifdef PSX_DYNAREC
 		dyn_run(t);   // el tiempo de CPU se mide una vez por frame (psx_run_frame): por línea costaba ~2%
+#elif defined(PSX_STEPIRQ)
+		psx_run_until = t;   // pruebas en el PC: como DYN_INTERP en la DS (interrupción mirada en cada instrucción)
+		while (TIME_BEFORE(psx_cycles, psx_run_until)) { if (cpu_dyn_irq()) { psx_cycles += 2; continue; } cpu_interp_step(); }
 #else
 		cpu_run(t);
 #endif
