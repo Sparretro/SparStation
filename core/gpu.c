@@ -848,6 +848,44 @@ static void hw_send(const Vtx *v, int n, int tex, int gour, int semi_on, int raw
 
 static void pend_touch(int x, int y, int w, int h);
 
+// Polígono del paquete de la DMA directo al dibujo por hardware: lo mismo que polygon() + hw_send() pero sin
+// copiar a la FIFO ni pasar por Vtx. 0 = no va a la pantalla (que lo haga polygon() por software).
+static int hw_poly_packet(const u32 *w)
+{
+	u32 cmd = w[0] >> 24, col = w[0] & 0xffffff, clut = 0;
+	int quad = cmd & 8, tex = cmd & 4, gour = cmd & 0x10, semi_on = cmd & 2, raw = cmd & 1, nv = quad ? 4 : 3, i = 1;
+	GpuHwVtx hv[4];
+	GpuHwPoly p;
+	if (!hw_screen()) return 0;
+	for (int k = 0; k < nv; k++) {
+		u32 xy;
+		if (k > 0 && gour) col = w[i++] & 0xffffff;
+		xy = w[i++];
+		hv[k].x = (s16)(sx11(xy) + g.off_x);
+		hv[k].y = (s16)(sx11(xy >> 16) + g.off_y);
+		hv[k].r = (u8)col;
+		hv[k].g = (u8)(col >> 8);
+		hv[k].b = (u8)(col >> 16);
+		if (tex) {
+			u32 uv = w[i++];
+			hv[k].u = (s16)(uv & 0xff);
+			hv[k].v = (s16)((uv >> 8) & 0xff);
+			if (k == 0) clut = uv >> 16;
+			if (k == 1) set_texpage(uv >> 16);
+		} else hv[k].u = hv[k].v = 0;
+	}
+	if (tex) use_texture(clut);
+	p.tex = tex ? (u8)(t_depth > 2 ? 3 : t_depth + 1) : 0;
+	p.raw = (u8)(tex && raw);
+	p.gouraud = (u8)(gour != 0);
+	p.semi = semi_on ? (u8)(g.semi + 1) : 0;
+	p.mask = (u8)(g.check_mask && g.set_mask);
+	p.tpx = (s16)t_px; p.tpy = (s16)t_py; p.cx = (s16)t_cx; p.cy = (s16)t_cy;
+	p.ox = (s16)hw_ox; p.oy = (s16)hw_oy;
+	gpu_hw->poly(hv, nv, &p);
+	return 1;
+}
+
 static void hw_dirty_area(void)   // algo dibujado por software fuera de la pantalla
 {
 	if (gpu_hw) pend_touch(g.da_x1, g.da_y1, g.da_x2 - g.da_x1 + 1, g.da_y2 - g.da_y1 + 1);
@@ -1231,6 +1269,14 @@ void gpu_write_gp0_n(const u32 *w, u32 n)
 	while (n) {
 		u32 need;
 		if (mode != M_CMD || fifo_n || (need = (u32)cmd_len(w[0] >> 24)) > n) { gpu_write_gp0(*w++); n--; continue; }
+#ifndef PSX_GPUSTAT
+		if (gpu_hw && (w[0] >> 29) == 1) {   // polígono (20h-3Fh) con dibujo por hardware: directo
+			u32 cmd = w[0] >> 24;
+			STAT_ADD(gpu_cmds, 1);
+			if (skip_frame) { w += need; n -= need; continue; }
+			if (hw_poly_packet(w)) { STAT_ADD(gpu_tris, (cmd & 8) ? 2 : 1); w += need; n -= need; continue; }
+		}
+#endif
 		for (u32 i = 0; i < need; i++) fifo[i] = w[i];
 		fifo_n = (int)need;
 		STAT_ADD(gpu_cmds, 1);
