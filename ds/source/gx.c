@@ -328,13 +328,23 @@ static void tex_ensure(TexEnt *t, int u, int v0, int v1)
 // polígono: una página que vuelve a la caché no se copia entera si el juego usa un trozo.
 static int tex_get(int x, int y, int depth, int cx, int cy, int v0, int v1)
 {
+	static int last = 0;   // los polígonos seguidos suelen usar la misma página
 	int units = units_of(depth), best = 0;
 	u32 best_age = 0;
+	{
+		TexEnt *t = &tex[last];
+		if (t->used && t->x == x && t->y == y && t->depth == depth) {
+			t->stamp = frame_no;
+			tex_ensure(t, last, v0, v1);
+			return last;
+		}
+	}
 	for (int i = 0; i < UNITS; i++) {
 		TexEnt *t = &tex[i];
 		if (t->used && t->x == x && t->y == y && t->depth == depth) {
 			t->stamp = frame_no;
 			tex_ensure(t, i, v0, v1);
+			last = i;
 			return i;
 		}
 	}
