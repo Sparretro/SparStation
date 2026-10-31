@@ -1859,6 +1859,11 @@ void dyn_scr_fail(u32 pc)
 	if (l < 0x200000) unlink_page(l >> DYN_PAGE_BITS, l, l + 4);
 }
 
+// PCs que compile() deja al intérprete (un salto con otro salto o un RFE en su delay slot, como el final de
+// las interrupciones de la BIOS): sin esto se intentaba traducirlos cada vez, cientos por segundo
+static u32 interp_only[64];
+static int is_interp_only(u32 pc) { return pc && interp_only[(pc >> 2) & 63] == pc; }
+
 // Lo llama el enlazador (stub_link) desde el final de un bloque: busca o traduce el destino y, si
 // se puede, cambia el BL de ese final por un salto directo. NULL = volver a C con cpu.pc = target.
 block_fn dyn_link(u32 target, u32 *site)
@@ -1871,9 +1876,10 @@ block_fn dyn_link(u32 target, u32 *site)
 	s = &slots[(l >> 2) & slot_mask];
 	f = *s;
 	if (!f || f[-1] != target) {
+		if (is_interp_only(target)) return NULL;
 		{ PROF_BEGIN(); f = compile(target, s); PROF_END(PROF_COMPILE); }
 		STAT_ADD(dyn_compiled, 1);
-		if (!f) return NULL;
+		if (!f) { interp_only[(target >> 2) & 63] = target; return NULL; }
 	}
 	if (gen != g0) return f;   // se vació la caché al traducir: el sitio ya no existe
 	if (l < 0x200000) {        // destino en RAM: apuntar el enlace por si se reescribe ese código
@@ -1914,10 +1920,11 @@ void dyn_run(u32 until)
 		if (!s) { dyn_where = 3; cpu_interp_step(); continue; }
 		f = *s;
 		if (!f || f[-1] != cpu.pc) {
+			if (is_interp_only(cpu.pc)) { dyn_where = 3; cpu_interp_step(); continue; }
 			dyn_where = 2;
 			{ PROF_BEGIN(); f = compile(cpu.pc, s); PROF_END(PROF_COMPILE); }
 			STAT_ADD(dyn_compiled, 1);
-			if (!f) { dyn_where = 3; cpu_interp_step(); continue; }
+			if (!f) { interp_only[(cpu.pc >> 2) & 63] = cpu.pc; dyn_where = 3; cpu_interp_step(); continue; }
 		}
 		dyn_where = 4;
 		dyn_enter(&cpu, psx_ram, dyn_pages, f);   // corre bloques encadenados hasta psx_run_until
