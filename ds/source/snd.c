@@ -232,7 +232,7 @@ void snd_init(int dsi)
 	soundPowerOn();
 	soundSetMixerVolume(127);
 	if (!spu_cache_mem) {   // caché de muestras en PCM: en modo DS (4 MB) solo cabe una pequeña
-		spu_cache_size = dsi ? 1536 * 1024 : SND_DS_CACHE_KB * 1024;
+		spu_cache_size = dsi ? 1024 * 1024 : SND_DS_CACHE_KB * 1024;
 		while (spu_cache_size >= 32 * 1024 && !(spu_cache_mem = memalign(32, spu_cache_size))) spu_cache_size /= 2;
 		if (!spu_cache_mem) spu_cache_size = 0;
 		printf("Sonido: cache %lu KB\n", spu_cache_size / 1024);

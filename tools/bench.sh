@@ -8,6 +8,8 @@ export DEVKITPRO=/opt/devkitpro DEVKITARM=/opt/devkitpro/devkitARM PATH=/opt/dev
 dir=$1; frames=${2:-6000}; snap=${3:-600}; name=${4:-$1}
 [ -f "ds/$dir/bios.bin" ] || cp bios/openbios.bin "ds/$dir/bios.bin"
 rm -f ds/SparStation_test.nds ds/SparStation_test.elf
+# make no ve los cambios de opciones: si EXTRA o la carpeta cambian, recompilar todo
+if [ "$(cat ds/build_test/.extra 2>/dev/null)" != "$dir $EXTRA" ]; then rm -rf ds/build_test; mkdir -p ds/build_test; echo "$dir $EXTRA" > ds/build_test/.extra; fi
 make -C ds SELFTEST=1 NITRODIR="$dir" EXTRA="$EXTRA" 2>&1 | grep -E "error|Error" && exit 1
 mkdir -p out/b
 cp ds/SparStation_test.nds "out/b/$name.nds"

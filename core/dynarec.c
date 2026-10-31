@@ -235,7 +235,7 @@ static void emit_stubs(void)
 		land(lookup);
 	}
 	// el hueco de la tabla es (dirección lineal >> 2) & slot_mask, que para RAM y BIOS sale de los mismos bits
-	a_movi(R2, (slot_mask << 2) & 0x7fffc);
+	a_movi(R2, (slot_mask << 2) & 0x1ffffc);   // RAM: los 2 MB (y sus espejos); BIOS: su desplazamiento
 	a_dp_reg(C_AL, OP_AND, 0, R1, R1, R2, SH_LSL, 0);
 	a_movi(R2, (u32)(uintptr_t)slots);
 	a_mem_reg(C_AL, 1, 0, R2, R2, R1);
@@ -261,9 +261,14 @@ static int near_cpu(const void *p, int extra, int *off)
 // big: DSi (16 MB) con espacio de sobra; si no, tamaños para una DS de 4 MB
 int dyn_init(int big)
 {
-	u32 nslots = big ? 0x20000 : DYN_DS_SLOTS;   // en el modo DS, pocos huecos: los bloques que chocan se retraducen
+	u32 nslots = big ? 0x80000 : DYN_DS_SLOTS;   // DSi: un hueco por instrucción de los 2 MB (si dos bloques chocan, se retraducen sin parar)
 	link_max = big ? 65536 : 4096;
+#ifdef DYN_SLOTS_AT
+	slots = (block_fn *)DYN_SLOTS_AT;   // banco de pruebas: tabla grande en el Expansion Pak
+	memset(slots, 0, nslots * sizeof(block_fn));
+#else
 	slots = calloc(nslots, sizeof(block_fn));
+#endif
 	links = malloc(link_max * sizeof(Link));
 	if (big) {
 		code_size = 3 * 1024 * 1024;
