@@ -168,18 +168,18 @@ static inline int clamp8(int v) { return v < -128 ? -128 : v > 127 ? 127 : v; }
 // Un macrobloque de 16x16 en color: escribe 24 o 15 bits por píxel
 static void yuv_block(const s16 *cr, const s16 *cb, const s16 *y, int xx, int yy, u8 *rgb)
 {
-	for (int py = 0; py < 8; py++)
-		for (int px = 0; px < 8; px++) {
-			int R = cr[((px + xx) >> 1) + ((py + yy) >> 1) * 8];
-			int B = cb[((px + xx) >> 1) + ((py + yy) >> 1) * 8];
-			int G = (-88 * B - 183 * R + 128) >> 8;
-			int Y = y[px + py * 8];
-			u8 *o = rgb + ((px + xx) + (py + yy) * 16) * 3;
-			R = (359 * R + 128) >> 8;
-			B = (454 * B + 128) >> 8;
-			o[0] = (u8)clamp8(Y + R);
-			o[1] = (u8)clamp8(Y + G);
-			o[2] = (u8)clamp8(Y + B);
+	// cada muestra de color sirve a 2x2 píxeles: sus términos se calculan una vez (mismas fórmulas que antes)
+	for (int cy = 0; cy < 4; cy++)
+		for (int cx = 0; cx < 4; cx++) {
+			int ci = cx + (xx >> 1) + (cy + (yy >> 1)) * 8, Rc = cr[ci], Bc = cb[ci];
+			int G = (-88 * Bc - 183 * Rc + 128) >> 8, R = (359 * Rc + 128) >> 8, B = (454 * Bc + 128) >> 8;
+			for (int d = 0; d < 4; d++) {
+				int px = cx * 2 + (d & 1), py = cy * 2 + (d >> 1), Y = y[px + py * 8];
+				u8 *o = rgb + ((px + xx) + (py + yy) * 16) * 3;
+				o[0] = (u8)clamp8(Y + R);
+				o[1] = (u8)clamp8(Y + G);
+				o[2] = (u8)clamp8(Y + B);
+			}
 		}
 }
 
