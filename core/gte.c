@@ -969,6 +969,22 @@ GTE_ENTRY(e_ncct, 12, ncc(0); ncc(1); ncc(2);)
 GTE_ENTRY(e_ncs, 12, nc(0);)
 GTE_ENTRY(e_nct, 12, nc(0); nc(1); nc(2);)
 
+// MVMVA directo en lo normal (matriz RT/LM/LC; traslación TR, BK o ninguna): lo mismo que gte_exec sin su
+// despacho. La matriz «3» (basura) y la traslación FC (con el fallo del hardware) siguen por gte_exec.
+static void e_mvmva(u32 op)
+{
+	int mx = (op >> 17) & 3, vv = (op >> 15) & 3, cv = (op >> 13) & 3;
+	s32 vx, vy, vz;
+	if (mx == 3 || cv == 2) { gte_exec(op); return; }
+	sf = (op >> 19) & 1 ? 12 : 0;
+	lm = (op >> 10) & 1;
+	FLAG = 0;
+	if (vv == 3) { vx = IR[1]; vy = IR[2]; vz = IR[3]; }
+	else { vx = V[vv][0]; vy = V[vv][1]; vz = V[vv][2]; }
+	mat_vec(mx == 0 ? RT : mx == 1 ? LM : LC, cv == 0 ? TR : cv == 1 ? BK : NULL, vx, vy, vz);
+	mac_to_ir();
+}
+
 void (*gte_entry(u32 op))(u32)
 {
 	int s12 = (op >> 19) & 1;
@@ -976,6 +992,7 @@ void (*gte_entry(u32 op))(u32)
 	case 0x06: return e_nclip;
 	case 0x2d: return e_avsz3;
 	case 0x2e: return e_avsz4;
+	case 0x12: return e_mvmva;
 	}
 	if (!s12) return gte_exec;   // el resto también directo: sin trampolín ni contar (MVMVA en Silent Hill)
 	switch (op & 0x3f) {
