@@ -62,12 +62,14 @@ static int rl_decode(s16 *blk, const u16 **src, const u16 *end, const u8 *qt)
 	q = (n >> 10) & 63;
 	k = 0;
 	val = s10(n) * qt[0];
+	int ac = 0;
 	for (;;) {
 		if (q == 0) val = s10(n) * 2;
 		if (val < -0x400) val = -0x400;
 		if (val > 0x3ff) val = 0x3ff;
 		if (q > 0) blk[zigzag[k]] = (s16)val;
 		else blk[k] = (s16)val;
+		if (k) ac |= val;
 		if (k >= 63 || p >= end) break;   // un bloque lleno termina sin código FE00h
 		n = *p++;
 		k += ((n >> 10) & 63) + 1;
@@ -75,7 +77,7 @@ static int rl_decode(s16 *blk, const u16 **src, const u16 *end, const u8 *qt)
 		val = (s10(n) * qt[k] * q + 4) / 8;
 	}
 	*src = p;
-	return 1;
+	return ac ? 1 : 2;   // 2: solo el coeficiente de continua (la IDCT es un relleno)
 }
 
 // ---- IDCT rápida (Loeffler, como jidctint de libjpeg) ----
@@ -163,6 +165,18 @@ static void idct(s16 *blk)
 	}
 }
 
+// IDCT con atajo: un bloque con solo la continua es un relleno (la misma cuenta que idct_fast)
+static void idct_dc(s16 *blk, int dc_only)
+{
+	if (dc_only && scale_is_standard) {
+		s16 v = (s16)DESC(blk[0] << P1, P1 + 3);
+		u32 vv = (u16)v | (u32)(u16)v << 16, *w = (u32 *)blk;
+		for (int i = 0; i < 32; i++) w[i] = vv;
+		return;
+	}
+	idct(blk);
+}
+
 static inline int clamp8(int v) { return v < -128 ? -128 : v > 127 ? 127 : v; }
 
 // Un macrobloque de 16x16 en color: escribe 24 o 15 bits por píxel
@@ -196,7 +210,7 @@ static void decode(void)
 			int ok = 1;
 			for (int b = 0; b < 6 && ok; b++) {
 				ok = rl_decode(blk[b], &p, end, b < 2 ? qt_c : qt_y);
-				if (ok) idct(blk[b]);
+				if (ok) idct_dc(blk[b], ok == 2);
 			}
 			if (!ok) break;
 			STAT_ADD(mdec_blocks, 1);
