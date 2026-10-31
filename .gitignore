@@ -14,3 +14,4 @@ tools/*.pdb
 tools/melonds/
 bios/
 *.map
+ds/nitro_klg2/
