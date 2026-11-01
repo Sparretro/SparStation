@@ -26,13 +26,14 @@ static void tm_irq(int i)
 	if (!(t->mode & 0x80)) t->mode |= 1 << 10;    // el pulso vuelve a 1 enseguida
 }
 
-static void tm_add(int i, u32 n)
+PSX_ITCM static void tm_add(int i, u32 n)
 {
 	Timer *t = &tm[i];
 	u32 old = t->count, c = old + n, tgt = t->target;
 	int hit_t = 0, hit_f = 0;
 	if (!n) return;
 	if (!(t->mode & 8) && c <= 0xffff && !(old < tgt && c >= tgt)) { t->count = c; return; }   // lo normal: solo contar
+	if (c < tgt) { t->count = c; return; }   // en modo «reinicia» (o no) sin llegar al objetivo: también solo contar
 	// llega al objetivo al pasar de debajo a >= objetivo; en modo «reinicia» cuenta 0..objetivo
 	hit_t = (old < tgt && c >= tgt) || (tgt == 0 && (t->mode & 8));
 	if (t->mode & 8) {
@@ -64,7 +65,7 @@ static int stopped(int i)
 
 static u32 lines_at(u32 c) { return (s32)(c - line_origin) > 0 ? (c - line_origin) / PSX_LINE_CYCLES : 0; }
 
-static void tm_sync(int i)
+PSX_ITCM static void tm_sync(int i)
 {
 	u32 n = psx_cycles - t_last[i];
 	if (!n) return;
@@ -80,7 +81,7 @@ static void tm_sync(int i)
 }
 
 // Al final de cada tramo y al leer I_STAT: solo los que pueden interrumpir (los demás se calculan al leerlos)
-void timers_sync(void)
+PSX_ITCM void timers_sync(void)
 {
 	for (int i = 0; i < 3; i++)
 		if (tm[i].mode & 0x30) tm_sync(i);
@@ -113,7 +114,7 @@ int timers_next_event(u32 *when)
 }
 
 
-u32 timer_read(u32 off)
+PSX_ITCM u32 timer_read(u32 off)
 {
 	int i = (off >> 4) & 3;
 	Timer *t;
