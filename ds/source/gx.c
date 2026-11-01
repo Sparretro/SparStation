@@ -93,7 +93,8 @@ static volatile int commit_on;
 #define STG_BYTES 0x18000
 static u8 *stg;
 static u32 com_stg[GX_NR];   // posición en stg de lo que espera de cada hueco
-static int staged;          // lo que espera está en stg
+static u32 stg_used;
+static volatile u32 staged; // bit k: lo que espera del hueco k está en stg (si no cabe, se espera como antes)
 
 // Se va a escribir [lo, hi) del hueco k (o de las paletas): si eso aún tiene que llegar a la VRAM para el
 // frame que se acaba de mandar, esperar a que llegue; luego se apunta como cambiado.
@@ -103,9 +104,21 @@ struct { char magic[8]; u32 n[16 + 64]; } gx_waits = { "SPGXWAIT" };   // n[16 +
 static void sh_mark(int k, u32 lo, u32 hi)
 {
 #ifdef GX_TEXLOG
-	if (commit_on && !staged && com_lo[k] < hi && lo < com_hi[k]) gx_waits.n[k]++;
+	if (commit_on && !(staged >> k & 1) && com_lo[k] < hi && lo < com_hi[k]) gx_waits.n[k]++;
 #endif
-	if (commit_on && !staged && com_lo[k] < hi && lo < com_hi[k]) while (commit_on) { }
+	if (commit_on && !(staged >> k & 1) && com_lo[k] < hi && lo < com_hi[k]) {
+		// se va a pisar algo que aún tiene que subir: se copia antes ese hueco a stg (solo cuando pasa; si no
+		// cabe, se espera a la vblank). Si la vblank llega durante la copia, sube la sombra, que aún no ha cambiado.
+		u32 clo = com_lo[k] & ~3u, chi = (com_hi[k] + 3) & ~3u;
+		if (stg && stg_used + (chi - clo) <= STG_BYTES) {
+			const u8 *src = k == GX_PAL ? (u8 *)sh_pal + clo : (u8 *)sh_tex + ((u32)k << 15) + clo;
+			memcpy(stg + stg_used, src, chi - clo);
+			DC_FlushRange(stg + stg_used, chi - clo);
+			com_stg[k] = stg_used;
+			stg_used += chi - clo;
+			staged |= 1u << k;
+		} else while (commit_on) { }
+	}
 	if (pend_lo[k] >= pend_hi[k]) { pend_lo[k] = lo; pend_hi[k] = hi; }
 	else { if (lo < pend_lo[k]) pend_lo[k] = lo; if (hi > pend_hi[k]) pend_hi[k] = hi; }
 }
@@ -140,7 +153,7 @@ void gx_vblank(void)
 		const u8 *src;
 		u8 *dst;
 		if (lo >= hi) continue;
-		src = staged ? stg + com_stg[k] : k == GX_PAL ? (const u8 *)sh_pal + lo : (const u8 *)sh_tex + ((u32)k << 15) + lo;
+		src = staged >> k & 1 ? stg + com_stg[k] : k == GX_PAL ? (const u8 *)sh_pal + lo : (const u8 *)sh_tex + ((u32)k << 15) + lo;
 		dst = k == GX_PAL ? (u8 *)bank_lcd(3) + lo : (u8 *)bank_lcd(bank) + ((u32)(k & 3) << 15) + lo;
 		bank_mode(bank, 1);
 		dmaCopyWords(2, src, dst, hi - lo);
@@ -801,24 +814,19 @@ static void gx_flip(int drawn)
 	STAGE(12);
 	if (sh_tex) {   // lo cambiado para este frame va a la VRAM en esa vblank (gx_vblank)
 		int any = 0;
-		u32 total = 0;
 		for (int k = 0; k < GX_NR; k++) {
 			com_lo[k] = pend_lo[k]; com_hi[k] = pend_hi[k];
 			pend_lo[k] = pend_hi[k] = 0;
-			if (com_lo[k] < com_hi[k]) total += ((com_hi[k] + 3) & ~3u) - (com_lo[k] & ~3u);
 		}
-		staged = stg && total <= STG_BYTES;
-		total = 0;
-		for (int k = 0; k < GX_NR; k++) {
+		staged = 0;
+		stg_used = 0;
+		for (int k = 0; k < GX_NR; k++) {   // stg solo se llena si el frame siguiente pisa algo antes de la vblank (sh_mark)
 			if (com_lo[k] < com_hi[k]) {
 				u32 lo = com_lo[k] & ~3u, hi = (com_hi[k] + 3) & ~3u;
-				const u8 *src = k == GX_PAL ? (u8 *)sh_pal + lo : (u8 *)sh_tex + ((u32)k << 15) + lo;
 				any = 1;
-				if (staged) { com_stg[k] = total; memcpy(stg + total, src, hi - lo); total += hi - lo; }
-				else DC_FlushRange(src, hi - lo);
+				DC_FlushRange(k == GX_PAL ? (u8 *)sh_pal + lo : (u8 *)sh_tex + ((u32)k << 15) + lo, hi - lo);
 			}
 		}
-		if (staged) DC_FlushRange(stg, total);
 		commit_on = any;
 	}
 	ln = npolys = nverts = 0;
