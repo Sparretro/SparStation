@@ -138,5 +138,6 @@ void dbg_fn_dump(void)
 	char *s = getenv("FN_DUMP");
 	if (!s || !pc_hist) return;
 	u32 a0 = (u32)strtoul(s, NULL, 16);
-	for (u32 a = a0; a < a0 + 0x200; a += 4) if (pc_hist[(a & 0x1fffff) >> 2]) printf("%08x %u\n", a, pc_hist[(a & 0x1fffff) >> 2]);
+	u32 len = getenv("FN_LEN") ? (u32)strtoul(getenv("FN_LEN"), NULL, 16) : 0x200;
+	for (u32 a = a0; a < a0 + len; a += 4) if (pc_hist[(a & 0x1fffff) >> 2]) { printf("%10u ", pc_hist[(a & 0x1fffff) >> 2]); mips_dis(a, bus_read32(a)); }
 }
