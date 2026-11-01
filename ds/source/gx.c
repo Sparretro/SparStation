@@ -91,8 +91,14 @@ static volatile int commit_on;
 
 // Se va a escribir [lo, hi) del hueco k (o de las paletas): si eso aún tiene que llegar a la VRAM para el
 // frame que se acaba de mandar, esperar a que llegue; luego se apunta como cambiado.
+#ifdef GX_TEXLOG
+struct { char magic[8]; u32 n[16]; } gx_waits = { "SPGXWAIT" };
+#endif
 static void sh_mark(int k, u32 lo, u32 hi)
 {
+#ifdef GX_TEXLOG
+	if (commit_on && com_lo[k] < hi && lo < com_hi[k]) gx_waits.n[k]++;
+#endif
 	if (commit_on && com_lo[k] < hi && lo < com_hi[k]) while (commit_on) { }
 	if (pend_lo[k] >= pend_hi[k]) { pend_lo[k] = lo; pend_hi[k] = hi; }
 	else { if (lo < pend_lo[k]) pend_lo[k] = lo; if (hi > pend_hi[k]) pend_hi[k] = hi; }
@@ -241,16 +247,16 @@ static void pal_dirty(int x, int y, int w, int h)
 	}
 }
 
-// ---- texturas: 192 huecos de 2 KB (banco B = huecos 0-63, D = 64-127, C = 128-191; el 176 es de la rampa) ----
+// ---- texturas: 384 huecos de 1 KB (banco B = huecos 0-127, D = 128-255, C = 256-383; el 352 es de la rampa) ----
 // Cada entrada es una banda de 16 a 256 filas (potencia de 2) de una página de la PS1, desde la fila del polígono
 // (la DS admite cualquier dirección): casi todos usan un trozo de su página, y así caben muchas más (Pepsiman usa
 // hasta unas 20 páginas por frame y con páginas enteras de 32 KB se echaban unas a otras sin parar).
 // depth 1/2/3 = página de 4/8/15 bits tal cual; 4 = página de 4 bits como A3I5 (8 bits por texel con alfa
 // por texel sacado del brillo de su color en la CLUT cx, cy: para las capas aditivas)
-#define NSUB 192
-#define SUB_BYTES 2048
-#define RAMP_SUB 176   // la rampa está en el byte 0x58000
-typedef struct { s16 x, y, cx, cy; u8 depth, units, used, start; u16 h; s16 next; u32 stamp, rows[8]; } TexEnt;   // used = 0: libre; rows: filas ya copiadas (bit = fila de la página); next: siguiente de su página
+#define NSUB 384
+#define SUB_BYTES 1024
+#define RAMP_SUB (0x58000 / SUB_BYTES)   // la rampa está en el byte 0x58000
+typedef struct { s16 x, y, cx, cy; u8 depth, units, used, start; u16 h; u8 hl; s16 next; u32 stamp, rows[8]; } TexEnt;   // used = 0: libre; rows: filas ya copiadas (bit = fila de la página); next: siguiente de su página
 static TexEnt tex[NSUB];     // la entrada i ocupa los huecos i .. i+units-1 (alineada a su tamaño)
 static s16 sub_owner[NSUB];   // entrada que ocupa cada hueco (-1: ninguna)
 static s16 page_head[128];    // primera entrada de cada página (32 páginas x 4 profundidades): buscar sin recorrer las 192
@@ -396,26 +402,42 @@ PSX_ITCM static int tex_get(int x, int y, int depth, int cx, int cy, int v0, int
 			last = i;
 			return i;
 		}
-	// la banda más pequeña (potencia de 2, desde 16 filas) que empieza a la altura del polígono y llega a sus filas
+	// la banda justa (en huecos de 1 KB, desde 8 filas) que empieza a la altura del polígono y llega a sus filas, en
+	// cualquier hueco: el 3D la ve con la altura potencia de 2 de encima (con repetición), pero los polígonos que la
+	// usan nunca pasan de sus filas (tex_has). Antes la altura era potencia de 2 y la banda iba alineada a su tamaño:
+	// una de 191 filas ocupaba 256 y en Pepsiman la memoria se llenaba y dos bandas se echaban una a otra en cada frame.
 	tc.ok = 0;   // puede echar la banda del último polígono
-	start = v0 & ~15;
-	for (h = 16; h < v1 - start + 1; h <<= 1) { }
-	if (start + h > 256) start = 256 - h;
-	units = h * dst_row(depth) / SUB_BYTES;
-	// el bloque alineado cuyo uso más reciente sea el más viejo (libre = viejísimo); los usados en este frame
-	// solo si no queda otro (el 3D dibuja el frame entero al final: pisarlos estropearía sus polígonos)
-	for (int i = 0; i + units <= NSUB; i += units) {
-		u32 newest = 0, age;
-		if (i <= RAMP_SUB && RAMP_SUB < i + units) continue;
-		for (int s = i; s < i + units; s++) {
-			int k = sub_owner[s];
-			if (k >= 0 && tex[k].used && tex[k].stamp + 1 > newest) newest = tex[k].stamp + 1;
+	{
+		int rb = dst_row(depth), per = SUB_BYTES / rb;   // filas por hueco (2, 4 u 8)
+		start = v0 & ~3;
+		h = v1 - start + 1;
+		if (h < 8) h = 8;
+		h = (h + per - 1) / per * per;
+		if (start + h > 256) start = 256 - h;
+		units = h * rb / SUB_BYTES;
+	}
+	// los huecos seguidos cuyo uso más reciente sea el más viejo (libre = viejísimo); los usados en este frame
+	// solo si no queda otro (el 3D dibuja el frame entero al final: pisarlos estropearía sus polígonos). A igual
+	// edad, el sitio que echa menos huecos ocupados.
+	{
+		u32 best_ev = 0;
+		for (int i = 0; i + units <= NSUB; i++) {
+			u32 newest = 0, age, ev = 0;
+			int prev = -1;
+			if (i <= RAMP_SUB && RAMP_SUB < i + units) continue;
+			for (int s = i; s < i + units; s++) {
+				int k = sub_owner[s];
+				if (k < 0 || !tex[k].used || k == prev) continue;
+				prev = k;
+				ev += tex[k].units;
+				if (tex[k].stamp + 1 > newest) newest = tex[k].stamp + 1;
+			}
+			age = frame_no + 1 - newest;   // 0: usado en este frame
+			if (best < 0 || age > best_age || (age == best_age && ev < best_ev)) { best_age = age; best = i; best_ev = ev; }
 		}
-		age = frame_no + 1 - newest;   // 0: usado en este frame
-		if (best < 0 || age > best_age) { best_age = age; best = i; }
 	}
 #ifdef GX_TEXLOG
-	if (gx_texlog.n < 4094) { gx_texlog.e[gx_texlog.n++] = (u32)x | (u32)y << 10 | (u32)depth << 19 | (u32)(best & 3) << 22 | (frame_no & 0xff) << 24; gx_texlog.e[gx_texlog.n++] = (u32)v0 | (u32)v1 << 8 | (u32)best << 16 | (u32)h << 22; }
+	if (gx_texlog.n < 4094) { gx_texlog.e[gx_texlog.n++] = (u32)x | (u32)y << 10 | (u32)depth << 19 | (u32)(best & 3) << 22 | (frame_no & 0xff) << 24; gx_texlog.e[gx_texlog.n++] = (u32)v0 | (u32)v1 << 8 | (u32)best << 16 | (u32)(h - 1) << 24; }
 #endif
 	for (int s = best; s < best + units; s++) {   // fuera lo que ocupaba esos huecos
 		int k = sub_owner[s];
@@ -434,6 +456,7 @@ PSX_ITCM static int tex_get(int x, int y, int depth, int cx, int cy, int v0, int
 	tex[best].x = (s16)x; tex[best].y = (s16)y; tex[best].cx = (s16)cx; tex[best].cy = (s16)cy;
 	tex[best].depth = (u8)depth; tex[best].units = (u8)units; tex[best].used = 1; tex[best].stamp = frame_no;
 	tex[best].start = (u8)start; tex[best].h = (u16)h;
+	for (tex[best].hl = 3; (1 << tex[best].hl) < h; tex[best].hl++) { }   // altura para el 3D: potencia de 2
 	memset(tex[best].rows, 0, sizeof tex[best].rows);
 	tex_ensure(&tex[best], best, v0, v1);
 	STAT_ADD(tex_bands, 1);
@@ -510,7 +533,7 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 			c0 = psx_vram[p->cy * 1024 + p->cx] == 0;   // índice 0 transparente si su color es 0
 		}
 		vbase = tex[u].start;
-		teximg = ((u32)u << 8) | (1u << 16) | (1u << 17) | (5u << 20) | ((u32)(__builtin_ctz(tex[u].h) - 3) << 23) | ((u32)fmt << 26) | ((u32)c0 << 29);
+		teximg = ((u32)u * (SUB_BYTES / 8)) | (1u << 16) | (1u << 17) | (5u << 20) | ((u32)(tex[u].hl - 3) << 23) | ((u32)fmt << 26) | ((u32)c0 << 29);
 	}
 	alpha = alpha_of[p->semi];
 	if (addlike) {
@@ -636,7 +659,7 @@ PSX_ITCM static void gx_poly_raw(const u32 *w, const GpuHwRaw *r)
 				c0 = psx_vram[r->cy * 1024 + r->cx] == 0;
 			}
 			vbase = tex[u].start;
-			teximg = ((u32)u << 8) | (1u << 16) | (1u << 17) | (5u << 20) | ((u32)(__builtin_ctz(tex[u].h) - 3) << 23) | ((u32)fmt << 26) | ((u32)c0 << 29);
+			teximg = ((u32)u * (SUB_BYTES / 8)) | (1u << 16) | (1u << 17) | (5u << 20) | ((u32)(tex[u].hl - 3) << 23) | ((u32)fmt << 26) | ((u32)c0 << 29);
 			tc.tpx = r->tpx; tc.tpy = r->tpy; tc.cx = r->cx; tc.cy = r->cy; tc.td = (u8)td;
 			tc.v0 = (s16)vmin; tc.v1 = (s16)vmax;
 			tc.teximg = teximg; tc.pltt = pltt; tc.lum = lum; tc.vbase = vbase;
@@ -768,6 +791,13 @@ static void gx_flip(int drawn)
 	}
 	ln = npolys = nverts = 0;
 	blk_attr = ~0u;   // lista nueva: sin bloque abierto
+#ifdef GX_TEXLOG
+	{   // marca de fin de frame: huecos ocupados por bandas usadas en este frame y ocupados en total
+		u32 now = 0, occ = 0;
+		for (int i = 0; i < NSUB; i++) if (tex[i].used) { occ += tex[i].units; if (tex[i].stamp == frame_no) now += tex[i].units; }
+		if (gx_texlog.n < 4094) { gx_texlog.e[gx_texlog.n++] = 0xffffffffu; gx_texlog.e[gx_texlog.n++] = now | occ << 16; }
+	}
+#endif
 	frame_no++;
 	STAGE(13);
 	gx_bg_hidden = opaque;
