@@ -407,9 +407,22 @@ int main(int argc, char **argv)
 			if (!sf || !psx_state_load(state_read, sf)) { fprintf(stderr, "no carga el estado %s\n", argv[i + 1]); return 1; }
 			fclose(sf);
 		}
+	for (int i = 1; i + 1 < argc; i++)   // --cht archivo: códigos GameShark
+		if (!strcmp(argv[i], "--cht")) {
+			u32 n;
+			char *t = (char *)load_file(argv[i + 1], &n);
+			if (!t) { fprintf(stderr, "no abre %s\n", argv[i + 1]); return 1; }
+			t = realloc(t, n + 1);
+			t[n] = 0;
+			printf("códigos: %d\n", cheat_parse(t));
+			free(t);
+		}
 	t0 = clock();
 	for (int f = 1; f <= frames; f++) {
 		profiling = f > frames - 60;
+#ifdef DBG_IDLE
+		{ extern int dbg_idle_on; dbg_idle_on = f > frames - (getenv("IDLE_FRAMES") ? atoi(getenv("IDLE_FRAMES")) : 300); }
+#endif
 		{ extern int gpudump; gpudump = f > frames - 6; }
 #ifdef PSX_OPSTAT
 		{ extern int psx_opstat_on; psx_opstat_on = profiling; }
@@ -497,6 +510,11 @@ int main(int argc, char **argv)
 	for (int i = 1; i + 1 < argc; i++)
 		if (!strcmp(argv[i], "--ref")) printf("VRAM_DIFF %d\n", vram_diff(argv[i + 1]));
 	if (want_prof) report_profile();
+#ifdef DBG_IDLE
+	{ extern void dbg_idle_report(void); dbg_idle_report(); }
+	{ extern void dbg_fn_report(void); dbg_fn_report(); }
+	{ extern void dbg_fn_dump(void); dbg_fn_dump(); }
+#endif
 #ifdef DBG_IRQCOUNT
 	{ extern u32 dbg_irq_count[11], dbg_exc_count; static const char *nm[11] = { "vblank", "gpu", "cdrom", "dma", "tmr0", "tmr1", "tmr2", "pad", "sio", "spu", "lpen" };
 	  for (int i = 0; i < 11; i++) if (dbg_irq_count[i]) printf("IRQ %s: %u\n", nm[i], dbg_irq_count[i]);

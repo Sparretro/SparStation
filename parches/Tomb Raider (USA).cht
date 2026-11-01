@@ -1,0 +1,31 @@
+; Tomb Raider (USA) - parches de SparStation (códigos GameShark, se aplican en cada vblank)
+; Ponlo junto al juego con el mismo nombre que el .cue:  sd:/ps1/Tomb Raider (USA).cht
+;
+; DISTANCIA DE DIBUJADO. El juego no dibuja lo que está a más de 20 bloques (20481 en el código).
+; Con 16 bloques (activado): -8 % de polígonos, +4 % de velocidad y +9 % de imágenes por segundo en la
+; prueba, y la imagen se ve igual (lo de lejos ya estaba casi negro por la niebla).
+; Cada pareja: «si la instrucción sigue siendo la original (D0 ... 2BC1), cambia el número».
+[distancia 16 bloques]
+D0010246 2BC1
+80010244 4001
+D001024E 2BC1
+8001024C 4001
+D001065E 2BC1
+8001065C 4001
+D001134A 2BC1
+80011348 4001
+D0011872 2BC1
+80011870 4001
+;
+; Más agresivo, 12 bloques (-15 % de polígonos): se nota, desaparecen cosas al fondo de los pasillos.
+; Para usarlo, borra el grupo de arriba y quita el «;» de estas líneas.
+;D0010246 2BC1
+;80010244 3001
+;D001024E 2BC1
+;8001024C 3001
+;D001065E 2BC1
+;8001065C 3001
+;D001134A 2BC1
+;80011348 3001
+;D0011872 2BC1
+;80011870 3001

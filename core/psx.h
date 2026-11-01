@@ -232,6 +232,12 @@ void dma_mdec_kick(void);   // el MDEC tiene datos nuevos: reanuda el DMA de sal
 
 // ---- mandos (SIO0) ----
 extern u16 psx_pad_buttons;   // activo en bajo, formato de la PS1
+
+// ---- parches GameShark (core/cheat.c): se aplican en cada vblank ----
+void cheat_clear(void);
+int cheat_parse(const char *text);   // añade los códigos de un texto (.cht); devuelve cuántos
+int cheat_count(void);
+void cheat_apply(void);
 extern u8 *psx_memcard;           // tarjeta de memoria de la ranura 1 (128 KB) o NULL
 extern u32 psx_memcard_writes;    // sectores escritos desde el arranque (el frontend guarda al ver cambios)
 void sio_memcard_reset(void);     // tarjeta recién puesta (bandera de «nueva»)

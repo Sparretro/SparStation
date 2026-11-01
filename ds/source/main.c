@@ -394,6 +394,20 @@ static int nwram_init(void)
 static char card_path[256];
 static u32 card_saved_writes, card_quiet, card_wait;
 
+// Parches GameShark de un archivo de texto (Juego.cht): devuelve cuántos códigos se leyeron
+static int load_cht(const char *path)
+{
+	static char text[16384];
+	FILE *f = fopen(path, "rb");
+	size_t n;
+	cheat_clear();
+	if (!f) return 0;
+	n = fread(text, 1, sizeof text - 1, f);
+	text[n] = 0;
+	fclose(f);
+	return cheat_parse(text);
+}
+
 static void card_open(const char *game)
 {
 	FILE *f;
@@ -883,10 +897,11 @@ static void run_loop(const char *title, int use_log)
 	prof_start("");   // melonDS: dsbench lee las muestras de la RAM (DSB_PROF)
 #endif
 	if (title) {
-		char info[64], nw[24];
+		char info[96], nw[24];
 		if (nwram_ok) snprintf(nw, sizeof nw, "%s", opt_nwram ? "NWRAM" : "RAM");
 		else snprintf(nw, sizeof nw, "RAM (sin NWRAM: %s)", nwram_why[0] ? nwram_why : "?");
-		snprintf(info, sizeof info, "%s, salto %d, CPU %s, codigo %s", quality_name[opt_quality], opt_skip, cpu_name(), nw);
+		snprintf(info, sizeof info, "%s, salto %d, CPU %s, codigo %s%s", quality_name[opt_quality], opt_skip, cpu_name(), nw,
+		         cheat_count() ? ", parches" : "");
 		hud_start(title, use_log, info);
 	}
 #ifdef STACK_PROBE
@@ -1012,6 +1027,7 @@ int main(void)
 		} else if (nitro && open_subset()) {
 			printf("Modo DS: disco reducido\n");
 			psx_fastboot = 1;
+			if (load_cht("nitro:/disc.cht")) printf("Parches: si\n");
 		} else printf("Modo DS: demo de la BIOS.\nLos juegos necesitan modo DSi.\n");
 #ifdef DYN_HOT_TEST
 		{   // EXTRA=-DDYN_HOT_TEST=KB: zona caliente en otro búfer, como con la NWRAM de la DSi (melonDS no la tiene en modo DS).
@@ -1075,6 +1091,11 @@ int main(void)
 	snd_enable(opt_snd);
 	snprintf(state_path, sizeof state_path, "%.*s.sst", (int)(strrchr(card_path, '.') - card_path), card_path);
 	snprintf(game_cfg, sizeof game_cfg, "%.*s.cfg", (int)(strrchr(card_path, '.') - card_path), card_path);
+	{   // parches GameShark del juego (Juego.cht junto al .cue), si los hay
+		char cht[256];
+		snprintf(cht, sizeof cht, "%.*s.cht", (int)(strrchr(card_path, '.') - card_path), card_path);
+		load_cht(cht);
+	}
 	psx_fastboot = 1;   // sin la animación de la BIOS (unos 25 s en la DSi)
 	psx_reset();
 	apply_cfg();

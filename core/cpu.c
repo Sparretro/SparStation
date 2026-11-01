@@ -441,6 +441,10 @@ void cpu_run(u32 until)
 		if (cpu.lr) { cpu.r[cpu.lr] = cpu.lv; cpu.lr = 0; }
 #endif
 		cpu.r[0] = 0;
+#ifdef DBG_IDLE
+		{ extern void dbg_idle_step(u32 op, u32 cur, u32 next); dbg_idle_step(op, cpu.cur_pc, cpu.pc); }
+		{ extern void dbg_fn_step(u32 op, u32 cur, u32 next); dbg_fn_step(op, cpu.cur_pc, cpu.pc); }
+#endif
 
 #ifdef PSX_BLOCKY
 		blk_pending += 2;

@@ -177,6 +177,7 @@ void psx_run_frame(void)
 		if (psx_line_cb) psx_line_cb();
 		line += k;
 		if (line == PSX_VBLANK_LINE) {
+			if (cheat_count()) cheat_apply();
 			psx_irq(PSX_IRQ_VBLANK);
 			gpu_vblank();
 		}
