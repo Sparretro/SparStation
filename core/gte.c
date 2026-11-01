@@ -358,7 +358,31 @@ GTE_INL void rtp_s(int vi, int last, int s)
 }
 
 // con sf fijo (12 o 0) los desplazamientos de 64 bits salen mucho más cortos
-static __attribute__((noinline)) void rtp12(int vi, int last) { rtp_s(vi, last, 12); }   // una copia por desplazamiento (la ITCM va justa)
+// una copia por desplazamiento. La de 12 solo la usa rtp12f si |TR| es enorme (nunca en los juegos medidos): en la DS
+// va con lo frío a la RAM principal (2 KB menos de ITCM). Ojo: las static (lm, sf, unr) son otras en la copia fría,
+// así que lm se pasa y la tabla de divisiones se rellena allí.
+#if defined(GTE_HOT_ONLY)
+void gte_rtp12_cold(int vi, int last, int lm_);
+#define rtp12(vi, last) gte_rtp12_cold(vi, last, lm)
+#elif defined(GTE_COLD_ONLY)
+void gte_rtp12_cold(int vi, int last, int lm_);
+void gte_rtp12_cold(int vi, int last, int lm_)
+{
+	if (!unr_ready) {
+		for (int i = 0; i < 257; i++) {
+			int v = (0x40000 / (i + 0x100) + 1) / 2 - 0x101;
+			unr[i] = (u8)(v > 0 ? v : 0);
+		}
+		unr_ready = 1;
+	}
+	sf = 12;
+	lm = lm_;
+	rtp_s(vi, last, 12);
+}
+#define rtp12(vi, last) gte_rtp12_cold(vi, last, lm)
+#else
+static __attribute__((noinline)) void rtp12(int vi, int last) { rtp_s(vi, last, 12); }
+#endif
 static __attribute__((noinline)) void rtp0(int vi, int last) { rtp_s(vi, last, 0); }
 static void rtp12f(int vi, int last);
 static void rtp(int vi, int last) { if (sf) rtp12f(vi, last); else rtp0(vi, last); }
