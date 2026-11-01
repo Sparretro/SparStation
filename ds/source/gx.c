@@ -642,6 +642,36 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 
 static inline int sx11(u32 v) { return ((s32)(v << 21)) >> 21; }
 
+// Vértices del caso más común de gx_poly_raw (textura modulada por el color, sin rampa: casi todo en Pepsiman y
+// Tomb Raider): copia aparte con plano/gouraud fijo, así el bucle no tiene que mirar el tipo y caben más cosas en
+// registros. Escribe lo mismo que el bucle general.
+static inline __attribute__((always_inline)) u32 *vtx_mod(u32 *o, const u32 *w, const u32 *const *vp, int n, const GpuHwRaw *r,
+                                                          int vbase, u32 z, const int gour)
+{
+	const s32 dx = r->dx, dy = r->dy, sx = kx, sy = ky;
+	for (int k = 0; k < n; k++) {
+		int j = n == 4 && k >= 2 ? 5 - k : k;   // 0, 1, 3, 2
+		const u32 *q = vp[j];
+		u32 xy = q[0], vtx = k ? 0x25 : 0x23, uv = q[1];
+		s32 x = (((sx11(xy) + dx) * sx) >> 8) - 4096, y = 4096 - (((sx11(xy >> 16) + dy) * sy) >> 8);
+		if ((u32)(x + 32768) > 0xffff) x = x < 0 ? -32768 : 32767;
+		if ((u32)(y + 32768) > 0xffff) y = y < 0 ? -32768 : 32767;
+		if (k == 0 || gour) {
+			u32 c = j && gour ? q[-1] : w[0];
+			u32 col = mod5t[c & 0xff] | ((u32)mod5t[(c >> 8) & 0xff] << 5) | ((u32)mod5t[(c >> 16) & 0xff] << 10);
+			*o++ = 0x20 | (0x22 << 8) | (vtx << 16);
+			*o++ = col;
+			GXH(col);
+		} else *o++ = 0x22 | (vtx << 8);
+		*o++ = ((u32)((int)((uv >> 8) & 0xff) - vbase) << 4 << 16) | (((uv & 0xff) << 4) & 0xffff);
+		GXH(o[-1]);
+		*o++ = ((u32)y << 16) | ((u32)x & 0xffff);
+		GXH(o[-1]);
+		if (!k) *o++ = z;
+	}
+	return o;
+}
+
 // Lo mismo que gx_poly, leyendo los vértices del paquete de la PS1 (gpu.c, hw_poly_packet) sin pasar por GpuHwVtx.
 // Con la misma cabecera que el anterior sigue en su bloque; los vértices después del primero van con VTX_XY (la z
 // es la del polígono entero). Mismos vértices, colores y profundidades que gx_poly: la imagen es la misma.
@@ -733,7 +763,8 @@ PSX_ITCM static void gx_poly_raw(const u32 *w, const GpuHwRaw *r)
 #ifdef GX_TEXLOG
 		gx_waits.n[16 + (cm << 4 | flat << 3 | textured << 2 | ramp << 1 | (n == 4))]++;
 #endif
-		for (int k = 0; k < n; k++) {
+		if (cm == CM_MOD && textured && !ramp) o = gour ? vtx_mod(o, w, vp, n, r, vbase, z, 1) : vtx_mod(o, w, vp, n, r, vbase, z, 0);
+		else for (int k = 0; k < n; k++) {
 			int j = n == 4 ? order[k] : k;
 			u32 xy = vp[j][0], c = j && gour ? vp[j][-1] : w[0], vtx = k ? 0x25 : 0x23;   // VTX_16 el primero, VTX_XY los demás
 			int qr = c & 0xff, qg = (c >> 8) & 0xff, qb = (c >> 16) & 0xff;
