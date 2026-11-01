@@ -523,6 +523,11 @@ int main(int argc, char **argv)
 #ifdef PSX_DBGCNT
 	{ extern unsigned dbg_cut[4]; printf("cortes por frame: fin %u cd %u sio %u tmr %u\n", dbg_cut[0] / frames, dbg_cut[1] / frames, dbg_cut[2] / frames, dbg_cut[3] / frames); }
 #endif
+#ifdef PSX_GTESTAT
+	{ extern u32 gte_mv[256]; for (int k = 0; k < 256; k++) if (gte_mv[k]) printf("MVMVA sf=%d mx=%d v=%d cv=%d lm=%d  %8.0f/frame\n", k >> 7, (k >> 5) & 3, (k >> 3) & 3, (k >> 1) & 3, k & 1, gte_mv[k] / (double)frames); }
+	{ extern u32 gte_hist[64]; static const char *gn[64] = { [1]="RTPS",[6]="NCLIP",[0xc]="OP",[0x10]="DPCS",[0x11]="INTPL",[0x12]="MVMVA",[0x13]="NCDS",[0x14]="CDP",[0x16]="NCDT",[0x1b]="NCCS",[0x1c]="CC",[0x1e]="NCS",[0x20]="NCT",[0x28]="SQR",[0x29]="DCPL",[0x2a]="DPCT",[0x2d]="AVSZ3",[0x2e]="AVSZ4",[0x30]="RTPT",[0x3d]="GPF",[0x3e]="GPL",[0x3f]="NCCT" };
+	  for (int k = 0; k < 64; k++) if (gte_hist[k]) printf("GTE %-6s %8.0f/frame\n", gn[k] ? gn[k] : "?", gte_hist[k] / (double)frames); }
+#endif
 #ifdef PSX_GPUSTAT
 	{
 		extern u32 gpustat[16];

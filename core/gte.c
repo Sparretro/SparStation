@@ -298,9 +298,27 @@ GTE_INL s64 mat_row(const s16 *m, const s32 *add, int i, s32 vx, s32 vy, s32 vz)
 	return t + (s64)(m[0] * vx) + (s64)(m[1] * vy) + (s64)(m[2] * vz);
 }
 
+// Con el desplazamiento fijo (0 o 12) y sumas de 64 bits con SMLAL: antes cada fila desplazaba 64 bits por sf
+// variable y recargaba los factores de la pila (~120 ciclos por llamada; Pepsiman hace ~22000 por segundo)
+GTE_INL void mat_vec_s(s16 m[3][3], const s32 *add, s32 vx, s32 vy, s32 vz, int s)
+{
+	if (add && (((u32)(add[0] + 0x40000000) | (u32)(add[1] + 0x40000000) | (u32)(add[2] + 0x40000000)) & 0x80000000u)) {
+		for (int i = 0; i < 3; i++) MAC[i + 1] = (s32)(mat_row(m[i], add, i, vx, vy, vz) >> s);
+		return;
+	}
+	for (int i = 0; i < 3; i++) {
+		s64 t = add ? (s64)add[i] << 12 : 0;
+		t += (s64)m[i][0] * vx;
+		t += (s64)m[i][1] * vy;
+		t += (s64)m[i][2] * vz;
+		MAC[i + 1] = (s32)(t >> s);
+	}
+}
+
 static void mat_vec(s16 m[3][3], const s32 *add, s32 vx, s32 vy, s32 vz)
 {
-	for (int i = 0; i < 3; i++) MAC[i + 1] = (s32)(mat_row(m[i], add, i, vx, vy, vz) >> sf);
+	if (sf) mat_vec_s(m, add, vx, vy, vz, 12);
+	else mat_vec_s(m, add, vx, vy, vz, 0);
 }
 
 GTE_INL void rtp_s(int vi, int last, int s)
@@ -969,12 +987,15 @@ void gte_state(PsxState *s)
 	STATE(s, FLAG);
 }
 
+#ifdef PSX_GTESTAT
+u32 gte_hist[64], gte_mv[256];
+#endif
 void gte_command(u32 op)
 {
 	// sin PROF_BEGIN/END: se llama miles de veces por frame y medir costaba casi tanto como calcular
 	STAT_ADD(gte_ops, 1);
 #ifdef PSX_GTESTAT
-	{ extern u32 gte_hist[64]; gte_hist[op & 0x3f]++; }
+	{ extern u32 gte_hist[64], gte_mv[256]; gte_hist[op & 0x3f]++; if ((op & 0x3f) == 0x12) gte_mv[((op >> 19) & 1) << 5 | ((op >> 17) & 3) << 3 | ((op >> 15) & 3) << 1 | ((op >> 10) & 1)]++; }
 #endif
 	gte_exec(op);
 }
