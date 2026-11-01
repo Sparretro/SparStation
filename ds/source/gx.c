@@ -98,7 +98,7 @@ static int staged;          // lo que espera está en stg
 // Se va a escribir [lo, hi) del hueco k (o de las paletas): si eso aún tiene que llegar a la VRAM para el
 // frame que se acaba de mandar, esperar a que llegue; luego se apunta como cambiado.
 #ifdef GX_TEXLOG
-struct { char magic[8]; u32 n[16]; } gx_waits = { "SPGXWAIT" };
+struct { char magic[8]; u32 n[16 + 64]; } gx_waits = { "SPGXWAIT" };   // n[16 + combinación]: polígonos de gx_poly_raw por tipo
 #endif
 static void sh_mark(int k, u32 lo, u32 hi)
 {
@@ -391,23 +391,13 @@ static int tex_has(const TexEnt *t, int x, int y, int depth, int v0, int v1)
 #ifdef GX_TEXLOG
 struct { char magic[8]; u32 n, e[4096]; } gx_texlog = { "SPTEXLOG" };
 #endif
-PSX_ITCM static int tex_get(int x, int y, int depth, int cx, int cy, int v0, int v1)
+static int tex_last;   // los polígonos seguidos suelen usar la misma página
+
+// Banda nueva: fuera de la ITCM (unas 30 por segundo; buscar sitio ocupa mucho código)
+static __attribute__((noinline)) int tex_new(int x, int y, int depth, int cx, int cy, int v0, int v1)
 {
-	static int last = 0;   // los polígonos seguidos suelen usar la misma página
 	int h, start, units, best = -1;
 	u32 best_age = 0;
-	if (tex_has(&tex[last], x, y, depth, v0, v1)) {
-		tex[last].stamp = frame_no;
-		tex_ensure(&tex[last], last, v0, v1);
-		return last;
-	}
-	for (int i = page_head[page_key(x, y, depth)]; i >= 0; i = tex[i].next)
-		if (tex_has(&tex[i], x, y, depth, v0, v1)) {
-			tex[i].stamp = frame_no;
-			tex_ensure(&tex[i], i, v0, v1);
-			last = i;
-			return i;
-		}
 	// la banda justa (en huecos de 1 KB, desde 8 filas) que empieza a la altura del polígono y llega a sus filas, en
 	// cualquier hueco: el 3D la ve con la altura potencia de 2 de encima (con repetición), pero los polígonos que la
 	// usan nunca pasan de sus filas (tex_has). Antes la altura era potencia de 2 y la banda iba alineada a su tamaño:
@@ -467,8 +457,26 @@ PSX_ITCM static int tex_get(int x, int y, int depth, int cx, int cy, int v0, int
 	memset(tex[best].rows, 0, sizeof tex[best].rows);
 	tex_ensure(&tex[best], best, v0, v1);
 	STAT_ADD(tex_bands, 1);
-	last = best;
+	tex_last = best;
 	return best;
+}
+
+PSX_ITCM static int tex_get(int x, int y, int depth, int cx, int cy, int v0, int v1)
+{
+	int last = tex_last;
+	if (tex_has(&tex[last], x, y, depth, v0, v1)) {
+		tex[last].stamp = frame_no;
+		tex_ensure(&tex[last], last, v0, v1);
+		return last;
+	}
+	for (int i = page_head[page_key(x, y, depth)]; i >= 0; i = tex[i].next)
+		if (tex_has(&tex[i], x, y, depth, v0, v1)) {
+			tex[i].stamp = frame_no;
+			tex_ensure(&tex[i], i, v0, v1);
+			tex_last = i;
+			return i;
+		}
+	return tex_new(x, y, depth, cx, cy, v0, v1);
 }
 
 // Rampa de transparencia: textura A5I3 de 32x8 en el hueco 11 con alfa = columna (0-31) y color blanco.
@@ -625,7 +633,11 @@ static inline int sx11(u32 v) { return ((s32)(v << 21)) >> 21; }
 // Con la misma cabecera que el anterior sigue en su bloque; los vértices después del primero van con VTX_XY (la z
 // es la del polígono entero). Mismos vértices, colores y profundidades que gx_poly: la imagen es la misma.
 // En la ITCM: en la DSi real (perfil de Tomb Raider, v25) era el 7% del tiempo, repartido por toda la función
+#ifdef GX_TEXLOG
+static void gx_poly_raw(const u32 *w, const GpuHwRaw *r)   // con los contadores no cabe en la ITCM
+#else
 PSX_ITCM static void gx_poly_raw(const u32 *w, const GpuHwRaw *r)
+#endif
 {
 	static const u8 alpha_of[5] = { 31, 16, 16, 14, 8 };
 	static const u8 order[4] = { 0, 1, 3, 2 };
@@ -705,6 +717,9 @@ PSX_ITCM static void gx_poly_raw(const u32 *w, const GpuHwRaw *r)
 		else if (!td) cm = CM_RGB;
 		else if (raw) { cm = CM_CONST; kcol = 0x7fff; }
 		else cm = CM_MOD;
+#ifdef GX_TEXLOG
+		gx_waits.n[16 + (cm << 4 | flat << 3 | textured << 2 | ramp << 1 | (n == 4))]++;
+#endif
 		for (int k = 0; k < n; k++) {
 			int j = n == 4 ? order[k] : k;
 			u32 xy = vp[j][0], c = j && gour ? vp[j][-1] : w[0], vtx = k ? 0x25 : 0x23;   // VTX_16 el primero, VTX_XY los demás
