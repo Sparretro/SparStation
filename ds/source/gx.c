@@ -88,6 +88,12 @@ static u16 *sh_tex, *sh_pal;   // NULL: sin memoria, se escribe directo en la VR
 static u32 pend_lo[GX_NR], pend_hi[GX_NR];          // bytes cambiados desde el último cambio de buffer
 static u32 com_lo[GX_NR], com_hi[GX_NR];            // los que esperan a la próxima vblank
 static volatile int commit_on;
+// Copia aparte de lo que espera a la vblank: así el frame siguiente puede escribir en la sombra sin esperar a que
+// llegue (antes sh_mark se quedaba parado hasta la vblank si tocaba esa zona: un 14 % del tiempo en Pepsiman)
+#define STG_BYTES 0x18000
+static u8 *stg;
+static u32 com_stg[GX_NR];   // posición en stg de lo que espera de cada hueco
+static int staged;          // lo que espera está en stg
 
 // Se va a escribir [lo, hi) del hueco k (o de las paletas): si eso aún tiene que llegar a la VRAM para el
 // frame que se acaba de mandar, esperar a que llegue; luego se apunta como cambiado.
@@ -97,9 +103,9 @@ struct { char magic[8]; u32 n[16]; } gx_waits = { "SPGXWAIT" };
 static void sh_mark(int k, u32 lo, u32 hi)
 {
 #ifdef GX_TEXLOG
-	if (commit_on && com_lo[k] < hi && lo < com_hi[k]) gx_waits.n[k]++;
+	if (commit_on && !staged && com_lo[k] < hi && lo < com_hi[k]) gx_waits.n[k]++;
 #endif
-	if (commit_on && com_lo[k] < hi && lo < com_hi[k]) while (commit_on) { }
+	if (commit_on && !staged && com_lo[k] < hi && lo < com_hi[k]) while (commit_on) { }
 	if (pend_lo[k] >= pend_hi[k]) { pend_lo[k] = lo; pend_hi[k] = hi; }
 	else { if (lo < pend_lo[k]) pend_lo[k] = lo; if (hi > pend_hi[k]) pend_hi[k] = hi; }
 }
@@ -134,7 +140,7 @@ void gx_vblank(void)
 		const u8 *src;
 		u8 *dst;
 		if (lo >= hi) continue;
-		src = k == GX_PAL ? (const u8 *)sh_pal + lo : (const u8 *)sh_tex + ((u32)k << 15) + lo;
+		src = staged ? stg + com_stg[k] : k == GX_PAL ? (const u8 *)sh_pal + lo : (const u8 *)sh_tex + ((u32)k << 15) + lo;
 		dst = k == GX_PAL ? (u8 *)bank_lcd(3) + lo : (u8 *)bank_lcd(bank) + ((u32)(k & 3) << 15) + lo;
 		bank_mode(bank, 1);
 		dmaCopyWords(2, src, dst, hi - lo);
@@ -434,6 +440,7 @@ PSX_ITCM static int tex_get(int x, int y, int depth, int cx, int cy, int v0, int
 			}
 			age = frame_no + 1 - newest;   // 0: usado en este frame
 			if (best < 0 || age > best_age || (age == best_age && ev < best_ev)) { best_age = age; best = i; best_ev = ev; }
+			if (!ev) break;   // huecos libres: no hay nada mejor
 		}
 	}
 #ifdef GX_TEXLOG
@@ -779,14 +786,24 @@ static void gx_flip(int drawn)
 	STAGE(12);
 	if (sh_tex) {   // lo cambiado para este frame va a la VRAM en esa vblank (gx_vblank)
 		int any = 0;
+		u32 total = 0;
 		for (int k = 0; k < GX_NR; k++) {
 			com_lo[k] = pend_lo[k]; com_hi[k] = pend_hi[k];
 			pend_lo[k] = pend_hi[k] = 0;
+			if (com_lo[k] < com_hi[k]) total += ((com_hi[k] + 3) & ~3u) - (com_lo[k] & ~3u);
+		}
+		staged = stg && total <= STG_BYTES;
+		total = 0;
+		for (int k = 0; k < GX_NR; k++) {
 			if (com_lo[k] < com_hi[k]) {
+				u32 lo = com_lo[k] & ~3u, hi = (com_hi[k] + 3) & ~3u;
+				const u8 *src = k == GX_PAL ? (u8 *)sh_pal + lo : (u8 *)sh_tex + ((u32)k << 15) + lo;
 				any = 1;
-				DC_FlushRange(k == GX_PAL ? (u8 *)sh_pal + com_lo[k] : (u8 *)sh_tex + ((u32)k << 15) + com_lo[k], com_hi[k] - com_lo[k]);
+				if (staged) { com_stg[k] = total; memcpy(stg + total, src, hi - lo); total += hi - lo; }
+				else DC_FlushRange(src, hi - lo);
 			}
 		}
+		if (staged) DC_FlushRange(stg, total);
 		commit_on = any;
 	}
 	ln = npolys = nverts = 0;
@@ -832,9 +849,11 @@ void gx_init(void)
 #ifdef BENCH_VRAM_PAK
 		sh_tex = (u16 *)0x09200000;   // banco de pruebas en modo DS: en el Expansion Pak, sin quitar RAM a la caché de código
 		sh_pal = (u16 *)(0x09200000 + GX_PAL * 0x8000);
+		stg = (u8 *)(0x09200000 + GX_PAL * 0x8000 + 0x10000);
 #else
 		sh_tex = malloc(GX_PAL * 0x8000);
 		sh_pal = malloc(0x10000);
+		if (sh_tex && sh_pal) stg = malloc(STG_BYTES);   // sin ella, como antes
 #endif
 		if (!sh_tex || !sh_pal) { free(sh_tex); free(sh_pal); sh_tex = sh_pal = NULL; }
 	}
