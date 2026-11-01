@@ -58,6 +58,9 @@ static void dump_ring(u32 code)
 
 static void exception(u32 code)
 {
+#ifdef DBG_IRQCOUNT
+	{ extern u32 dbg_exc_count; dbg_exc_count++; }
+#endif
 #ifdef PSX_TRACE_PC
 	if (code == EX_RI || code == EX_ADEL || code == EX_ADES) dump_ring(code);
 #endif

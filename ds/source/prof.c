@@ -50,15 +50,18 @@ static void put_tag(u32 tag)
 
 void prof_start(const char *game)
 {
-	u32 hdr[16] = { 0x46525053, 0x31464f52 };   // "SPRFROF1": marca de formato
-	dyn_regions(pr.regions);
+	u32 hdr[16] = { 0x46525053, 0x31464f52 }, r[8];   // "SPRFROF1": marca de formato
+	dyn_regions(r);
+	// para dsbench, las 6 de siempre (bloques [3, 4) y zona fría [4, 5): en el modo DS van seguidas)
+	pr.regions[0] = r[0]; pr.regions[1] = r[1]; pr.regions[2] = r[2];
+	pr.regions[3] = r[3]; pr.regions[4] = r[4]; pr.regions[5] = r[6];
 	rpos = pr.wpos = 0;
 	tickTaskStart(&task, prof_tick, TICK_FREQ / HZ, TICK_FREQ / HZ);
 #ifndef PSX_SELFTEST
 	pf = fopen(PROF_PATH, "ab");
 	if (!pf) return;
 	hdr[2] = HZ;
-	memcpy(hdr + 3, pr.regions, sizeof pr.regions);
+	memcpy(hdr + 3, r, sizeof r);   // las 8 zonas (con la NWRAM, la caliente y la fría van separadas)
 	fwrite(hdr, 4, 16, pf);
 	{
 		char name[64] = { 0 };

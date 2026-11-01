@@ -21,3 +21,9 @@ tests_own/*.o
 tests_own/*.elf
 tests_own/*.exe
 tests_own/*.pdb
+ds/build_perfil/
+ds/arm7/build/
+ds/arm7/*.elf
+tools/*.pdb
+tools/*.exe
+tools/wavgap/*.exe

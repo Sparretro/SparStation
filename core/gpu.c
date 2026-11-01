@@ -48,9 +48,21 @@ static unsigned ref_frames;   // para PSX_GPU_CHECK (ver pc/gpu_ref.inc)
 
 static inline int sx11(u32 v) { return ((s32)(v << 21)) >> 21; }
 
+static int hw_scr_dirty = 1;   // hay que recalcular hw_screen() (cambió el buffer mostrado, el modo o el área de dibujo)
+static struct { s16 x, y, w, h; u8 on; } hwbuf[2];   // búferes de pantalla que dibujó el 3D (ver hwbuf_flip)
+static u8 hw_drew;                         // en esta imagen se mandó algo al 3D
+static u8 fb_tex_dirty = 1, fb_tex_bad;    // ¿la página de textura actual cae en uno de esos búferes? (fb_tex)
+static u32 hp_tp = ~0u, hp_clut;           // página y paleta del último paquete de hw_poly_packet (~0: hay que mirarlas)
+#ifdef GPU_NO_HPCACHE
+#define HP_OFF 1   // medida: sin esta caché
+#else
+#define HP_OFF 0
+#endif
+
 static void update_display(void)
 {
 	static const int widths[4] = { 256, 320, 512, 640 };
+	hw_scr_dirty = 1;
 	gpu_disp.disp_x = g.disp_x;
 	gpu_disp.disp_y = g.disp_y;
 	gpu_disp.width = g.hres2 ? 368 : widths[g.hres1];
@@ -61,9 +73,16 @@ static void update_display(void)
 	gpu_disp.pal = g.pal;
 }
 
+static void cmd_len_init(void);
+
 void gpu_reset(void)
 {
+	cmd_len_init();
 	memset(&g, 0, sizeof g);
+	memset(hwbuf, 0, sizeof hwbuf);
+	hw_drew = 0;
+	fb_tex_dirty = 1;
+	hp_tp = ~0u;
 	g.disp_disable = 1;
 	g.h1 = 0x200;
 	g.h2 = 0xc00;
@@ -188,6 +207,7 @@ static inline u16 modulate(u16 t, int r, int gg, int b)
 
 static void set_texpage(u32 tp)
 {
+	hp_tp = ~0u;
 	g.tp_x = tp & 0xf;
 	g.tp_y = (tp >> 4) & 1;
 	g.semi = (tp >> 5) & 3;
@@ -197,6 +217,8 @@ static void set_texpage(u32 tp)
 
 static void use_texture(u32 clut)
 {
+	if (t_px != g.tp_x * 64 || t_py != g.tp_y * 256 || t_depth != g.depth) fb_tex_dirty = 1;
+	hp_tp = ~0u;
 	t_px = g.tp_x * 64;
 	t_py = g.tp_y * 256;
 	t_depth = g.depth;
@@ -808,7 +830,7 @@ static int buf_dist(int bx, int by)   // -1 si el área no empieza dentro del bu
 	return (g.da_x1 - bx) + (g.da_y1 - by);
 }
 
-static int hw_screen(void)
+static int hw_screen_calc(void)
 {
 	int a, b;
 	if (!gpu_hw || gpu_disp.color24) return 0;   // en 24 bits (vídeos) lo que se dibuje va a la VRAM, como en la PS1
@@ -818,6 +840,110 @@ static int hw_screen(void)
 	if (b >= 0 && (a < 0 || b < a)) { hw_ox = prev_disp_x; hw_oy = prev_disp_y; }
 	else { hw_ox = g.disp_x; hw_oy = g.disp_y; }
 	return 1;
+}
+
+// Se pregunta en cada polígono, pero solo cambia con el buffer mostrado, el modo o el área de dibujo
+static int hws_ok;
+static const GpuHw *hws_hw;
+static inline int hw_screen(void)
+{
+	if (hw_scr_dirty || hws_hw != gpu_hw) {
+		hws_ok = hw_screen_calc();
+		hws_hw = gpu_hw;
+		hw_scr_dirty = 0;
+	}
+	return hws_ok;
+}
+
+// Búferes de pantalla que dibujó el 3D de la DS (hwbuf, arriba): su imagen no está en la VRAM de la PS1. Un juego
+// que los usa de textura leería basura (Dino Crisis mezcla la imagen anterior sobre la nueva, una estela de
+// monitor, y en la DS salía todo emborronado y subiendo 256 KB de textura por imagen): esos polígonos no se
+// dibujan. Si después el juego escribe el búfer entero (un vídeo, un fondo subido por la CPU), vuelve a valer.
+static void hwbuf_flip(int x, int y)   // se enseña (x, y): el búfer que se acaba de dibujar
+{
+	if (hw_drew || skip_frame) {   // saltada: lo habría dibujado el 3D, y la VRAM tampoco lo tiene
+		int k;
+		for (k = 0; k < 2; k++) if (hwbuf[k].on && hwbuf[k].x == x && hwbuf[k].y == y) break;
+		if (k == 2) { hwbuf[0] = hwbuf[1]; k = 1; }   // uno nuevo: fuera el más viejo
+		hwbuf[k].x = (s16)x; hwbuf[k].y = (s16)y;
+		hwbuf[k].w = (s16)gpu_disp.width; hwbuf[k].h = (s16)gpu_disp.height;
+		hwbuf[k].on = 1;
+	}
+	hw_drew = 0;
+	fb_tex_dirty = 1;
+}
+
+// La CPU (o el dibujo por software) escribe la VRAM: si tapa casi todo un búfer del 3D (3/4 de ancho y de alto, como
+// un fondo de 320x224 en una pantalla de 320x240), lo que hay en la VRAM vuelve a ser la imagen
+static void hwbuf_written(int x, int y, int w, int h)
+{
+	for (int k = 0; k < 2; k++) {
+		int x0 = x > hwbuf[k].x ? x : hwbuf[k].x, x1 = x + w < hwbuf[k].x + hwbuf[k].w ? x + w : hwbuf[k].x + hwbuf[k].w;
+		int y0 = y > hwbuf[k].y ? y : hwbuf[k].y, y1 = y + h < hwbuf[k].y + hwbuf[k].h ? y + h : hwbuf[k].y + hwbuf[k].h;
+		if (hwbuf[k].on && (x1 - x0) * 4 >= hwbuf[k].w * 3 && (y1 - y0) * 4 >= hwbuf[k].h * 3) {
+			hwbuf[k].on = 0;
+			fb_tex_dirty = 1;
+		}
+	}
+}
+
+static int fb_tex_calc(void)
+{
+	int tw = t_depth == 0 ? 64 : t_depth == 1 ? 128 : 256;
+	fb_tex_bad = 0;
+	for (int k = 0; k < 2; k++)
+		if (hwbuf[k].on && t_px < hwbuf[k].x + hwbuf[k].w && t_px + tw > hwbuf[k].x && t_py < hwbuf[k].y + hwbuf[k].h && t_py + 256 > hwbuf[k].y)
+			fb_tex_bad = 1;
+	fb_tex_dirty = 0;
+	return fb_tex_bad;
+}
+
+static inline int fb_tex(void)   // la textura del polígono sale de una imagen que solo tiene el 3D
+{
+	return fb_tex_dirty ? fb_tex_calc() : fb_tex_bad;
+}
+
+// Si la página cae en un búfer del 3D (fb_tex), ¿lo que leen de verdad sus u, v también? (el mapa de Dino Crisis
+// es una textura de 15 bits en la página de x=256, que pisa las columnas 256-319 de la pantalla, pero lee de la 320)
+static int fb_tex_uv(int u0, int u1, int v0, int v1)
+{
+	int sh = t_depth == 0 ? 2 : t_depth == 1 ? 1 : 0;
+	int x0 = t_px + (u0 >> sh), x1 = t_px + (u1 >> sh), y0 = t_py + v0, y1 = t_py + v1;
+	for (int k = 0; k < 2; k++)
+		if (hwbuf[k].on && x0 < hwbuf[k].x + hwbuf[k].w && x1 >= hwbuf[k].x && y0 < hwbuf[k].y + hwbuf[k].h && y1 >= hwbuf[k].y) return 1;
+	return 0;
+}
+
+static int fb_tex_vtx(const Vtx *v, int n)
+{
+	int u0 = 255, u1 = 0, v0 = 255, v1 = 0;
+	for (int k = 0; k < n; k++) {
+		if (v[k].u < u0) u0 = v[k].u;
+		if (v[k].u > u1) u1 = v[k].u;
+		if (v[k].v < v0) v0 = v[k].v;
+		if (v[k].v > v1) v1 = v[k].v;
+	}
+	return fb_tex_uv(u0, u1, v0, v1);
+}
+
+static int fb_tex_packet(const u32 *w, int nv, int gour)   // lo mismo leyendo los uv del paquete
+{
+	int u0 = 255, u1 = 0, v0 = 255, v1 = 0;
+	for (int k = 0; k < nv; k++) {
+		u32 uv = w[2 + k * (gour ? 3 : 2)];
+		int u = (int)(uv & 0xff), v = (int)((uv >> 8) & 0xff);
+		if (u < u0) u0 = u;
+		if (u > u1) u1 = u;
+		if (v < v0) v0 = v;
+		if (v > v1) v1 = v;
+	}
+	return fb_tex_uv(u0, u1, v0, v1);
+}
+
+static void vram_written_hw(int x, int y, int w, int h)   // la VRAM cambió por otro camino que el 3D
+{
+	hwbuf_written(x, y, w, h);
+	gpu_hw->vram_written(x, y, w, h);
 }
 
 static void hw_send(const Vtx *v, int n, int tex, int gour, int semi_on, int raw)
@@ -831,6 +957,8 @@ static void hw_send(const Vtx *v, int n, int tex, int gour, int semi_on, int raw
 		if (gpudump) printf("MASK set=%d check=%d semi=%d tex=%d\n", g.set_mask, g.check_mask, semi_on ? g.semi : -1, tex);
 	}
 #endif
+	if (tex && fb_tex() && fb_tex_vtx(v, n)) { STAT_ADD(fb_skips, 1); return; }   // la textura es una imagen que solo tiene el 3D (ver hwbuf_flip)
+	hw_drew = 1;
 	for (int k = 0; k < n; k++) {
 		hv[k].x = (s16)v[k].x; hv[k].y = (s16)v[k].y;
 		hv[k].r = (u8)v[k].r; hv[k].g = (u8)v[k].g; hv[k].b = (u8)v[k].b;
@@ -857,6 +985,29 @@ static int hw_poly_packet(const u32 *w)
 	GpuHwVtx hv[4];
 	GpuHwPoly p;
 	if (!hw_screen()) return 0;
+	if (gpu_hw->poly_raw) {   // el frontend lee los vértices del paquete él mismo
+		GpuHwRaw r;
+		if (tex) {   // paleta en el uv del vértice 0, página en el del 1 (con gouraud va detrás de su color)
+			u32 tpw = w[gour ? 5 : 4] >> 16, clw = w[2] >> 16;
+			if (HP_OFF || tpw != hp_tp || clw != hp_clut) {   // la misma que el paquete anterior (lo normal): ya está puesta
+				set_texpage(tpw);
+				use_texture(clw);
+				hp_tp = tpw;
+				hp_clut = clw;
+			}
+			if (fb_tex() && fb_tex_packet(w, nv, gour)) { STAT_ADD(fb_skips, 1); return 1; }   // textura de un búfer que solo tiene el 3D: no se dibuja
+		}
+		hw_drew = 1;
+		r.cmd = cmd;
+		r.dx = (s16)(g.off_x - hw_ox);
+		r.dy = (s16)(g.off_y - hw_oy);
+		r.tex = tex ? (u8)(t_depth > 2 ? 3 : t_depth + 1) : 0;
+		r.semi = semi_on ? (u8)(g.semi + 1) : 0;
+		r.mask = (u8)(g.check_mask && g.set_mask);
+		r.tpx = (s16)t_px; r.tpy = (s16)t_py; r.cx = (s16)t_cx; r.cy = (s16)t_cy;
+		gpu_hw->poly_raw(w, &r);
+		return 1;
+	}
 	for (int k = 0; k < nv; k++) {
 		u32 xy;
 		if (k > 0 && gour) col = w[i++] & 0xffffff;
@@ -875,6 +1026,8 @@ static int hw_poly_packet(const u32 *w)
 		} else hv[k].u = hv[k].v = 0;
 	}
 	if (tex) use_texture(clut);
+	if (tex && fb_tex() && fb_tex_packet(w, nv, gour)) { STAT_ADD(fb_skips, 1); return 1; }   // textura de un búfer que solo tiene el 3D: no se dibuja
+	hw_drew = 1;
 	p.tex = tex ? (u8)(t_depth > 2 ? 3 : t_depth + 1) : 0;
 	p.raw = (u8)(tex && raw);
 	p.gouraud = (u8)(gour != 0);
@@ -892,7 +1045,7 @@ static void hw_dirty_area(void)   // algo dibujado por software fuera de la pant
 	{ extern int gpudump; extern int printf(const char *, ...); if (gpudump && gpu_hw) printf("SOFT cmd=%02x area=%d,%d-%d,%d\n", (unsigned)(fifo[0] >> 24), g.da_x1, g.da_y1, g.da_x2, g.da_y2); }
 #endif
 	if (gpu_hw) pend_touch(g.da_x1, g.da_y1, g.da_x2 - g.da_x1 + 1, g.da_y2 - g.da_y1 + 1, 0);
-	if (gpu_hw) gpu_hw->vram_written(g.da_x1, g.da_y1, g.da_x2 - g.da_x1 + 1, g.da_y2 - g.da_y1 + 1);
+	if (gpu_hw) vram_written_hw(g.da_x1, g.da_y1, g.da_x2 - g.da_x1 + 1, g.da_y2 - g.da_y1 + 1);
 }
 
 static void polygon(void)
@@ -927,6 +1080,16 @@ static void polygon(void)
 	if (tex) use_texture(clut);
 	if (!gour) for (int k = 1; k < nv; k++) { v[k].r = v[0].r; v[k].g = v[0].g; v[k].b = v[0].b; }
 	if (tex && !gour && raw) raw = 1;
+#ifdef DBG_GPUCOUNT
+	{   // depuración (PC): polígonos con textura de 15 bits en el frame marcado
+		extern int dbg_frame_on;
+		extern int printf(const char *, ...);
+		if (dbg_frame_on && tex && t_depth == 2)
+			printf("POLY15 nv=%d semi=%d(%d) raw=%d xy=%d,%d %d,%d %d,%d uv=%d,%d %d,%d tp=%d,%d col=%d,%d,%d disp=%d,%d area=%d,%d-%d,%d\n", nv,
+			       semi_on ? 1 : 0, g.semi, raw, v[0].x, v[0].y, v[1].x, v[1].y, v[nv - 1].x, v[nv - 1].y, v[0].u, v[0].v, v[nv - 1].u,
+			       v[nv - 1].v, t_px, t_py, v[0].r, v[0].g, v[0].b, g.disp_x, g.disp_y, g.da_x1, g.da_y1, g.da_x2, g.da_y2);
+	}
+#endif
 #ifdef PSX_GPUSTAT
 	{   // PC: qué usan los polígonos (colores por encima de 1.0, modos de mezcla)
 		extern u32 gpustat[16];
@@ -995,6 +1158,15 @@ static void rectangle(void)
 	else if (size == 2) w = h = 8;
 	else w = h = 16;
 	if (tex) use_texture(uv >> 16);
+#ifdef DBG_GPUCOUNT
+	{   // depuración (PC): rectángulos con textura de 15 bits en el frame marcado
+		extern int dbg_frame_on;
+		extern int printf(const char *, ...);
+		if (dbg_frame_on && tex && t_depth == 2)
+			printf("RECT15 xy=%d,%d wh=%d,%d semi=%d(%d) raw=%d uv=%d,%d tp=%d,%d disp=%d,%d area=%d,%d-%d,%d\n", x0, y0, w, h, semi_on ? 1 : 0,
+			       g.semi, raw, uv & 0xff, (uv >> 8) & 0xff, t_px, t_py, g.disp_x, g.disp_y, g.da_x1, g.da_y1, g.da_x2, g.da_y2);
+	}
+#endif
 #ifdef PSX_GPUSTAT
 	{
 		extern int gpudump;
@@ -1127,7 +1299,7 @@ static void pend_touch(int x, int y, int w, int h, int full)   // algo va a escr
 	if (!(full && x <= pend.x && y <= pend.y && x + w >= pend.x + pend.w && y + h >= pend.y + pend.h))
 		fill_rect(pend.x, pend.y, pend.w, pend.h, pend.c);
 	gpu_hw->clear(0xffff);   // fondo transparente otra vez
-	gpu_hw->vram_written(pend.x, pend.y, pend.w, pend.h);
+	vram_written_hw(pend.x, pend.y, pend.w, pend.h);
 }
 
 static void pend_keep(void)
@@ -1156,7 +1328,7 @@ static void fill(void)
 		}
 	}
 	fill_rect(x0, y0, w, h, c);
-	if (gpu_hw) gpu_hw->vram_written(x0, y0, w, h);
+	if (gpu_hw) vram_written_hw(x0, y0, w, h);
 }
 
 static void vram_copy(void)
@@ -1178,7 +1350,7 @@ static void vram_copy(void)
 			if (g.check_mask && (*d & 0x8000)) continue;
 			*d = c | (g.set_mask << 15);
 		}
-	if (gpu_hw) gpu_hw->vram_written(dx, dy, w, h);
+	if (gpu_hw) vram_written_hw(dx, dy, w, h);
 }
 
 // Subida a la VRAM de n palabras seguidas (2 píxeles cada una): una división al empezar y luego fila a fila
@@ -1237,13 +1409,14 @@ static int cmd_len_calc(u32 cmd)
 	return 1;
 }
 
-// Tabla (se pide en cada paquete de la DMA): se rellena la primera vez
+// Tabla (se pide en cada paquete de la DMA): la rellena gpu_reset, y así cada consulta es una lectura sin llamada
 static u8 cmd_len_tab[256];
-static int cmd_len(u32 cmd)
+static void cmd_len_init(void)
 {
-	if (!cmd_len_tab[0]) for (int i = 0; i < 256; i++) cmd_len_tab[i] = (u8)cmd_len_calc((u32)i);
-	return cmd_len_tab[cmd & 255];
+	for (int i = 0; i < 256; i++) cmd_len_tab[i] = (u8)cmd_len_calc((u32)i);
 }
+
+static inline int cmd_len(u32 cmd) { return cmd_len_tab[cmd & 255]; }
 
 static void execute_cmd(void)
 {
@@ -1253,7 +1426,14 @@ static void execute_cmd(void)
 #endif
 	if (skip_frame && cmd >= 0x20 && cmd < 0x80 && (cmd < 0x40 || cmd >= 0x60)) return;   // frame saltado: sin polígonos ni sprites
 	if (cmd >= 0x20 && cmd < 0x40) { STAT_ADD(gpu_tris, (cmd & 8) ? 2 : 1); polygon(); return; }
-	if (cmd >= 0x40 && cmd < 0x60) { STAT_ADD(gpu_lines, 1); line(); return; }
+	if (cmd >= 0x40 && cmd < 0x60) {
+		STAT_ADD(gpu_lines, 1);
+#ifdef DBG_GPUCOUNT
+		{ extern u32 dbg_lines, dbg_linecmd[32]; dbg_lines++; dbg_linecmd[cmd & 31]++; }
+#endif
+		line();
+		return;
+	}
 	if (cmd >= 0x60 && cmd < 0x80) { STAT_ADD(gpu_rects, 1); rectangle(); return; }
 	if (cmd >= 0x80 && cmd < 0xa0) { STAT_ADD(gpu_copies, 1); vram_copy(); return; }
 	if (cmd >= 0xa0 && cmd < 0xc0) {
@@ -1267,7 +1447,7 @@ static void execute_cmd(void)
 #ifdef PSX_GPUSTAT
 		{ extern int gpudump; extern int printf(const char *, ...); if (gpudump) printf("LOAD %d,%d %dx%d\n", load_x, load_y, load_w, load_h); }
 #endif
-		if (gpu_hw) gpu_hw->vram_written(load_x, load_y, load_w, load_h);
+		if (gpu_hw) vram_written_hw(load_x, load_y, load_w, load_h);
 		load_i = 0;
 		mode = M_LOAD;
 		return;
@@ -1292,7 +1472,7 @@ static void execute_cmd(void)
 		g.flip_y = (v >> 13) & 1;
 		break;
 	case 0xe2: g.tw_mx = v & 0x1f; g.tw_my = (v >> 5) & 0x1f; g.tw_ox = (v >> 10) & 0x1f; g.tw_oy = (v >> 15) & 0x1f; break;
-	case 0xe3: g.da_x1 = v & 0x3ff; g.da_y1 = (v >> 10) & 0x1ff; break;
+	case 0xe3: g.da_x1 = v & 0x3ff; g.da_y1 = (v >> 10) & 0x1ff; hw_scr_dirty = 1; break;
 	case 0xe4: g.da_x2 = v & 0x3ff; g.da_y2 = (v >> 10) & 0x1ff; break;
 	case 0xe5:
 #ifdef PSX_GPUSTAT
@@ -1320,7 +1500,7 @@ void gpu_write_gp0(u32 v)
 }
 
 // Paquete de la lista enlazada (DMA): los comandos que vienen enteros se ejecutan sin pasar palabra a palabra
-void gpu_write_gp0_n(const u32 *w, u32 n)
+PSX_ITCM void gpu_write_gp0_n(const u32 *w, u32 n)   // en la ITCM (2,5% en la DSi real con Tomb Raider)
 {
 	while (n) {
 		u32 need;
@@ -1353,6 +1533,9 @@ void gpu_write_gp0_n(const u32 *w, u32 n)
 
 void gpu_write_gp1(u32 v)
 {
+#ifdef DBG_GPUCOUNT
+	{ extern u32 dbg_gp1[64]; dbg_gp1[(v >> 24) & 63]++; }   // depuración (PC): comandos GP1 por segundo
+#endif
 #ifdef PSX_TTY_GP1
 	{ extern int printf(const char *, ...); if ((v >> 24) != 5) printf("GP1 %08x\n", (unsigned)v); }
 #endif
@@ -1369,8 +1552,9 @@ void gpu_write_gp1(u32 v)
 			prev_disp_x = g.disp_x;
 			if (rows_mode) need_rows = 1;
 			pend.on = 0;   // el borrado pendiente ya lo hizo el fondo del 3D
-			if (gpu_hw) gpu_hw->flip(!skip_frame);
+			if (gpu_hw) { gpu_hw->flip(!skip_frame); hwbuf_flip((int)(v & 0x3fe), (int)((v >> 10) & 0x1ff)); }
 			gpu_disp.stale = skip_frame;   // se va a ver el buffer que no se dibujó
+			if (!skip_frame) STAT_ADD(disp_drawn, 1);
 			vbl_since_flip = 0;
 			skip_frame = gpu_frameskip && ++flip_n % (gpu_frameskip + 1) != 0;
 		}
@@ -1436,6 +1620,9 @@ static void rows_update(void)
 	static u16 rows[512];
 	static int key_h = -1, key_mode = -1, key_lines = -1, nrows;
 	int h = gpu_disp.height, mode = rows_mode, out_lines = rows_lines;
+	// Con el 3D de la DS lo que se ve no lo pinta el software: este solo dibuja texturas fuera de la pantalla
+	// (efectos que el juego pinta y luego usa), y saltarse filas las dejaba a rayas. La calidad es de la GPU por software.
+	if (gpu_hw) mode = 0;
 	gpu_rows_on = mode != 0;
 	if (!mode) return;
 	if (h != key_h || mode != key_mode || out_lines != key_lines) {
@@ -1473,6 +1660,9 @@ void gpu_state(PsxState *s)
 	STATE(s, pl_col); STATE(s, pl_next_col);
 	STATE(s, prev_disp_y);
 	if (s->load) {
+		hp_tp = ~0u;     // página y paleta del último paquete, búferes del 3D
+		memset(hwbuf, 0, sizeof hwbuf);
+		fb_tex_dirty = 1;
 		lut_rgb = ~0u;   // cachés de dibujo
 		skip_frame = 0;
 		gpu_disp.stale = 0;

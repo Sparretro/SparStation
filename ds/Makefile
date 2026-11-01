@@ -1,5 +1,5 @@
 #---------------------------------------------------------------------------------
-# SparStation para DSi: núcleo de ../core + frontend de source/. Usa el ARM7 por defecto de calico.
+# SparStation para DSi: núcleo de ../core + frontend de source/. Usa el ARM7 por defecto de calico (con NWRAM7=1, el de arm7/).
 #---------------------------------------------------------------------------------
 .SUFFIXES:
 ifeq ($(strip $(DEVKITARM)),)
@@ -7,7 +7,7 @@ $(error "Please set DEVKITARM in your environment. export DEVKITARM=<path to>dev
 endif
 
 GAME_TITLE     := SparStation
-GAME_SUBTITLE1 := PlayStation en tu DSi (v18)
+GAME_SUBTITLE1 := PlayStation en tu DSi (v33)
 GAME_SUBTITLE2 := by Spar Retro
 # make SELFTEST=1 [NITRODIR=carpeta] mete esa carpeta como NitroFS (selftest.exe o disco reducido) para probar en modo DS
 ifeq ($(SELFTEST),1)
@@ -41,6 +41,12 @@ ifeq ($(PERFIL),1)
 CFLAGS   += -DSPAR_PROF
 BUILD    := build_perfil
 TARGET   := SparStation_perfil
+endif
+# make NWRAM7=1 (con make -C arm7 antes): el mismo ARM9 con el ARM7 de arm7/, que deja la NWRAM B y C al ARM9
+# (TWiLight Menu++ se la da al ARM7 protegida). Sale SparStation_nwram7.nds; con PERFIL=1, SparStation_perfil_nwram7.
+ifeq ($(NWRAM7),1)
+TARGET   := $(TARGET)_nwram7
+_ARM7_ELF := -7 $(dir $(abspath $(firstword $(MAKEFILE_LIST))))arm7/arm7.elf
 endif
 
 LIBDIRS  := $(LIBNDS) $(PORTLIBS)

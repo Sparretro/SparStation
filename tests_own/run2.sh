@@ -10,7 +10,7 @@ out/psxblk.exe bios/openbios.bin "$w\tests_own\raw.exe" 300 "$w\out\rw" --dump "
 cp tests_own/raw.exe ds/nitro_fuzz/selftest.exe
 export DEVKITPRO=/opt/devkitpro DEVKITARM=/opt/devkitpro/devkitARM PATH=/opt/devkitpro/devkitARM/bin:/opt/devkitpro/tools/bin:$PATH
 rm -f ds/SparStation_test.nds ds/SparStation_test.elf
-[ "$(cat ds/build_test/.extra 2>/dev/null)" != "nitro_fuzz -DNO_SND" ] && { rm -rf ds/build_test; mkdir -p ds/build_test; echo "nitro_fuzz -DNO_SND" > ds/build_test/.extra; }; make -C ds SELFTEST=1 NITRODIR=nitro_fuzz EXTRA=-DNO_SND 2>&1 | grep -E "error" && exit 1
+[ "$(cat ds/build_test/.extra 2>/dev/null)" != "nitro_fuzz -DNO_SND -DDYN_DS_RESERVE_KB=160 -DBENCH_VRAM_PAK" ] && { rm -rf ds/build_test; mkdir -p ds/build_test; echo "nitro_fuzz -DNO_SND -DDYN_DS_RESERVE_KB=160 -DBENCH_VRAM_PAK" > ds/build_test/.extra; }; make -C ds SELFTEST=1 NITRODIR=nitro_fuzz EXTRA="-DNO_SND -DDYN_DS_RESERVE_KB=160 -DBENCH_VRAM_PAK" 2>&1 | grep -E "error" && exit 1
 cp ds/SparStation_test.nds out/b/fuzz.nds
 DSB_SNAP=60 DSB_PSXMEM="180000:$n:$w\out\rw_ds.bin" tools/dsbench.exe "$w\tools\melonds\melondsds_libretro.dll" "$w\out\b\fuzz.nds" ${DSFRAMES:-1500} "$w\out\b\fuzz.png" > /dev/null 2>&1
 if cmp -s out/rw_pc.bin out/rw_ds.bin; then echo "semilla $seed: IGUAL"; exit 0; fi

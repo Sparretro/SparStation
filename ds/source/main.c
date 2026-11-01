@@ -21,6 +21,27 @@
 #ifdef PSX_SELFTEST
 #include <calico/nds/gbacart.h>
 #include <calico/arm/mpu.h>
+#include <calico/system/mutex.h>
+
+#ifdef STACK_PROBE
+// Medida: cuánto baja como mucho la pila del hilo principal en la DTCM (lo que quede libre puede ser tabla).
+// Se pinta el hueco al arrancar; gx_dbg.dyn = bytes usados (lo imprime dsbench al final)
+extern u32 __dtcm_bss_end[], __sp_usr[];
+static u32 stack_paint_depth;
+static __attribute__((noinline)) void stack_paint(void)
+{
+	u32 *p = __dtcm_bss_end, *sp;
+	__asm__ volatile("mov %0, sp" : "=r"(sp));
+	stack_paint_depth = (u32)((u8 *)__sp_usr - (u8 *)sp);
+	while (p < sp - 64) *p++ = 0x5a5aa5a5;
+}
+static u32 stack_used(void)
+{
+	u32 *p = __dtcm_bss_end;
+	while (p < __sp_usr && *p == 0x5a5aa5a5) p++;
+	return (u32)((u8 *)__sp_usr - (u8 *)p);
+}
+#endif
 #endif
 
 #define GAMES_DIR "sd:/ps1"
@@ -54,20 +75,45 @@ static int read_exe(void *user, u8 *dst, u32 len) { return fread(dst, 1, len, (F
 
 // Disco reducido para pruebas en modo DS (nitro:/disc.idx + disc.dat, ver tools/mksubset.c)
 static u32 *sub_lbas, sub_count;
+static FILE *disc_xa;   // el del hilo del audio (snd.c): cada hilo con su archivo, como en la SD
+static Mutex sub_mtx;   // NitroFS no aguanta dos hilos leyendo a la vez (la SD sí: libfat lleva su mutex)
 
-static int read_subset(void *user, u32 lba, u8 *out)
+static int read_subset_from(FILE *f, u32 lba, u8 *out)
 {
 	u32 lo = 0, hi = sub_count;
-	(void)user;
+	int ok;
 	while (lo < hi) {
 		u32 mid = (lo + hi) / 2;
 		if (sub_lbas[mid] < lba) lo = mid + 1; else hi = mid;
 	}
-	if (lo < sub_count && sub_lbas[lo] == lba && !fseek(disc, (long)lo * 2352, SEEK_SET) && fread(out, 1, 2352, disc) == 2352)
-		return 1;
-	memset(out, 0, 2352);   // sector que no se grabó: vacío
+	mutexLock(&sub_mtx);
+	ok = lo < sub_count && sub_lbas[lo] == lba && !fseek(f, (long)lo * 2352, SEEK_SET) && fread(out, 1, 2352, f) == 2352;
+	mutexUnlock(&sub_mtx);
+	if (!ok) memset(out, 0, 2352);   // sector que no se grabó: vacío
 	return 1;
 }
+
+static int read_subset(void *user, u32 lba, u8 *out) { (void)user; return read_subset_from(disc, lba, out); }
+static int read_subset_xa(void *user, u32 lba, u8 *out) { (void)user; return read_subset_from(disc_xa, lba, out); }
+
+#ifdef DA_TEST
+// Prueba del hilo de la música en melonDS (que no tiene la SD de la DSi): tono triangular de 441 Hz con la fase
+// sacada del sector (sale continuo solo si no se pierde, repite ni desordena nada) y una espera de DA_TEST µs por
+// lectura, como la de la SD (el hilo queda bloqueado y la emulación sigue)
+static u32 test_da_read(void *user, u32 lba, u32 n, u8 *out)
+{
+	s16 *p = (s16 *)out;
+	(void)user;
+	threadSleep(DA_TEST);
+	for (u32 i = 0; i < n * 588; i++) {
+		u32 t = (lba * 588 + i) % 100;
+		s32 tri = t < 50 ? (s32)t * 640 - 16000 : 16000 - (s32)(t - 50) * 640;
+		p[i * 2] = (s16)tri;
+		p[i * 2 + 1] = (s16)(-tri / 2);
+	}
+	return n;
+}
+#endif
 
 static int open_subset(void)
 {
@@ -97,7 +143,11 @@ static int open_subset(void)
 		}
 		if (t) fclose(t);
 	}
-	snd_set_disc(read_subset);
+	disc_xa = fopen("nitro:/disc.dat", "rb");
+	if (disc_xa) snd_set_disc(read_subset_xa);
+#ifdef DA_TEST
+	snd_set_cdda(test_da_read);
+#endif
 	return 1;
 }
 
@@ -110,32 +160,37 @@ static void tty_out(int c) { putchar(c); }
 // sitio a otro del disco: en la SD, buscar cuesta y se pierde el búfer.
 static CueDisc cue;
 typedef struct { FILE *f; int fi, buf; long pos; } DiscRd;
-static DiscRd rd_cd = { NULL, -1, 32 * 1024, -1 }, rd_xa = { NULL, -1, 16 * 1024, -1 }, rd_da = { NULL, -1, 16 * 1024, -1 };
+// El de las pistas de audio lee bloques grandes desde su hilo (snd.c): sin búfer de stdio, directo al anillo.
+static DiscRd rd_cd = { NULL, -1, 32 * 1024, -1 }, rd_xa = { NULL, -1, 16 * 1024, -1 }, rd_da = { NULL, -1, 0, -1 };
 
-static int disc_read(DiscRd *r, u32 lba, u8 *out)
+// n sectores seguidos de una vez (como mucho hasta el final de su archivo); devuelve cuántos se leyeron
+static u32 disc_read_n(DiscRd *r, u32 lba, u32 n, u8 *out)
 {
 	u32 s;
 	int i = cue_locate(&cue, lba, &s);
 	long want;
-	if (i < 0) return 0;
+	if (i < 0 || !n) return 0;
 	if (i != r->fi) {   // otro archivo (otra pista): se cambia el que tiene abierto
 		if (r->f) fclose(r->f);
 		r->f = fopen(cue.file[i].path, "rb");
 		r->fi = r->f ? i : -1;
 		r->pos = -1;
 		if (!r->f) return 0;
-		setvbuf(r->f, NULL, _IOFBF, (size_t)r->buf);
+		setvbuf(r->f, NULL, r->buf ? _IOFBF : _IONBF, (size_t)r->buf);
 	}
+	if (n > cue.file[i].sectors - s) n = cue.file[i].sectors - s;
 	want = (long)s * 2352;
 	if (want != r->pos && fseek(r->f, want, SEEK_SET)) { r->pos = -1; return 0; }   // leyendo seguido, sin fseek
-	if (fread(out, 1, 2352, r->f) != 2352) { r->pos = -1; return 0; }
-	r->pos = want + 2352;
-	return 1;
+	if (fread(out, 1, n * 2352, r->f) != n * 2352) { r->pos = -1; return 0; }
+	r->pos = want + (long)n * 2352;
+	return n;
 }
+
+static int disc_read(DiscRd *r, u32 lba, u8 *out) { return disc_read_n(r, lba, 1, out) == 1; }
 
 static int read_sector(void *user, u32 lba, u8 *out) { (void)user; return disc_read(&rd_cd, lba, out); }
 static int read_sector_xa(void *user, u32 lba, u8 *out) { (void)user; return disc_read(&rd_xa, lba, out); }
-static int read_sector_da(void *user, u32 lba, u8 *out) { (void)user; return disc_read(&rd_da, lba, out); }
+static u32 read_sectors_da(void *user, u32 lba, u32 n, u8 *out) { (void)user; return disc_read_n(&rd_da, lba, n, out); }
 
 static u32 file_sectors(const char *path)
 {
@@ -160,7 +215,7 @@ static int open_disc(const char *path)
 	cdrom_set_disc(read_sector, NULL, cue.total);
 	cdrom_set_tracks(cue.trk, cue.ntrk);
 	snd_set_disc(read_sector_xa);
-	snd_set_cdda(read_sector_da);
+	snd_set_cdda(read_sectors_da);
 	return 1;
 }
 
@@ -169,14 +224,28 @@ static int open_disc(const char *path)
 static int opt_quality, opt_skip, opt_cpu;   // calidad 0-3, frames saltados 0-3, CPU 0 = auto, 1-5 = cpu_pct
 static int opt_hw = 1;                       // GPU: 1 = motor 3D de la DS (gx.c), 0 = por software
 static int opt_snd = 1;                      // sonido (voces de la SPU y audio XA del CD)
+static int opt_nwram = 1;                    // código traducido en la NWRAM de la DSi (si la hay, ver nwram_init)
+static int cfg_version;                      // versión que escribió el .cfg (ver load_cfg)
 static const char *const quality_name[4] = { "normal", "rapida", "muy rapida", "baja res" };
 static const int cpu_pct[6] = { 0, 100, 85, 70, 50, 35 };
 #define CPU_OPTS 6
 // CPU automática: la PS1 corre con los ciclos justos para que el juego vaya a la velocidad real. Los juegos que
-// miden el tiempo en vblanks (Silent Hill) van a su velocidad con menos imágenes; los demás, igual que al 100%.
+// miden el tiempo en vblanks (Silent Hill, Tomb Raider) van a su velocidad con menos imágenes; los demás, igual
+// que al 100%. Hasta la v20 el tope era el 30%: Tomb Raider necesita ~23% (sus imágenes duran 3 vblanks en vez
+// de 2) y se quedaba al 68% de velocidad. Por debajo del 30% el mando perdía los ACK: ahora sus tiempos van con
+// la CPU (sio.c), y Tomb Raider va bien hasta al 15%.
+// Hasta dónde baja es un ajuste de cada juego (cpu_min= en su .cfg; por defecto el 20%). Con Tomb Raider, en
+// melonDS: tope 15% -> 94% de velocidad y 16,6 imágenes; 20% -> 95% y 17,4; 25% -> 89% y 18,8; 30% -> 85% y 19,0.
 #define AUTO_MIN 256u                 // 100%
-#define AUTO_MAX (256u * 100 / 30)    // 30%
-static u32 auto_scale = AUTO_MIN;
+#ifndef CPU_MIN_DEFAULT
+#define CPU_MIN_DEFAULT 20
+#endif
+static int opt_cpu_min = CPU_MIN_DEFAULT;    // % más bajo de la CPU automática
+#ifndef AUTO_TARGET
+#define AUTO_TARGET 92   // % de cada frame que la CPU automática intenta llenar (el resto, margen)
+#endif
+static int opt_target = AUTO_TARGET;        // por juego: objetivo= en su .cfg
+static u32 auto_scale = AUTO_MIN, auto_max = 256u * 100 / CPU_MIN_DEFAULT;
 
 static const char *cpu_name(void)
 {
@@ -186,27 +255,138 @@ static const char *cpu_name(void)
 	return s;
 }
 
-static void load_cfg(void)
+// Lee unos ajustes (los generales o los de un juego); 0 si no hay archivo
+static int cfg_read(const char *path)
 {
-	FILE *f = fopen(CFG_PATH, "r");
-	if (!f) return;
+	FILE *f = fopen(path, "r");
+	if (!f) return 0;
 	if (fscanf(f, "calidad=%d saltar=%d cpu=%d", &opt_quality, &opt_skip, &opt_cpu) != 3) opt_quality = opt_skip = opt_cpu = 0;
 	if (fscanf(f, " gpu3d=%d", &opt_hw) != 1) opt_hw = 1;
 	if (fscanf(f, " sonido=%d", &opt_snd) != 1) opt_snd = 1;
+	if (fscanf(f, " nwram=%d", &opt_nwram) != 1) opt_nwram = 1;
+	// Antes de la v21 se recomendaba saltar 1: con el 3D de la DS la GPU cuesta poco y saltar solo hacía ver
+	// la mitad de las imágenes (Tomb Raider: 20 hechas, 10 vistas). Se vuelve a 0 una vez.
+	if (fscanf(f, " version=%d", &cfg_version) != 1 || cfg_version < 21) opt_skip = 0;
+	if (fscanf(f, " cpu_min=%d", &opt_cpu_min) != 1) opt_cpu_min = CPU_MIN_DEFAULT;   // desde la v26
+	if (fscanf(f, " objetivo=%d", &opt_target) != 1) opt_target = AUTO_TARGET;   // desde la v29
+	if (opt_target < 50 || opt_target > 100) opt_target = AUTO_TARGET;
+	if (opt_cpu_min < 10 || opt_cpu_min > 100) opt_cpu_min = CPU_MIN_DEFAULT;
 	opt_hw = opt_hw != 0;
 	opt_snd = opt_snd != 0;
+	opt_nwram = opt_nwram != 0;
 	fclose(f);
 	if (opt_quality < 0 || opt_quality > 3) opt_quality = 0;
 	if (opt_skip < 0 || opt_skip > 3) opt_skip = 0;
 	if (opt_cpu < 0 || opt_cpu >= CPU_OPTS) opt_cpu = 0;
+	return 1;
 }
 
-static void save_cfg(void)
+static void load_cfg(void) { cfg_read(CFG_PATH); }
+
+// Ajustes propios de un juego, junto a él y con su nombre (Silent Hill.cue -> Silent Hill.cfg)
+static void game_cfg_path(char *buf, size_t n, const char *name)
 {
-	FILE *f = fopen(CFG_PATH, "w");
+	const char *dot = strrchr(name, '.');
+	snprintf(buf, n, GAMES_DIR "/%.*s.cfg", dot ? (int)(dot - name) : (int)strlen(name), name);
+}
+
+static void cfg_write(const char *path)
+{
+	FILE *f = fopen(path, "w");
 	if (!f) return;
-	fprintf(f, "calidad=%d saltar=%d cpu=%d\ngpu3d=%d\nsonido=%d\n", opt_quality, opt_skip, opt_cpu, opt_hw, opt_snd);
+	fprintf(f, "calidad=%d saltar=%d cpu=%d\ngpu3d=%d\nsonido=%d\nnwram=%d\nversion=29\ncpu_min=%d\nobjetivo=%d\n", opt_quality, opt_skip,
+	        opt_cpu, opt_hw, opt_snd, opt_nwram, opt_cpu_min, opt_target);
 	fclose(f);
+}
+
+static void save_cfg(void) { cfg_write(CFG_PATH); }
+
+// NWRAM de la DSi para el código traducido (dyn_hot_area): los bancos B y C, 256 KB cada uno, de 32 bits. Desde la
+// RAM principal (16 bits) el ARM9 tarda unos 23 ciclos del bus en llenar una línea de su caché de instrucciones y
+// desde una memoria de 32 bits unos 11 (GBATEK); con la CPU a 134 MHz el bus sigue igual de lento. La cabecera que
+// escribe ndstool da al ARM9 sus 16 huecos de 32 KB, seguidos: C en 03700000h y B en 03740000h. calico no la usa ni le
+// da región del MPU: se abre la 3 (libre) con caché de instrucciones y de datos, y se comprueba de verdad escribiendo
+// los 512 KB y leyéndolos de vuelta con la caché vaciada. Si algo no cuadra, el código sigue en la RAM principal.
+#define NWRAM_BASE 0x03700000u
+#define NWRAM_SIZE 0x80000u
+static int nwram_ok;
+
+static void mpu_region3(u32 config)   // 0: quitarla
+{
+	u32 on = config ? 8 : 0;   // bit 3 = región 3; permisos de 4 bits en 12-15
+	armMpuSetDataPerm((armMpuGetDataPerm() & ~0xf000u) | (config ? 0x3000u : 0));   // datos: leer y escribir
+	armMpuSetCodePerm((armMpuGetCodePerm() & ~0xf000u) | (config ? 0x6000u : 0));   // instrucciones: ejecutar
+	armMpuSetDCacheConfig((armMpuGetDCacheConfig() & ~8u) | on);
+	armMpuSetICacheConfig((armMpuGetICacheConfig() & ~8u) | on);
+	armMpuSetWrBufConfig((armMpuGetWrBufConfig() & ~8u) | on);   // escritura diferida, como la RAM principal
+	armMpuSetRegion3(config);
+	armDrainWriteBuffer();
+}
+
+// Si la prueba colgara la consola (ejecutar desde la NWRAM), queda este archivo y en el siguiente arranque se usa
+// la RAM principal sin probar nada. Borrándolo se vuelve a intentar.
+#define NWRAM_MARK GAMES_DIR "/nwram_prueba.txt"
+
+// Diagnóstico: por qué no se usa la NWRAM (corto, para el log) y los registros en sd:/ps1/nwram_info.txt.
+// En la v20-v25, con TWiLight Menu++, salía «sin NWRAM» sin saber qué comprobación fallaba.
+static const char *nwram_why = "";
+
+static void nwram_report(const char *what)
+{
+	FILE *f = fopen(GAMES_DIR "/nwram_info.txt", what[0] == 'a' && what[1] == 'n' ? "w" : "a");   // «antes» empieza el archivo
+	if (!f) return;
+	fprintf(f, "%s\nSCFG_EXT=%08lx MBK1(A)=%08lx MBK2-3(B)=%08lx %08lx MBK4-5(C)=%08lx %08lx\nMBK6-8(mapa A,B,C)=%08lx %08lx %08lx MBK9(protegidos)=%08lx\n\n",
+	        what, REG_SCFG_EXT, *(vu32 *)0x04004040, *(vu32 *)0x04004044, *(vu32 *)0x04004048, *(vu32 *)0x0400404c,
+	        *(vu32 *)0x04004050, REG_MBK_MAP_A, REG_MBK_MAP_B, REG_MBK_MAP_C, REG_MBK_SLOTWRPROT);
+	fclose(f);
+}
+
+static int nwram_init(void)
+{
+	vu32 *p = (vu32 *)NWRAM_BASE;
+	u32 n = NWRAM_SIZE / 4, i;
+	FILE *m;
+	int ok;
+	if (!isDSiMode()) return 0;
+	nwram_report("antes");
+	if (!(REG_SCFG_EXT & SCFG_EXT_HAS_NWRAM)) { nwram_why = "SCFG"; nwram_report("SCFG_EXT sin acceso a la NWRAM (solo el ARM7 puede darlo)"); return 0; }
+	// Los 16 huecos tienen que estar activos y ser del ARM9 (dueño 0). Con TWiLight Menu++ la cabecera de la ROM no
+	// se aplica y pueden venir del ARM7 o del DSP: si el ARM7 no los protegió (MBK9), se los quedamos (nadie más los usa)
+	for (i = 0; i < 8; i++) {
+		if ((REG_MBK_SLOT_Bx(i) & 0x83) != 0x80 && !(REG_MBK_SLOTWRPROT & (1u << (8 + i)))) REG_MBK_SLOT_Bx(i) = (u8)(0x80 | (i << 2));
+		if ((REG_MBK_SLOT_Cx(i) & 0x83) != 0x80 && !(REG_MBK_SLOTWRPROT & (1u << (16 + i)))) REG_MBK_SLOT_Cx(i) = (u8)(0x80 | (i << 2));
+	}
+	for (i = 0; i < 8; i++)
+		if ((REG_MBK_SLOT_Bx(i) & 0x83) != 0x80 || (REG_MBK_SLOT_Cx(i) & 0x83) != 0x80) {
+			nwram_why = "huecos";
+			nwram_report("huecos B/C de otro procesador y protegidos (MBK9)");
+			return 0;
+		}
+	if ((m = fopen(NWRAM_MARK, "r"))) { fclose(m); nwram_why = "marca"; nwram_report("la prueba anterior colgo (nwram_prueba.txt)"); return 0; }
+	if ((m = fopen(NWRAM_MARK, "w"))) {
+		fputs("SparStation: probando la NWRAM. Si este archivo sigue aqui, la prueba colgo la consola.\n", m);
+		fclose(m);
+	}
+	REG_MBK_MAP_C = MBK_MAP_START(0xe0) | MBK_MAP_SIZE(MbkMapSize_256K) | MBK_MAP_END(0xe8);   // 03700000h-0373FFFFh
+	REG_MBK_MAP_B = MBK_MAP_START(0xe8) | MBK_MAP_SIZE(MbkMapSize_256K) | MBK_MAP_END(0xf0);   // 03740000h-0377FFFFh
+	mpu_region3(armMpuDefineRegion(NWRAM_BASE, CP15_PU_512K));
+	for (i = 0; i < n; i++) p[i] = i * 0x9e3779b1u ^ 0x5a5a5a5au;   // cada palabra distinta: también se ven los espejos
+	DC_FlushRange((void *)NWRAM_BASE, NWRAM_SIZE);
+	for (i = 0; i < n && p[i] == (i * 0x9e3779b1u ^ 0x5a5a5a5au); i++) { }
+	ok = i == n;
+	if (ok) {   // y que el ARM9 ejecute desde ahí: «mov r0, #42; bx lr» al final de la zona
+		u32 *f = (u32 *)(NWRAM_BASE + NWRAM_SIZE - 8);
+		f[0] = 0xe3a0002a;
+		f[1] = 0xe12fff1e;
+		DC_FlushRange(f, 8);
+		IC_InvalidateRange(f, 8);
+		ok = ((int (*)(void))f)() == 42;
+	}
+	if (!ok) mpu_region3(0);
+	remove(NWRAM_MARK);
+	if (!ok) nwram_why = "prueba";
+	nwram_report(ok ? "en uso para el codigo traducido" : "falla la prueba de lectura o de ejecucion");
+	return ok;
 }
 
 // Tarjeta de memoria: una por juego, junto al .cue (Silent Hill.cue -> Silent Hill.mcr). Se guarda en la SD
@@ -252,6 +432,7 @@ static void apply_cfg(void)
 	gpu_half_x = opt_quality == 3;   // baja res: además, la mitad de los píxeles de cada línea
 	gpu_frameskip = (u8)opt_skip;
 	auto_scale = AUTO_MIN;
+	auto_max = 256u * 100 / (u32)opt_cpu_min;
 	dyn_set_cpu_scale(opt_cpu ? 256u * 100 / (u32)cpu_pct[opt_cpu] : auto_scale);
 }
 
@@ -300,8 +481,18 @@ static int pick_game(char *out, size_t outlen)
 	}
 	closedir(d);
 	if (!n) return 0;
+	// Cada juego recuerda sus ajustes (su .cfg al lado): al marcarlo se cargan; si no tiene, los generales.
+	// Cambiar algo con un juego marcado lo apunta para ese juego.
+	int gq = opt_quality, gs = opt_skip, gc = opt_cpu, ghw = opt_hw, gsnd = opt_snd, gnw = opt_nwram, gmin = opt_cpu_min, gtg = opt_target, cur = -1, own = 0;
+	char gpath[300];
 	for (;;) {
 		int keys;
+		if (sel != cur) {
+			cur = sel;
+			opt_quality = gq; opt_skip = gs; opt_cpu = gc; opt_hw = ghw; opt_snd = gsnd; opt_nwram = gnw; opt_cpu_min = gmin; opt_target = gtg;
+			game_cfg_path(gpath, sizeof gpath, names[sel]);
+			own = cfg_read(gpath);
+		}
 		consoleClear();
 		printf("SparStation - elige juego\n(%s)\n\n", GAMES_DIR);
 		{   // caben 11 en pantalla: la ventana sigue a la selección
@@ -309,14 +500,15 @@ static int pick_game(char *out, size_t outlen)
 			for (int i = top; i < n && i < top + 11; i++) printf("%c %.28s\n", i == sel ? '>' : ' ', names[i]);
 			if (n > 11) printf("\x1b[37m  (%d de %d)\x1b[37;1m\n", sel + 1, n);
 		}
-		printf("\x1b[15;0H\x1b[36;1mAjustes de velocidad\x1b[37;1m\n");
+		printf("\x1b[15;0H\x1b[36;1mAjustes %s\x1b[37;1m\n", own ? "de este juego" : "generales");
 		printf("L/R    calidad: %s\n", quality_name[opt_quality]);
 		printf("SELECT saltar frames: %d\n", opt_skip);
 		printf("Y      CPU PS1: %s\n", cpu_name());
 		printf("X      GPU: %s\n", opt_hw ? "3D de la DS (rapida)" : "software (exacta)");
 		printf("B      sonido: %s\n", opt_snd ? "si" : "no");
+		printf("START  codigo: %s\n", !nwram_ok ? "RAM (sin NWRAM)" : opt_nwram ? "NWRAM (rapido)" : "RAM principal");
 		printf("\x1b[37m(calidad: solo GPU software)\x1b[37;1m\n");
-		printf("\nA: jugar");
+		printf("A: jugar");
 		fflush(stdout);
 		do { swiWaitForVBlank(); scanKeys(); keys = keysDown(); } while (!keys);
 		if (keys & KEY_UP) sel = (sel + n - 1) % n;
@@ -327,9 +519,11 @@ static int pick_game(char *out, size_t outlen)
 		if (keys & KEY_Y) opt_cpu = (opt_cpu + 1) % CPU_OPTS;
 		if (keys & KEY_X) opt_hw ^= 1;
 		if (keys & KEY_B) opt_snd ^= 1;
+		if ((keys & KEY_START) && nwram_ok) opt_nwram ^= 1;
+		if (keys & (KEY_R | KEY_L | KEY_SELECT | KEY_Y | KEY_X | KEY_B | KEY_START)) { cfg_write(gpath); own = 1; }
 		if (keys & KEY_A) break;
 	}
-	save_cfg();
+	save_cfg();   // los del juego elegido pasan a ser los generales (los que ven los juegos sin ajustes propios)
 	snprintf(out, outlen, GAMES_DIR "/%s", names[sel]);
 	return 1;
 }
@@ -609,8 +803,10 @@ static void microbench(void)
 }
 #endif
 
-// Menú de pausa (tocar MENU en la pantalla de abajo): estado guardado junto al juego (.sst, ~3,7 MB)
+// Menú de pausa (tocar MENU en la pantalla de abajo): estado guardado junto al juego (.sst, ~3,7 MB). Desde aquí
+// también se cambian el salto de imágenes y la CPU en marcha: se aplican al momento y quedan en los ajustes del juego.
 static char state_path[256];
+static char game_cfg[256];   // ajustes propios del juego en marcha (Silent Hill.cue -> Silent Hill.cfg)
 
 static void wait_release(void) { do { swiWaitForVBlank(); scanKeys(); } while (keysHeld()); }
 
@@ -627,10 +823,19 @@ static void pause_menu(void)
 		printf("A      seguir jugando\n\n");
 		printf("X      guardar estado\n\n");
 		printf("Y      cargar estado%s\n\n", has_state ? "" : " (no hay)");
+		printf("SELECT saltar frames: %d\n", opt_skip);
+		printf("R      CPU PS1: %s\n\n", cpu_name());
 		printf("\x1b[37mEl estado guarda el momento\nexacto (en la SD, junto al\njuego). Las partidas del juego\nvan a la tarjeta de memoria\n(.mcr), que se guarda sola.\x1b[37;1m\n");
 		fflush(stdout);
 		do { swiWaitForVBlank(); scanKeys(); k = keysDown(); } while (!k);
 		if (k & (KEY_A | KEY_B | KEY_START)) break;
+		if (k & (KEY_SELECT | KEY_R)) {   // al momento, y apuntado para este juego
+			if (k & KEY_SELECT) opt_skip = (opt_skip + 1) % 4;
+			if (k & KEY_R) opt_cpu = (opt_cpu + 1) % CPU_OPTS;
+			apply_cfg();
+			if (game_cfg[0]) cfg_write(game_cfg);
+			continue;
+		}
 		if (k & KEY_X) {
 			FILE *f = fopen(state_path, "wb");
 			int ok;
@@ -678,10 +883,15 @@ static void run_loop(const char *title, int use_log)
 	prof_start("");   // melonDS: dsbench lee las muestras de la RAM (DSB_PROF)
 #endif
 	if (title) {
-		char info[48];
-		snprintf(info, sizeof info, "%s, salto %d, CPU %s", quality_name[opt_quality], opt_skip, cpu_name());
+		char info[64], nw[24];
+		if (nwram_ok) snprintf(nw, sizeof nw, "%s", opt_nwram ? "NWRAM" : "RAM");
+		else snprintf(nw, sizeof nw, "RAM (sin NWRAM: %s)", nwram_why[0] ? nwram_why : "?");
+		snprintf(info, sizeof info, "%s, salto %d, CPU %s, codigo %s", quality_name[opt_quality], opt_skip, cpu_name(), nw);
 		hud_start(title, use_log, info);
 	}
+#ifdef STACK_PROBE
+	stack_paint();   // desde aquí: solo lo que gasta la emulación
+#endif
 	for (;;) {
 		u32 t0 = fast_ticks();
 		scanKeys();
@@ -710,6 +920,9 @@ static void run_loop(const char *title, int use_log)
 			while ((s32)(lim_t - (vblanks - lim_base) * 5) > 0) swiWaitForVBlank();
 		}
 		bench.frames++;
+#ifdef GX_HASH
+		{ extern u32 gx_hash; if (bench.frames == GX_HASH) gx_dbg.dyn = gx_hash; }
+#endif
 #ifdef PSX_SMCLOG
 		{ extern u32 psx_frame_no; psx_frame_no = bench.frames; }
 #endif
@@ -719,14 +932,17 @@ static void run_loop(const char *title, int use_log)
 		{ u32 used, size; extern u32 *dyn_code_base(void); dyn_cache_use(&used, &size); bench.code = (u32)dyn_code_base(); bench.code_used = used; }
 		if (vblanks - last >= 60) {   // un segundo real
 			if (!opt_cpu && frames) {   // CPU automática: acercar el trabajo de cada frame al tiempo de un frame real
-				u32 target = (gpu_disp.pal ? 33514000u / 50 : 33514000u / 60) * 92 / 100;
+				u32 target = (gpu_disp.pal ? 33514000u / 50 : 33514000u / 60) * (u32)opt_target / 100;
 				u32 want = (u32)((u64)auto_scale * (psx_prof[PROF_FRAME] / (u32)frames) / target);
 				auto_scale = (auto_scale + want) / 2;
 				if (auto_scale < AUTO_MIN) auto_scale = AUTO_MIN;
-				if (auto_scale > AUTO_MAX) auto_scale = AUTO_MAX;
+				if (auto_scale > auto_max) auto_scale = auto_max;
 				dyn_set_cpu_scale(auto_scale);
 			}
 			bench_second();
+#ifdef STACK_PROBE
+			gx_dbg.dyn = stack_used() << 16 | stack_paint_depth;
+#endif
 			if (title) hud_second(frames, vblanks - last);
 			else { memset(psx_prof, 0, sizeof psx_prof); memset(&psx_stat, 0, sizeof psx_stat); }
 			frames = 0;
@@ -740,6 +956,9 @@ int main(void)
 	char game[256];
 	int bg;
 
+#ifdef STACK_PROBE
+	stack_paint();
+#endif
 	defaultExceptionHandler();   // un fallo del ARM9 enseña los registros en vez de quedarse en negro
 	videoSetMode(MODE_5_2D);
 	videoSetModeSub(MODE_0_2D);
@@ -753,7 +972,7 @@ int main(void)
 	fb[1] = fb[0] + 256 * 256;   // banco B, base de mapa 8
 	dmaFillHalfWords(0x8000, fb[0], 2 * 256 * 256 * 2);
 
-	printf("SparStation v18 - PS1 en DSi\nby Spar Retro\n\n");
+	printf("SparStation v33 - PS1 en DSi\nby Spar Retro\n\n");
 #ifdef PSX_SELFTEST
 	if (!nitroFSInit(NULL) || !pak_init() || !load_bios()) {
 		printf("Pruebas: falta nitro:/bios.bin\no el Expansion Pak.\n");
@@ -794,6 +1013,21 @@ int main(void)
 			printf("Modo DS: disco reducido\n");
 			psx_fastboot = 1;
 		} else printf("Modo DS: demo de la BIOS.\nLos juegos necesitan modo DSi.\n");
+#ifdef DYN_HOT_TEST
+		{   // EXTRA=-DDYN_HOT_TEST=KB: zona caliente en otro búfer, como con la NWRAM de la DSi (melonDS no la tiene en modo DS).
+			// dsbench con DSB_MAGIC=SPHOTTST:8:archivo saca dónde quedó (0 = no hubo memoria) y la caché de código de antes
+			// Sin memoria libre (las pruebas de instrucciones), la mitad final del búfer de código, y la fría la primera.
+			static volatile struct { char magic[8]; u32 hot, old; } hot_dbg = { "SPHOTTST" };
+			u32 kb = DYN_HOT_TEST, used, size;
+			void *h = malloc(kb * 1024);
+			hot_dbg.old = (u32)dyn_code_base();
+			dyn_cache_use(&used, &size);
+			if (!h) { kb = size / 2048; h = (u8 *)dyn_code_base() + kb * 1024; }
+			dyn_hot_area(h, kb * 1024);
+			hot_dbg.hot = (u32)h;
+			printf("Zona caliente aparte: %s\n", h ? "si" : "NO");
+		}
+#endif
 		psx_reset();
 		if (nitro && !psx_tty) {   // banco de pruebas: empezar desde un estado guardado, con guion de botones
 			FILE *sf = fopen("nitro:/state.sst", "rb");
@@ -814,6 +1048,9 @@ int main(void)
 			opt_cpu = BENCH_CPU;
 #endif
 			apply_cfg();
+#ifdef BENCH_PCT
+			dyn_set_cpu_scale(256u * 100 / BENCH_PCT);   // EXTRA=-DBENCH_PCT=n: CPU fija al n% (cualquier valor)
+#endif
 #endif
 		}
 		irqSet(IRQ_VBLANK, on_vblank);
@@ -824,10 +1061,12 @@ int main(void)
 		printf("No puedo leer la tarjeta SD.\n");
 		for (;;) swiWaitForVBlank();
 	}
+	nwram_ok = nwram_init();
 	if (!pick_game(game, sizeof game)) {
 		printf("No hay juegos en %s\n(.cue + .bin)\n", GAMES_DIR);
 		for (;;) swiWaitForVBlank();
 	}
+	if (nwram_ok && opt_nwram) dyn_hot_area((void *)NWRAM_BASE, NWRAM_SIZE);   // aún no se ha traducido nada
 	if (!open_disc(game)) {
 		printf("No puedo abrir\n%s\n", game);
 		for (;;) swiWaitForVBlank();
@@ -835,6 +1074,7 @@ int main(void)
 	card_open(game);
 	snd_enable(opt_snd);
 	snprintf(state_path, sizeof state_path, "%.*s.sst", (int)(strrchr(card_path, '.') - card_path), card_path);
+	snprintf(game_cfg, sizeof game_cfg, "%.*s.cfg", (int)(strrchr(card_path, '.') - card_path), card_path);
 	psx_fastboot = 1;   // sin la animación de la BIOS (unos 25 s en la DSi)
 	psx_reset();
 	apply_cfg();

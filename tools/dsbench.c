@@ -211,7 +211,7 @@ int main(int argc, char **argv)
 		uint8_t *ram = NULL;
 		size_t ramn = 0;
 		uint32_t *bench = NULL;
-#define BENCH_N 6 + 8 + 28
+#define BENCH_N (6 + 8 + 31)
 		if (retro_get_memory_data && retro_get_memory_size) { ram = retro_get_memory_data(2); ramn = retro_get_memory_size(2); }
 		if (getenv("DSB_PSX")) sscanf(getenv("DSB_PSX"), "%u:%u", &psx_from, &psx_to);
 		// DSB_PROF=archivo: desde el frame DSB_SNAP, las muestras del perfilador (ds/source/prof.c, marca
@@ -257,8 +257,8 @@ int main(int argc, char **argv)
 			// tras la cabecera: frames, vblanks, pc, ram, código, código usado, tiempos, contadores
 			enum { B_PROF = 6, B_STAT = 14 };
 			static const char *pn[8] = { "cpu", "gpu", "present", "frame", "disc", "mdec", "compile", "gte" };
-			static const char *sn[28] = { "gpu_cmds", "tris", "rects", "lines", "fills", "copies", "vram_up", "gpu_px", "flips",
-			                              "cd_sect", "mdec_blk", "compiled", "flushes", "smc", "interp_ops", "interp_steps", "idle", "mips", "arm", "gte_ops", "io", "sio_b", "sio_ack", "sio_poll", "tri_rapido", "tri_otro", "rect_rapido", "rect_otro" };
+			static const char *sn[31] = { "gpu_cmds", "tris", "rects", "lines", "fills", "copies", "vram_up", "gpu_px", "flips",
+			                              "cd_sect", "mdec_blk", "compiled", "flushes", "smc", "interp_ops", "interp_steps", "idle", "mips", "arm", "gte_ops", "io", "sio_b", "sio_ack", "sio_poll", "tri_rapido", "tri_otro", "rect_rapido", "rect_otro", "vistas", "tex_nuevas", "descartes_fb" };
 			uint32_t d[BENCH_N];
 			double secs;
 			const char *dump = getenv("DSB_PSXMEM");   // DSB_PSXMEM=desplazamiento:bytes:archivo vuelca RAM de la PS1
@@ -271,7 +271,8 @@ int main(int argc, char **argv)
 			for (int k = 0; k < BENCH_N; k++) d[k] = bench[k] - b0[k];
 			secs = d[1] / 60.0;
 			if (secs <= 0) secs = 1;
-			printf("BENCH frames=%u vblanks=%u -> %.2f fps (juego %.2f)  pc=%08x\n", d[0], d[1], d[0] / secs, d[B_STAT + 8] / secs, bench[2]);
+			printf("BENCH frames=%u vblanks=%u -> %.2f fps (juego %.2f, vistas %.2f)  pc=%08x\n", d[0], d[1], d[0] / secs, d[B_STAT + 8] / secs,
+			       d[B_STAT + 28] / secs, bench[2]);
 			printf("  tiempo:");
 			for (int k = 0; k < 8; k++) printf(" %s=%.1f%%", pn[k], d[B_PROF + 3] ? d[B_PROF + k] * 100.0 / d[B_PROF + 3] : 0.0);
 			if (d[0]) {   // ms por frame de la PS1 (temporizador a 33,514 MHz); «ejec» = CPU sin GPU, MDEC ni traducir
@@ -282,7 +283,7 @@ int main(int argc, char **argv)
 				printf("\n  DSi estimado (sin traducir): %.1f ms/frame", ((double)d[B_PROF + 3] - d[B_PROF + 6]) / f);
 			}
 			printf("\n  por s:");
-			for (int k = 0; k < 28; k++) printf(" %s=%.0f", sn[k], d[B_STAT + k] / secs);
+			for (int k = 0; k < 31; k++) printf(" %s=%.0f", sn[k], d[B_STAT + k] / secs);
 			printf("\n");
 			if (dump) {
 				unsigned off, len;
@@ -310,7 +311,7 @@ int main(int argc, char **argv)
 			for (size_t o = 0; r && o + 8 + len <= rn; o += 4)
 				if (!memcmp(r + o, mg, 8)) { FILE *f = fopen(path, "wb"); if (f) { fwrite(r + o + 8, 1, len, f); fclose(f); } break; }
 	}
-	wav_finish((unsigned)(wav_frames * 59.8261 / (frames > 0 ? frames : 1) + 0.5));   // frecuencia sacada de lo recibido
+	wav_finish((unsigned)(wav_frames * 59.8261 / (cur_frame + 1) + 0.5));   // frecuencia sacada de lo recibido en los frames que corrieron
 	if (frame) save_png(argv[4]);
 	printf("ok %ux%u\n", fw, fh);
 	return 0;

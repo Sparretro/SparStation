@@ -45,6 +45,10 @@ static u32 irgb(void)
 	return clampi(IR[1] >> 7, 0, 31) | (clampi(IR[2] >> 7, 0, 31) << 5) | (clampi(IR[3] >> 7, 0, 31) << 10);
 }
 
+// En la DS, gte.c se compila dos veces: lo caliente en la ITCM (ds/hot/gte.itcm.c, GTE_HOT_ONLY) y lo frío en la
+// RAM principal (ds/hot/gte.cold.c, GTE_COLD_ONLY: gte_exec, gte_command y gte_state, que en partida no se usan).
+// Las funciones static salen en las dos (cada una se queda las que usa); las globales, solo en una.
+#ifndef GTE_COLD_ONLY
 u32 gte_read(int r)
 {
 	switch (r) {
@@ -138,6 +142,7 @@ void gte_write(int r, u32 v)
 	case 63: FLAG = v & 0x7ffff000; break;
 	}
 }
+#endif
 
 static int part2(GteRegPart *p, void *lo, void *hi)
 {
@@ -152,6 +157,7 @@ static int part1(GteRegPart *p, void *a, int bits, int sign)
 	return 1;
 }
 
+#ifndef GTE_COLD_ONLY
 int gte_reg_parts(int r, int write, GteRegPart p[2])
 {
 	if (r >= 32 && r < 56 && (r & 7) < 5) {   // matrices RT, LM y LC: pares de s16 seguidos
@@ -186,6 +192,7 @@ int gte_reg_parts(int r, int write, GteRegPart p[2])
 	}
 	return 0;   // IRGB/ORGB, LZCS al escribir, FLAG: con gte_read/gte_write
 }
+#endif
 
 // ---- aritmética con banderas ----
 #define GTE_INL static inline __attribute__((always_inline))   // las pequeñas, integradas: se llaman muchísimo
@@ -413,39 +420,42 @@ _Static_assert(offsetof(RtpOut, ir1) == 12 && offsetof(RtpOut, n) == 24 && offse
                offsetof(RtpOut, sx) == 32 && offsetof(RtpOut, sy) == 38 && offsetof(RtpOut, sz) == 44, "RtpOut");
 void gte_rtpt_asm(const GteRegs *g, RtpOut *o, s32 lo, const u8 *unr_tab);
 void gte_rtps_asm(const GteRegs *g, RtpOut *o, s32 lo, const u8 *unr_tab);
+#ifndef GTE_COLD_ONLY
 __asm__(
 "	.text\n"
 "	.arm\n"
 "	.align 2\n"
-// una fila de la matriz: mac = TR + (RT . V) >> 12 en r7; ir recortado a [lo, 7FFFh] en r8; ambos a o
-".macro RTPROW rt, tr, omac, oir, flagbit\n"
-"	ldrsh r8, [r0, #\\rt]\n"
-"	ldrsh r9, [r0, #\\rt+2]\n"
-"	ldrsh r10, [r0, #\\rt+4]\n"
-"	smull r12, lr, r8, r4\n"
-"	smlal r12, lr, r9, r5\n"
-"	smlal r12, lr, r10, r6\n"
-"	ldr r7, [r0, #\\tr]\n"
-"	add r7, r7, r12, lsr #12\n"
-"	add r7, r7, lr, lsl #20\n"
-"	cmp r7, r2\n"
-"	movlt r8, r2\n"
-"	movge r8, r7\n"
-"	cmp r8, #0x8000\n"
-"	movge r8, #0x7f00\n"
-"	orrge r8, r8, #0xff\n"
-"	str r7, [r1, #\\omac]\n"
-"	str r8, [r1, #\\oir]\n"
+// Una fila: suma = RTj0*X + RTj1*Y + RTj2*Z de 16x16 bits sumada en 64 (SMULxy + SMLALxy del ARM9E: 1 y 2 ciclos,
+// contra 3 de SMULL/SMLAL); la matriz va empaquetada en r4-r8 (cargada una vez para los tres vértices) y el vértice
+// en r9-r10. mac = TR + (suma >> 12) a MACn; ir recortado a [lo (r2), 7FFFh] a IRn, y su bandera.
+".macro RTROW m0, h0, m1, h1, m2, h2, xr, xh, yr, yh, zr, zh, row, flagbit\n"
+"	smul\\h0\\xh r12, \\m0, \\xr\n"
+"	ldr r1, [r0, #48+\\row*4]\n"
+"	mov lr, r12, asr #31\n"
+"	smlal\\h1\\yh r12, lr, \\m1, \\yr\n"
+"	smlal\\h2\\zh r12, lr, \\m2, \\zr\n"
+"	add r1, r1, r12, lsr #12\n"
+"	add r1, r1, lr, lsl #20\n"
+"	str r1, [r0, #36+\\row*4]\n"
+"	cmp r1, r2\n"
+"	movlt r3, r2\n"
+"	movge r3, r1\n"
+"	cmp r3, #0x8000\n"
+"	movge r3, #0x7f00\n"
+"	orrge r3, r3, #0xff\n"
+"	strh r3, [r0, #116+\\row*2]\n"
 "	.if \\flagbit\n"
-"	teq r8, r7\n"
+"	teq r3, r1\n"
 "	orrne r11, r11, #(1 << \\flagbit)\n"
 "	.endif\n"
 ".endm\n"
-// proyección de un eje: n (r7) * ir + OF, desbordamientos (bits 16/15), y recorte a [-400h, 3FFh]
-".macro PROJ irr, ofr, satbit, osx\n"
-"	smull r9, r10, r7, \\irr\n"
-"	adds r9, r9, \\ofr\n"
-"	adc r10, r10, \\ofr, asr #31\n"
+// proyección de un eje: n (r1) * IRn + OF, desbordamientos (bits 16/15), y recorte a [-400h, 3FFh] en su sitio de la cola
+".macro PROJ irofs, ofofs, satbit, osx\n"
+"	ldrsh r3, [r0, #\\irofs]\n"
+"	ldr r12, [r0, #\\ofofs]\n"
+"	smull r9, r10, r1, r3\n"
+"	adds r9, r9, r12\n"
+"	adc r10, r10, r12, asr #31\n"
 "	cmp r10, r9, asr #31\n"
 "	beq 1f\n"
 "	cmp r10, #0\n"
@@ -461,86 +471,69 @@ __asm__(
 "	mov r9, #0x400\n"
 "	rsblt r9, r9, #0\n"
 "	subge r9, r9, #1\n"
-"2:	strh r9, [r1, #\\osx]\n"
+"2:	strh r9, [r0, #\\osx]\n"
 ".endm\n"
-// un vértice entero
-".macro RTPV vi\n"
-"	ldrsh r4, [r0, #96+\\vi*6]\n"
-"	ldrsh r5, [r0, #98+\\vi*6]\n"
-"	ldrsh r6, [r0, #100+\\vi*6]\n"
-"	RTPROW 134, 48, 0, 12, 24\n"
-"	RTPROW 140, 52, 4, 16, 23\n"
-"	RTPROW 146, 56, 8, 20, 0\n"
-"	add r9, r7, #0x8000\n"           // bandera de IR3: mira MAC3 sin lm
-"	cmp r9, #0x10000\n"
+// un vértice entero: va/vb = las dos palabras donde está, xr/xh... = registro y mitad de cada coordenada; szofs, sxofs y
+// syofs = dónde va su SZ, SX y SY en las colas. Deja n en r1.
+".macro RTV va, vb, xr, xh, yr, yh, zr, zh, szofs, sxofs, syofs\n"
+"	ldr r9, [r0, #\\va]\n"
+"	ldr r10, [r0, #\\vb]\n"
+"	RTROW r4, t, r5, b, r5, t, \\xr, \\xh, \\yr, \\yh, \\zr, \\zh, 0, 24\n"
+"	RTROW r6, b, r6, t, r7, b, \\xr, \\xh, \\yr, \\yh, \\zr, \\zh, 1, 23\n"
+"	RTROW r7, t, r8, b, r8, t, \\xr, \\xh, \\yr, \\yh, \\zr, \\zh, 2, 0\n"
+"	add r12, r1, #0x8000\n"           // bandera de IR3: mira MAC3 (r1) sin lm
+"	cmp r12, #0x10000\n"
 "	orrhs r11, r11, #(1 << 22)\n"
-"	movs r9, r7, lsr #16\n"            // SZ: MAC3 recortado a [0, FFFFh]
-"	moveq r9, r7\n"
-"	mvnne r9, r7, asr #31\n"
-"	movne r9, r9, lsr #16\n"
+"	movs r12, r1, lsr #16\n"            // SZ: MAC3 recortado a [0, FFFFh]
+"	moveq r12, r1\n"
+"	mvnne r12, r1, asr #31\n"
+"	movne r12, r12, lsr #16\n"
 "	orrne r11, r11, #(1 << 18)\n"
-"	strh r9, [r1, #44+\\vi*2]\n"
+"	strh r12, [r0, #\\szofs]\n"
 "	ldrh r10, [r0, #204]\n"            // división UNR: n = H / SZ (como divide())
-"	cmp r10, r9, lsl #1\n"
+"	cmp r10, r12, lsl #1\n"
 "	bhs 4f\n"
-"	clz r12, r9\n"
-"	sub r12, r12, #16\n"
-"	mov lr, r9, lsl r12\n"
-"	sub r8, lr, #0x7f00\n"
-"	sub r8, r8, #0xc0\n"
-"	ldrb r8, [r3, r8, lsr #7]\n"
-"	add r8, r8, #0x100\n"
-"	add r8, r8, #1\n"
-"	mul r7, lr, r8\n"
-"	rsb r7, r7, #0x2000000\n"
-"	add r7, r7, #0x80\n"
-"	mov r7, r7, lsr #8\n"
-"	mul r9, r7, r8\n"
-"	add r9, r9, #0x80\n"
-"	mov r9, r9, lsr #8\n"
-"	mov r10, r10, lsl r12\n"
-"	umull r7, r8, r10, r9\n"
-"	adds r7, r7, #0x8000\n"
-"	adc r8, r8, #0\n"
-"	movs r10, r8, lsr #16\n"
-"	mov r7, r7, lsr #16\n"
-"	orr r7, r7, r8, lsl #16\n"
+"	clz r9, r12\n"
+"	sub r9, r9, #16\n"
+"	mov lr, r12, lsl r9\n"
+"	sub r3, lr, #0x7f00\n"
+"	sub r3, r3, #0xc0\n"
+"	ldr r1, [sp]\n"                     // la tabla
+"	ldrb r3, [r1, r3, lsr #7]\n"
+"	add r3, r3, #0x100\n"
+"	add r3, r3, #1\n"
+"	mul r1, lr, r3\n"
+"	rsb r1, r1, #0x2000000\n"
+"	add r1, r1, #0x80\n"
+"	mov r1, r1, lsr #8\n"
+"	mul r12, r1, r3\n"
+"	add r12, r12, #0x80\n"
+"	mov r12, r12, lsr #8\n"
+"	mov r10, r10, lsl r9\n"
+"	umull r1, r3, r10, r12\n"
+"	adds r1, r1, #0x8000\n"
+"	adc r3, r3, #0\n"
+"	movs r10, r3, lsr #16\n"
+"	mov r1, r1, lsr #16\n"
+"	orr r1, r1, r3, lsl #16\n"
 "	bne 5f\n"
-"	cmp r7, #0x20000\n"
+"	cmp r1, #0x20000\n"
 "	blo 6f\n"
-"5:	mov r7, #0x20000\n"
-"	sub r7, r7, #1\n"
+"5:	mov r1, #0x20000\n"
+"	sub r1, r1, #1\n"
 "	b 6f\n"
 "4:	orr r11, r11, #(1 << 17)\n"
-"	mov r7, #0x20000\n"
-"	sub r7, r7, #1\n"
-"6:	str r7, [r1, #24]\n"
-"	ldr r8, [r1, #12]\n"
-"	ldr r12, [r0, #84]\n"
-"	PROJ r8, r12, 14, 32+\\vi*2\n"
-"	ldr r8, [r1, #16]\n"
-"	ldr r12, [r0, #88]\n"
-"	PROJ r8, r12, 13, 38+\\vi*2\n"
+"	mov r1, #0x20000\n"
+"	sub r1, r1, #1\n"
+"6:	PROJ 116, 84, 14, \\sxofs\n"
+"	PROJ 118, 88, 13, \\syofs\n"
 ".endm\n"
-// el final de RTPS/RTPT: MAC1-3 e IR1-3 del último vértice, profundidad (MAC0 = n*DQA + DQB, IR0 recortado a
-// [0, 1000h]) y FLAG |= las banderas. o (r1) tiene lo del último vértice.
+// el final de RTPS/RTPT: profundidad del último vértice (MAC0 = n*DQA + DQB, IR0 recortado a [0, 1000h]) y FLAG |= las
+// banderas. MAC1-3, IR1-3 y las colas ya están en su sitio.
 ".macro FINISH\n"
-"	ldr r4, [r1, #0]\n"
-"	str r4, [r0, #36]\n"
-"	ldr r4, [r1, #4]\n"
-"	str r4, [r0, #40]\n"
-"	ldr r4, [r1, #8]\n"
-"	str r4, [r0, #44]\n"
-"	ldr r4, [r1, #12]\n"
-"	strh r4, [r0, #116]\n"
-"	ldr r4, [r1, #16]\n"
-"	strh r4, [r0, #118]\n"
-"	ldr r4, [r1, #20]\n"
-"	strh r4, [r0, #120]\n"
-"	ldr r7, [r1, #24]\n"
 "	ldrsh r8, [r0, #188]\n"
 "	ldr r12, [r0, #92]\n"
-"	smull r9, r10, r7, r8\n"
+"	smull r9, r10, r1, r8\n"
 "	adds r9, r9, r12\n"
 "	adc r10, r10, r12, asr #31\n"
 "	str r9, [r0, #32]\n"
@@ -562,71 +555,65 @@ __asm__(
 "	orr r4, r4, r11\n"
 "	str r4, [r0, #28]\n"
 ".endm\n"
+// matriz empaquetada: RT00 en la mitad alta de la palabra de SY2; luego RT01 RT02, RT10 RT11, RT12 RT20, RT21 RT22
+".macro LOADRT\n"
+"	ldr r4, [r0, #132]\n"
+"	ldr r5, [r0, #136]\n"
+"	ldr r6, [r0, #140]\n"
+"	ldr r7, [r0, #144]\n"
+"	ldr r8, [r0, #148]\n"
+".endm\n"
 "	.global gte_rtpt_asm\n"
 "	.type gte_rtpt_asm, %function\n"
 "gte_rtpt_asm:\n"
 "	push {r4-r11, lr}\n"
+"	sub sp, sp, #8\n"
+"	str r3, [sp]\n"                     // la tabla UNR (r3 hace de temporal)
 "	mov r11, #0\n"
-"	RTPV 0\n"
-"	RTPV 1\n"
-"	RTPV 2\n"
-"	ldrh r4, [r0, #202]\n"              // SZ0 = SZ3 de antes; SZ1-3, SX0-2 y SY0-2: los de los tres vértices
-"	strh r4, [r0, #196]\n"
-"	ldrh r4, [r1, #44]\n"               // (de media en media palabra: SZ1 no está alineado a 4 y el ARM9
-"	ldrh r5, [r1, #46]\n"               // no lee ni escribe palabras desalineadas)
-"	ldrh r6, [r1, #48]\n"
-"	strh r4, [r0, #198]\n"
-"	strh r5, [r0, #200]\n"
-"	strh r6, [r0, #202]\n"
-"	ldrh r4, [r1, #32]\n"
-"	ldrh r5, [r1, #34]\n"
-"	ldrh r6, [r1, #36]\n"
-"	strh r4, [r0, #122]\n"
-"	strh r5, [r0, #124]\n"
-"	strh r6, [r0, #126]\n"
-"	ldrh r4, [r1, #38]\n"
-"	ldrh r5, [r1, #40]\n"
-"	ldrh r6, [r1, #42]\n"
-"	strh r4, [r0, #128]\n"
-"	strh r5, [r0, #130]\n"
-"	strh r6, [r0, #132]\n"
+"	LOADRT\n"
+"	ldrh r12, [r0, #202]\n"             // SZ0 = SZ3 de antes; los tres vértices van directos a SZ1-3, SXY0-2
+"	strh r12, [r0, #196]\n"
+"	RTV 96, 100, r9, b, r9, t, r10, b, 198, 122, 128\n"
+"	RTV 100, 104, r9, t, r10, b, r10, t, 200, 124, 130\n"
+"	RTV 108, 112, r9, b, r9, t, r10, b, 202, 126, 132\n"
 "	FINISH\n"
+"	add sp, sp, #8\n"
 "	pop {r4-r11, pc}\n"
 "	.size gte_rtpt_asm, . - gte_rtpt_asm\n"
 "	.global gte_rtps_asm\n"             // RTPS: solo el vértice 0 (las colas avanzan una)
 "	.type gte_rtps_asm, %function\n"
 "gte_rtps_asm:\n"
 "	push {r4-r11, lr}\n"
+"	sub sp, sp, #8\n"
+"	str r3, [sp]\n"
 "	mov r11, #0\n"
-"	RTPV 0\n"
-"	ldrh r4, [r0, #198]\n"              // SZ0-2 = SZ1-3; SZ3 = el nuevo
-"	ldrh r5, [r0, #200]\n"
-"	ldrh r6, [r0, #202]\n"
-"	ldrh r7, [r1, #44]\n"
-"	strh r4, [r0, #196]\n"
-"	strh r5, [r0, #198]\n"
-"	strh r6, [r0, #200]\n"
-"	strh r7, [r0, #202]\n"
-"	ldr r4, [r0, #124]\n"               // SX0-1 = SX1-2 (4 bytes alineados), SX2 = el nuevo
-"	ldrh r5, [r1, #32]\n"
-"	strh r4, [r0, #122]\n"
-"	mov r4, r4, lsr #16\n"
-"	strh r4, [r0, #124]\n"
-"	strh r5, [r0, #126]\n"
-"	ldrh r4, [r0, #130]\n"              // SY0-1 = SY1-2, SY2 = el nuevo
-"	ldrh r5, [r0, #132]\n"
-"	ldrh r6, [r1, #38]\n"
-"	strh r4, [r0, #128]\n"
-"	strh r5, [r0, #130]\n"
-"	strh r6, [r0, #132]\n"
+"	LOADRT\n"
+"	ldrh r9, [r0, #198]\n"              // SZ0-2 = SZ1-3
+"	ldrh r10, [r0, #200]\n"
+"	ldrh r12, [r0, #202]\n"
+"	strh r9, [r0, #196]\n"
+"	strh r10, [r0, #198]\n"
+"	strh r12, [r0, #200]\n"
+"	ldr r9, [r0, #124]\n"               // SX0-1 = SX1-2 (4 bytes alineados)
+"	strh r9, [r0, #122]\n"
+"	mov r9, r9, lsr #16\n"
+"	strh r9, [r0, #124]\n"
+"	ldrh r9, [r0, #130]\n"              // SY0-1 = SY1-2
+"	ldrh r10, [r0, #132]\n"
+"	strh r9, [r0, #128]\n"
+"	strh r10, [r0, #130]\n"
+"	RTV 96, 100, r9, b, r9, t, r10, b, 202, 126, 132\n"
 "	FINISH\n"
+"	add sp, sp, #8\n"
 "	pop {r4-r11, pc}\n"
 "	.size gte_rtps_asm, . - gte_rtps_asm\n"
-"	.purgem RTPROW\n"
+"	.purgem RTROW\n"
 "	.purgem PROJ\n"
-"	.purgem RTPV\n"
+"	.purgem RTV\n"
 "	.purgem FINISH\n"
+"	.purgem LOADRT\n"
 );
+#endif
 
 static __attribute__((noinline)) void rtpt12f(void)
 {
@@ -848,6 +835,7 @@ GTE_INL void nclip(void)
 	         (s64)SX[0] * SY[2] - (s64)SX[1] * SY[0] - (s64)SX[2] * SY[1]);
 }
 
+#ifndef GTE_HOT_ONLY
 static void gte_exec(u32 op)
 {
 	if (!unr_ready) {
@@ -991,9 +979,11 @@ void gte_command(u32 op)
 	gte_exec(op);
 }
 
+#endif
 // ---- entradas directas para el dynarec ----
 // La operación se sabe al traducir: cada una tiene su función (sin decodificar, sin contar, con sf ya fijo),
 // y el código traducido la llama sin pasar por el reloj (la GTE no lo mira). Lo raro va por gte_command.
+#ifndef GTE_COLD_ONLY
 void gte_reset(void)
 {
 	for (int i = 0; i < 257; i++) {
@@ -1024,7 +1014,7 @@ static void e_mvmva(u32 op)
 {
 	int mx = (op >> 17) & 3, vv = (op >> 15) & 3, cv = (op >> 13) & 3;
 	s32 vx, vy, vz;
-	if (mx == 3 || cv == 2) { gte_exec(op); return; }
+	if (mx == 3 || cv == 2) { gte_command(op); return; }
 	sf = (op >> 19) & 1 ? 12 : 0;
 	lm = (op >> 10) & 1;
 	FLAG = 0;
@@ -1043,7 +1033,7 @@ void (*gte_entry(u32 op))(u32)
 	case 0x2e: return e_avsz4;
 	case 0x12: return e_mvmva;
 	}
-	if (!s12) return gte_exec;   // el resto también directo: sin trampolín ni contar (MVMVA en Silent Hill)
+	if (!s12) return gte_command;   // el resto también directo: sin trampolín ni contar (MVMVA en Silent Hill)
 	switch (op & 0x3f) {
 	case 0x01: return e_rtps;
 	case 0x30: return e_rtpt;
@@ -1056,5 +1046,6 @@ void (*gte_entry(u32 op))(u32)
 	case 0x1e: return e_ncs;
 	case 0x20: return e_nct;
 	}
-	return gte_exec;
+	return gte_command;
 }
+#endif

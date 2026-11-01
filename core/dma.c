@@ -80,9 +80,15 @@ static void run(int ch)
 		if (!n) n = 0x10000;
 		lo = (addr & 0x1ffffc) - (n - 1) * 4;
 		if ((addr & 0x1ffffc) >= (n - 1) * 4) {   // sin dar la vuelta a la RAM: de un tirón y el código traducido una vez
-			u32 *p = ram32(addr), a = addr;
-			for (u32 i = n - 1; i; i--) { *p-- = (a - 4) & 0xffffff; a -= 4; }
-			*p = 0xffffff;
+			// de abajo arriba y de 8 en 8 (STM: en la RAM de la DS las escrituras seguidas van en ráfaga); cada
+			// entrada apunta a la de debajo y la más baja es el final de la lista
+			u32 *q = ram32(addr) - (n - 1), v = addr - (n - 1) * 4, k = n - 1;
+			*q++ = 0xffffff;
+			while (k >= 8) {
+				q[0] = v; q[1] = v + 4; q[2] = v + 8; q[3] = v + 12; q[4] = v + 16; q[5] = v + 20; q[6] = v + 24; q[7] = v + 28;
+				q += 8; v += 32; k -= 8;
+			}
+			while (k--) { *q++ = v; v += 4; }
 			dyn_ram_written_if(lo, n * 4);
 			finish(ch);
 			return;
@@ -98,13 +104,30 @@ static void run(int ch)
 
 	if (sync == 2) {   // lista enlazada (GPU)
 		int guard = 0x80000;
+		u8 *ram = psx_ram;
+		u32 o = addr & 0x1ffffc;
 		PROF_BEGIN();
 		for (;;) {
-			u32 hdr = *ram32(addr), n = hdr >> 24;
-			if (n && (addr & 0x1ffffc) + n * 4 < 0x200000) gpu_write_gp0_n(ram32(addr + 4), n);   // el paquete entero
-			else for (u32 i = 1; i <= n; i++) gpu_write_gp0(*ram32(addr + i * 4));
+			u32 hdr = *(const u32 *)(ram + o), n = hdr >> 24;
+			// entradas vacías seguidas de la tabla de orden (casi todas: TR recorre ~4000 por imagen): cada una apunta
+			// justo a la palabra anterior, así que basta comparar; de 4 en 4 mientras se cumpla
+			while (hdr == o - 4 && o >= 16 && guard > 4) {
+				const u32 *e = (const u32 *)(ram + o - 16);   // e[3] = la de o - 4 ... e[0] = la de o - 16
+				if (e[3] != o - 8 || e[2] != o - 12 || e[1] != o - 16 || e[0] != o - 20) break;
+				o -= 16;
+				hdr = e[0];
+				guard -= 4;
+			}
+			n = hdr >> 24;
+			if (n) {
+				if (o + n * 4 < 0x200000) gpu_write_gp0_n((const u32 *)(ram + o + 4), n);   // el paquete entero
+				else for (u32 i = 1; i <= n; i++) gpu_write_gp0(*(const u32 *)(ram + ((o + i * 4) & 0x1ffffc)));
+			}
+#ifdef DBG_GPUCOUNT
+			{ extern u32 dbg_nodes, dbg_guard; dbg_nodes++; if (guard == 1) dbg_guard++; }
+#endif
 			if ((hdr & 0x800000) || --guard == 0) break;
-			addr = hdr & 0xfffffc;
+			o = hdr & 0x1ffffc;
 		}
 		PROF_END(PROF_GPU);
 		madr[ch] = 0xffffff;
@@ -169,7 +192,7 @@ u32 dma_read(u32 off)
 	return 0;
 }
 
-void dma_write(u32 off, u32 v)
+PSX_ITCM void dma_write(u32 off, u32 v)   // en la ITCM: la tabla de orden y la lista de la GPU (4,2% en la DSi real con Tomb Raider)
 {
 	int ch = off >> 4;
 	if (ch == 7) {

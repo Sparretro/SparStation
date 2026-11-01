@@ -4,6 +4,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#ifdef DBG_GPUCOUNT
+u32 dbg_nodes, dbg_guard, dbg_lines, dbg_linecmd[32], dbg_gp1[64];   // depuración de la lista de la GPU (core/dma.c, core/gpu.c)
+int dbg_frame_on;   // el frame en que gpu.c enseña los polígonos con textura de 15 bits (DBG_FRAME)
+#endif
 
 static u8 *load_file(const char *path, u32 *len)
 {
@@ -427,7 +431,24 @@ int main(int argc, char **argv)
 				if (!strcmp(btn, names[k].n)) psx_pad_buttons &= ~names[k].b;
 		}
 
+#ifdef DBG_GPUCOUNT
+		dbg_frame_on = getenv("DBG_FRAME") && f == atoi(getenv("DBG_FRAME"));
+#endif
 		psx_run_frame();
+#ifdef DBG_GPUCOUNT
+		{   // depuración: comandos de línea y nodos de la lista de la GPU por segundo
+			extern u32 dbg_nodes, dbg_guard, dbg_lines, dbg_linecmd[32], dbg_gp1[64];
+			if (f % 60 == 59) {
+				printf("f%d nodos=%u guarda=%u lineas=%u", f, dbg_nodes, dbg_guard, dbg_lines);
+				for (int k = 0; k < 32; k++) if (dbg_linecmd[k]) printf(" %02x:%u", 0x40 + k, dbg_linecmd[k]);
+				for (int k = 0; k < 64; k++) if (dbg_gp1[k]) printf(" gp1_%02x:%u", k, dbg_gp1[k]);
+				memset(dbg_gp1, 0, sizeof dbg_gp1);
+				printf("\n");
+				dbg_nodes = dbg_guard = dbg_lines = 0;
+				memset(dbg_linecmd, 0, sizeof dbg_linecmd);
+			}
+		}
+#endif
 		for (int i = 1; i + 1 < argc; i++) {   // --save F:archivo guarda el estado tras el frame F
 			int at;
 			char sname[512];
@@ -476,6 +497,11 @@ int main(int argc, char **argv)
 	for (int i = 1; i + 1 < argc; i++)
 		if (!strcmp(argv[i], "--ref")) printf("VRAM_DIFF %d\n", vram_diff(argv[i + 1]));
 	if (want_prof) report_profile();
+#ifdef DBG_IRQCOUNT
+	{ extern u32 dbg_irq_count[11], dbg_exc_count; static const char *nm[11] = { "vblank", "gpu", "cdrom", "dma", "tmr0", "tmr1", "tmr2", "pad", "sio", "spu", "lpen" };
+	  for (int i = 0; i < 11; i++) if (dbg_irq_count[i]) printf("IRQ %s: %u\n", nm[i], dbg_irq_count[i]);
+	  printf("excepciones: %u\n", dbg_exc_count); }
+#endif
 #ifdef PSX_DBGCNT
 	{ extern unsigned dbg_cut[4]; printf("cortes por frame: fin %u cd %u sio %u tmr %u\n", dbg_cut[0] / frames, dbg_cut[1] / frames, dbg_cut[2] / frames, dbg_cut[3] / frames); }
 #endif

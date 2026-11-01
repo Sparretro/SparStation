@@ -101,7 +101,9 @@ int dyn_init(int big);
 void dyn_set_cpu_scale(u32 scale);   // cambia psx_cpu_scale en marcha (sin volver a traducir)
 void dyn_run(u32 until);
 void dyn_cache_use(u32 *used, u32 *size);   // bytes de la caché de código ocupados / total
-void dyn_regions(u32 r[6]);   // zonas de la caché de código (para el perfilador)
+void dyn_hot_area(void *p, u32 size);   // zona caliente de la caché de código en otra memoria (NWRAM de la DSi)
+u32 *dyn_code_base(void);               // principio de la zona caliente
+void dyn_regions(u32 r[8]);   // zonas de la caché de código (para el perfilador)
 u32 dyn_block_of(u32 arm_pc);   // PC MIPS del bloque traducido que contiene esa dirección (0 = ninguno)
 #define DYN_CHECK_WRITE(off) do { if (dyn_pages[((off) & 0x1fffff) >> DYN_PAGE_BITS]) dyn_smc((off) & 0x1fffff); } while (0)
 #else
@@ -144,11 +146,19 @@ typedef struct {
 	s16 tpx, tpy, cx, cy;    // página de textura y paleta en la VRAM
 	s16 ox, oy;              // origen del área de dibujo (esquina del buffer)
 } GpuHwPoly;
+// Polígono tal cual viene en el paquete de la DMA (comando 20h-3Fh entero en w): lo que no está en sus palabras
+typedef struct {
+	u32 cmd;
+	s16 dx, dy;              // a sumar a x, y del paquete: desplazamiento de dibujo menos el origen del buffer
+	u8 tex, semi, mask;      // como en GpuHwPoly
+	s16 tpx, tpy, cx, cy;
+} GpuHwRaw;
 typedef struct {
 	void (*poly)(const GpuHwVtx *v, int n, const GpuHwPoly *p);   // n = 3 o 4 (cuadrado: 0,1,2 y 1,2,3)
 	void (*vram_written)(int x, int y, int w, int h);              // para invalidar texturas y la imagen
 	void (*flip)(int drawn);   // el juego cambia el buffer mostrado; drawn = 0 si ese frame se saltó
 	void (*clear)(u16 color);  // relleno de casi todo un buffer de pantalla: en vez de escribir la VRAM
+	void (*poly_raw)(const u32 *w, const GpuHwRaw *r);   // opcional: el polígono sin pasar por GpuHwVtx (más rápido)
 } GpuHw;
 extern const GpuHw *gpu_hw;
 extern u8 gpu_rows_on;         // 1 = dibujar solo las filas marcadas en gpu_row_draw
@@ -281,6 +291,9 @@ typedef struct {
 	u32 gte_ops, io_calls;   // comandos de la GTE y accesos a memoria por el camino lento (E/S, scratchpad)
 	u32 sio_bytes, sio_acks, sio_polls;   // mando: bytes enviados, ACK y lecturas completas (0x42)
 	u32 gpu_px_kind[4];   // píxeles: triángulos por el bucle rápido / el resto, rectángulos rápido / el resto
+	u32 disp_drawn;    // de los disp_flips, los que se dibujaron de verdad (sin los saltados por gpu_frameskip)
+	u32 tex_bands;     // bandas de textura nuevas en la caché del 3D de la DS (gx.c)
+	u32 fb_skips;      // polígonos sin dibujar: su textura es un búfer de pantalla que solo tiene el 3D (gpu.c, fb_tex)
 } PsxStats;
 extern PsxStats psx_stat;
 #define STAT_ADD(f, n) (psx_stat.f += (n))

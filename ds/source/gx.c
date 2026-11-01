@@ -20,6 +20,16 @@
 #include "psx.h"
 #include "gx.h"
 
+#ifdef GX_HASH
+// Prueba: huella de lo que se manda al 3D (cabecera y vértices de cada polígono), la misma por gx_poly que por
+// gx_poly_raw aunque la lista quede distinta. main.c la deja en gx_dbg.dyn en el frame GX_HASH de la PS1;
+// con -DGX_NO_RAW todo va por el camino viejo: si las dos huellas coinciden, el 3D recibe lo mismo.
+u32 gx_hash = 2166136261u;
+#define GXH(v) (gx_hash = (gx_hash ^ (u32)(v)) * 16777619u)
+#else
+#define GXH(v) ((void)0)
+#endif
+
 #ifdef PSX_SELFTEST
 #define MAX_POLYS 1200   // en el modo DS la RAM va justa
 #else
@@ -138,8 +148,19 @@ static u32 p16_used[P16_N], p256_used[P256_N];      // frame_no + 1 del último 
 static s16 p16_owner[P16_N], p256_owner[P256_N];    // entrada de pal[] que lo ocupa (-1 = libre)
 static int p16_hand = 1, p256_hand;
 
+// Textura del último polígono de gx_poly_raw: si el siguiente usa la misma página, paleta y filas ya cargadas (lo
+// normal en Tomb Raider), no se busca en las cachés. Se anula si cambia la VRAM, si una banda o una paleta nueva
+// pudo echar la suya, y en cada imagen nueva (la primera vez pasa por tex_get/pal_get, que apuntan el uso).
+static struct { s16 tpx, tpy, cx, cy, v0, v1; u8 td, ok; u32 teximg, pltt, frame; int lum, vbase; } tc;
+#ifdef GX_NO_TC
+#define TC_ON 0   // medida: sin esta caché
+#else
+#define TC_ON 1
+#endif
+
 static void pal_reset(void)
 {
+	tc.ok = 0;
 	memset(pal, 0, sizeof pal);
 	memset(p16_used, 0, sizeof p16_used);
 	memset(p256_used, 0, sizeof p256_used);
@@ -159,7 +180,7 @@ static u32 pal_off(const PalEnt *e) { return e->n == 16 ? (u32)e->slot * 32 : 0x
 
 // Base de paleta (para PLTT_BASE) con los n colores de la CLUT en (cx, cy). n = 32: los 16 colores
 // llevados a brillo máximo (para A3I5, donde el brillo va en el alfa de cada texel) y 16 negros.
-static u32 pal_get(int cx, int cy, int n, int *lum)
+PSX_ITCM static u32 pal_get(int cx, int cy, int n, int *lum)
 {
 	STAGE(30);
 	u32 h = ((u32)cy * 64 + (u32)cx / 16 + (n == 256 ? 0x9e37 : n == 32 ? 0x4f1b : 0)) & (PAL_HASH - 1), off;
@@ -168,6 +189,7 @@ static u32 pal_get(int cx, int cy, int n, int *lum)
 	u32 sum = 0, now = frame_no + 1;
 	int small = n == 16, slot = 0;
 	if (e->n == n && e->x == cx && e->y == cy) { pal_mark_used(e); *lum = e->lum; return pal_off(e) >> 4; }
+	tc.ok = 0;   // una paleta nueva puede quedarse el hueco de la del último polígono
 	// hueco: el siguiente que no se haya usado en este frame (vuelta circular = aproximadamente el más viejo)
 	if (small) {
 		for (int t = 0; t < P16_N; t++) {
@@ -209,6 +231,7 @@ static u32 pal_get(int cx, int cy, int n, int *lum)
 
 static void pal_dirty(int x, int y, int w, int h)
 {
+	tc.ok = 0;
 	for (int i = 0; i < PAL_HASH; i++) {
 		PalEnt *e = &pal[i];
 		if (e->n && e->y >= y && e->y < y + h && e->x < x + w && e->x + e->n > x) {
@@ -236,6 +259,7 @@ static int page_key(int x, int y, int depth) { return ((y >> 8) & 1) << 4 | ((x 
 
 static void tex_reset(void)
 {
+	tc.ok = 0;
 	memset(tex, 0, sizeof tex);
 	memset(sub_owner, -1, sizeof sub_owner);
 	memset(page_head, -1, sizeof page_head);
@@ -253,6 +277,7 @@ static int dst_row(int depth) { return depth == 1 ? 128 : depth == 3 ? 512 : 256
 
 static void tex_dirty(int x, int y, int w, int h)
 {
+	tc.ok = 0;
 	for (int i = 0; i < NSUB; i++) {
 		TexEnt *t = &tex[i];
 		if (!t->used) continue;
@@ -324,7 +349,7 @@ static void tex_upload(const TexEnt *t, int u, int row0, int row1)
 }
 
 // Filas [v0, v1] de la página que aún no se han copiado: se copian ahora (por tramos seguidos)
-static void tex_ensure(TexEnt *t, int u, int v0, int v1)
+PSX_ITCM static void tex_ensure(TexEnt *t, int u, int v0, int v1)
 {
 	int w0 = v0 >> 5, w1 = v1 >> 5, missing = 0;
 	for (int w = w0; w <= w1; w++) {   // lo normal: ya están todas (por palabras de 32 filas)
@@ -354,7 +379,7 @@ static int tex_has(const TexEnt *t, int x, int y, int depth, int v0, int v1)
 #ifdef GX_TEXLOG
 struct { char magic[8]; u32 n, e[4096]; } gx_texlog = { "SPTEXLOG" };
 #endif
-static int tex_get(int x, int y, int depth, int cx, int cy, int v0, int v1)
+PSX_ITCM static int tex_get(int x, int y, int depth, int cx, int cy, int v0, int v1)
 {
 	static int last = 0;   // los polígonos seguidos suelen usar la misma página
 	int h, start, units, best = -1;
@@ -372,6 +397,7 @@ static int tex_get(int x, int y, int depth, int cx, int cy, int v0, int v1)
 			return i;
 		}
 	// la banda más pequeña (potencia de 2, desde 16 filas) que empieza a la altura del polígono y llega a sus filas
+	tc.ok = 0;   // puede echar la banda del último polígono
 	start = v0 & ~15;
 	for (h = 16; h < v1 - start + 1; h <<= 1) { }
 	if (start + h > 256) start = 256 - h;
@@ -410,7 +436,7 @@ static int tex_get(int x, int y, int depth, int cx, int cy, int v0, int v1)
 	tex[best].start = (u8)start; tex[best].h = (u16)h;
 	memset(tex[best].rows, 0, sizeof tex[best].rows);
 	tex_ensure(&tex[best], best, v0, v1);
-	STAT_ADD(gpu_lines, depth == 1 ? 1 : depth == 2 ? 1000 : 1000000);   // diagnóstico: bandas nuevas (4 bits, 8 bits x1000, 15 bits x1000000)
+	STAT_ADD(tex_bands, 1);
 	last = best;
 	return best;
 }
@@ -436,15 +462,25 @@ static inline u32 rgb5(int r, int g, int b) { return (u32)(r >> 3) | ((u32)(g >>
 static inline int mod5(int c) { c >>= 2; return c > 31 ? 31 : c; }   // color de modulación: 128 = 1.0
 static u32 inv255[256];   // inv255[m] = 255 * 65536 / m redondeado hacia arriba: (r * inv255[m]) >> 16 == r * 255 / m
 static u8 mod5t[256];     // color de modulación (128 = 1.0) a 5 bits, saturado
+static s32 kx, ky;        // escala a coordenadas de la DS (4.12) por píxel, en 24.8: se recalcula si cambia la resolución
+
+static inline void scale_update(void)
+{
+	static int last_w, last_h;
+	int w = gpu_disp.width, h = gpu_disp.height;
+	if (w != last_w || h != last_h) { kx = (8192 << 8) / w; ky = (8192 << 8) / h; last_w = w; last_h = h; }
+}
+
+// Cabecera (POLY_FORMAT, TEXIMAGE_PARAM, PLTT_BASE y BEGIN_VTXS) del bloque de vértices abierto en la lista: si el
+// polígono siguiente lleva la misma, sus vértices siguen en ese bloque (el hardware hace un polígono de cada 3 o 4).
+// blk_attr = ~0u: hay que empezar uno.
+static u32 blk_attr = ~0u, blk_teximg, blk_pltt, blk_quad;
 
 static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 {
 	STAGE(40);
 	static const u8 alpha_of[5] = { 31, 16, 16, 14, 8 };   // opaco, B/2+F/2, B+F, B-F, B+F/4 (aproximados)
 	static const int order[4] = { 0, 1, 3, 2 };            // cuadrado de la PS1 -> perímetro de la DS
-	int w = gpu_disp.width, h = gpu_disp.height;
-	static int last_w, last_h;
-	static s32 kx, ky;   // escala a coordenadas de la DS (4.12) por píxel, en 24.8: se recalcula si cambia la resolución
 	u32 attr, teximg = 0, pltt = 0, *o;
 	u32 z;
 	int lum = 24, alpha, white = 0, black = 0, vbase = 0;   // vbase: primera fila de la banda de textura
@@ -453,7 +489,7 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 	// del color de los vértices en el alfa del polígono.
 	int addlike = p->semi >= 2, a3 = 0, vb = 0, ramp = 0;   // a3 (A3I5 por página) desactivado: llenaba la caché
 	if (npolys >= MAX_POLYS || nverts + n > 6144) return;
-	if (w != last_w || h != last_h) { kx = (8192 << 8) / w; ky = (8192 << 8) / h; last_w = w; last_h = h; }
+	scale_update();
 	// Con el bit de máscara (comprobar y poner) la PS1 solo pinta sobre lo que no lo tiene: en Silent Hill son
 	// velos de niebla que tiñen solo al personaje (el fondo y la niebla ya tienen la marca). La DS no puede
 	// limitarlos así y saldrían como un recuadro: mejor no dibujarlos.
@@ -498,7 +534,9 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 	*o++ = teximg;
 	*o++ = pltt;
 	*o++ = n == 4 ? 1 : 0;
+	blk_attr = ~0u;   // estos vértices van con VTX_16: el siguiente de gx_poly_raw empieza bloque propio
 	z = (u32)(4000 - npolys * 3) & 0xffff;
+	GXH(attr); GXH(teximg); GXH(pltt); GXH(n == 4); GXH(z);
 	{
 		// color de cada vértice: constante, normalizado (aditivos), RGB tal cual o modulación de textura
 		enum { CM_CONST, CM_NORM, CM_RGB, CM_MOD } cm;
@@ -530,6 +568,7 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 				}
 				*o++ = 0x20 | (0x22 << 8) | (0x23 << 16);   // COLOR, TEXCOORD, VTX_16
 				*o++ = col;
+				GXH(col);
 			} else *o++ = 0x22 | (0x23 << 8);           // TEXCOORD, VTX_16 (el color sigue)
 			if (ramp) {
 				int m = q->r > q->g ? (q->r > q->b ? q->r : q->b) : (q->g > q->b ? q->g : q->b);
@@ -539,8 +578,141 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 				*o++ = (8u << 16) | (u32)(m * 16 + 8);
 			} else
 				*o++ = ((u32)((q->v - vbase) << 4) << 16) | ((u32)(q->u << 4) & 0xffff);
+			GXH(o[-1]);
 			*o++ = ((u32)y << 16) | ((u32)x & 0xffff);
+			GXH(o[-1]);
 			*o++ = z;
+		}
+	}
+	ln = (int)(o - list);
+	npolys++;
+	nverts += n;
+}
+
+static inline int sx11(u32 v) { return ((s32)(v << 21)) >> 21; }
+
+// Lo mismo que gx_poly, leyendo los vértices del paquete de la PS1 (gpu.c, hw_poly_packet) sin pasar por GpuHwVtx.
+// Con la misma cabecera que el anterior sigue en su bloque; los vértices después del primero van con VTX_XY (la z
+// es la del polígono entero). Mismos vértices, colores y profundidades que gx_poly: la imagen es la misma.
+// En la ITCM: en la DSi real (perfil de Tomb Raider, v25) era el 7% del tiempo, repartido por toda la función
+PSX_ITCM static void gx_poly_raw(const u32 *w, const GpuHwRaw *r)
+{
+	static const u8 alpha_of[5] = { 31, 16, 16, 14, 8 };
+	static const u8 order[4] = { 0, 1, 3, 2 };
+	const u32 *vp[4];   // xy de cada vértice; delante su color (gouraud, menos el 0) y detrás su uv (con textura)
+	u32 cmd = r->cmd, attr, teximg = 0, pltt = 0, z, *o;
+	int n = cmd & 8 ? 4 : 3, gour = (cmd & 0x10) != 0, textured = (cmd & 4) != 0, td = r->tex, semi = r->semi;
+	int raw = textured && (cmd & 1), lum = 24, alpha, white = 0, black = 0, vbase = 0, addlike = semi >= 2, vb = 0, ramp = 0;
+	STAGE(41);
+	if (npolys >= MAX_POLYS || nverts + n > 6144) return;
+	if (r->mask && semi) return;   // ver gx_poly
+	scale_update();
+	{
+		const u32 *q = w + 1;
+		for (int j = 0; j < n; j++) { q += j && gour; vp[j] = q; q += textured ? 2 : 1; }
+	}
+	if (addlike) {
+		for (int j = 0; j < n; j++) {
+			u32 c = j && gour ? vp[j][-1] : w[0];
+			int cr = c & 0xff, cg = (c >> 8) & 0xff, cb = (c >> 16) & 0xff;
+			vb += cr > cg ? (cr > cb ? cr : cb) : (cg > cb ? cg : cb);
+		}
+		vb = raw ? 128 : n == 4 ? vb >> 2 : (vb * 21846) >> 16;
+	}
+	if (td) {
+		int vmin = (vp[0][1] >> 8) & 0xff, vmax = vmin, u, fmt, c0 = 0;
+		for (int j = 1; j < n; j++) { int v = (vp[j][1] >> 8) & 0xff; if (v < vmin) vmin = v; if (v > vmax) vmax = v; }
+		if (TC_ON && tc.ok && tc.frame == frame_no && tc.tpx == r->tpx && tc.tpy == r->tpy && tc.td == td && tc.cx == r->cx && tc.cy == r->cy &&
+		    vmin >= tc.v0 && vmax <= tc.v1) {   // la misma textura que el anterior y filas ya cargadas
+			teximg = tc.teximg;
+			pltt = tc.pltt;
+			lum = tc.lum;
+			vbase = tc.vbase;
+		} else {
+			u = tex_get(r->tpx, r->tpy, td, r->cx, r->cy, vmin, vmax);
+			fmt = td == 1 ? 3 : td == 2 ? 4 : 7;
+			if (td < 3) {
+				pltt = pal_get(r->cx, r->cy, td == 1 ? 16 : 256, &lum);
+				c0 = psx_vram[r->cy * 1024 + r->cx] == 0;
+			}
+			vbase = tex[u].start;
+			teximg = ((u32)u << 8) | (1u << 16) | (1u << 17) | (5u << 20) | ((u32)(__builtin_ctz(tex[u].h) - 3) << 23) | ((u32)fmt << 26) | ((u32)c0 << 29);
+			tc.tpx = r->tpx; tc.tpy = r->tpy; tc.cx = r->cx; tc.cy = r->cy; tc.td = (u8)td;
+			tc.v0 = (s16)vmin; tc.v1 = (s16)vmax;
+			tc.teximg = teximg; tc.pltt = pltt; tc.lum = lum; tc.vbase = vbase;
+			tc.frame = frame_no;
+			tc.ok = 1;
+		}
+	}
+	alpha = alpha_of[semi];
+	if (addlike) {
+		int f = !td ? vb >> 3 : lum * vb / 128;
+		if (semi == 4) f >>= 2;
+		alpha = f < 1 ? 1 : f > 30 ? 30 : f;
+		if (!td) { ramp = 1; alpha = 31; teximg = RAMP_TEXIMG; }
+		if (semi == 3) black = 1; else white = 1;
+	}
+	attr = (3u << 6) | (1u << 12) | (1u << 13) | ((u32)alpha << 16);
+	if (semi) attr |= (u32)(r->mask ? 62 : (semi_id = semi_id >= 61 ? 1 : semi_id + 1)) << 24;
+	o = &list[ln];
+	if (attr != blk_attr || teximg != blk_teximg || pltt != blk_pltt || (u32)(n == 4) != blk_quad) {
+		*o++ = 0x29 | (0x2a << 8) | (0x2b << 16) | (0x40 << 24);   // POLY_FORMAT, TEXIMAGE_PARAM, PLTT_BASE, BEGIN_VTXS
+		*o++ = attr;
+		*o++ = teximg;
+		*o++ = pltt;
+		*o++ = n == 4 ? 1 : 0;
+		blk_attr = attr; blk_teximg = teximg; blk_pltt = pltt; blk_quad = n == 4;
+	}
+	z = (u32)(4000 - npolys * 3) & 0xffff;
+	GXH(attr); GXH(teximg); GXH(pltt); GXH(n == 4); GXH(z);
+	{
+		enum { CM_CONST, CM_NORM, CM_RGB, CM_MOD } cm;
+		u32 kcol = 0;
+		int flat = !gour && !ramp;
+		if (black) cm = CM_CONST;
+		else if (white && td) { cm = CM_CONST; kcol = 0x7fff; }
+		else if (white) cm = CM_NORM;
+		else if (!td) cm = CM_RGB;
+		else if (raw) { cm = CM_CONST; kcol = 0x7fff; }
+		else cm = CM_MOD;
+		for (int k = 0; k < n; k++) {
+			int j = n == 4 ? order[k] : k;
+			u32 xy = vp[j][0], c = j && gour ? vp[j][-1] : w[0], vtx = k ? 0x25 : 0x23;   // VTX_16 el primero, VTX_XY los demás
+			int qr = c & 0xff, qg = (c >> 8) & 0xff, qb = (c >> 16) & 0xff;
+			s32 x = (((sx11(xy) + r->dx) * kx) >> 8) - 4096, y = 4096 - (((sx11(xy >> 16) + r->dy) * ky) >> 8);
+			if ((u32)(x + 32768) > 0xffff) x = x < 0 ? -32768 : 32767;
+			if ((u32)(y + 32768) > 0xffff) y = y < 0 ? -32768 : 32767;
+			if (k == 0 || !flat) {
+				u32 col;
+				switch (cm) {
+				case CM_CONST: col = kcol; break;
+				case CM_NORM: {
+					int m = qr > qg ? (qr > qb ? qr : qb) : (qg > qb ? qg : qb);
+					u32 iv = inv255[m];
+					col = rgb5((int)((qr * iv) >> 16), (int)((qg * iv) >> 16), (int)((qb * iv) >> 16));
+					break;
+				}
+				case CM_RGB: col = rgb5(qr, qg, qb); break;
+				default: col = mod5t[qr] | ((u32)mod5t[qg] << 5) | ((u32)mod5t[qb] << 10); break;
+				}
+				*o++ = 0x20 | (0x22 << 8) | (vtx << 16);   // COLOR, TEXCOORD, VTX
+				*o++ = col;
+				GXH(col);
+			} else *o++ = 0x22 | (vtx << 8);           // TEXCOORD, VTX (el color sigue)
+			if (ramp) {
+				int m = qr > qg ? (qr > qb ? qr : qb) : (qg > qb ? qg : qb);
+				m >>= semi == 4 ? 5 : 3;
+				if (m < 1) m = 1;
+				if (m > 31) m = 31;
+				*o++ = (8u << 16) | (u32)(m * 16 + 8);
+			} else if (textured) {
+				u32 uv = vp[j][1];
+				*o++ = ((u32)((int)((uv >> 8) & 0xff) - vbase) << 4 << 16) | (((uv & 0xff) << 4) & 0xffff);
+			} else *o++ = 0;
+			GXH(o[-1]);
+			*o++ = ((u32)y << 16) | ((u32)x & 0xffff);
+			GXH(o[-1]);
+			if (!k) *o++ = z;
 		}
 	}
 	ln = (int)(o - list);
@@ -595,12 +767,17 @@ static void gx_flip(int drawn)
 		commit_on = any;
 	}
 	ln = npolys = nverts = 0;
+	blk_attr = ~0u;   // lista nueva: sin bloque abierto
 	frame_no++;
 	STAGE(13);
 	gx_bg_hidden = opaque;
 }
 
-const GpuHw gx_hw = { gx_poly, gx_vram_written, gx_flip, gx_clear };
+#ifdef GX_NO_RAW
+const GpuHw gx_hw = { gx_poly, gx_vram_written, gx_flip, gx_clear, NULL };   // prueba: todo por gx_poly
+#else
+const GpuHw gx_hw = { gx_poly, gx_vram_written, gx_flip, gx_clear, gx_poly_raw };
+#endif
 
 void gx_init(void)
 {
@@ -637,5 +814,6 @@ void gx_init(void)
 	pal_reset();
 	ramp_init();
 	ln = npolys = nverts = 0;
+	blk_attr = ~0u;
 	GFX_FLUSH = 1;
 }

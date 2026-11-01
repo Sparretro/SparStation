@@ -99,6 +99,7 @@ static inline void a_b(int cond, int link, const void *target)
 
 static inline void a_blx_reg(int rm) { emit(0xe12fff30 | (u32)rm); }
 static inline void a_bx(int rm) { emit(0xe12fff10 | (u32)rm); }
+static inline void a_bx_cond(int cond, int rm) { emit(((u32)cond << 28) | 0x012fff10u | (u32)rm); }
 
 // MUL/MLA y multiplicaciones largas
 static inline void a_mul(int rd, int rm, int rs) { emit(0xe0000090 | ((u32)rd << 16) | ((u32)rs << 8) | (u32)rm); }

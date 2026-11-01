@@ -29,6 +29,11 @@ static u32 xfer_end, ack_time, ack_end;
 #define ACK_DELAY 170    // ciclos entre el fin del byte y el ACK
 #define ACK_LEN 100      // duración del pulso de ACK
 
+// Con la CPU emulada más lenta (psx_cpu_scale > 256, CPU automática) el mando va igual de lento: la librería
+// del juego ve los mismos tiempos contados en instrucciones que al 100%. Si no, al 15% Tomb Raider perdía
+// el mando («No Controller»).
+static u32 cpu_rel(u32 c) { return (c * psx_cpu_scale) >> 8; }
+
 void sio_reset(void)
 {
 	ctrl = mode = baud = stat_irq = ack_line = 0;
@@ -121,7 +126,7 @@ static u32 transfer_cycles(void)
 {
 	static const u32 factor[4] = { 1, 1, 16, 64 };
 	u32 b = baud ? baud : 0x88;
-	return b * factor[mode & 3] * 8;
+	return cpu_rel(b * factor[mode & 3] * 8);
 }
 
 static void transfer(u8 v)
@@ -172,13 +177,13 @@ void sio_tick(void)
 		rx_full = 1;
 		if (will_ack) {
 			ack_pending = 1;
-			ack_time = xfer_end + ACK_DELAY;
+			ack_time = xfer_end + cpu_rel(ACK_DELAY);
 		}
 	}
 	if (ack_pending && !TIME_BEFORE(psx_cycles, ack_time)) {
 		ack_pending = 0;
 		ack_line = 1;
-		ack_end = ack_time + ACK_LEN;
+		ack_end = ack_time + cpu_rel(ACK_LEN);
 		STAT_ADD(sio_acks, 1);
 		SIO_LOG("    ACK%s (t=%u)\n", (ctrl & 0x1000) ? " + IRQ7" : "", psx_cycles);
 		if (ctrl & 0x1000) {

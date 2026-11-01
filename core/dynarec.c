@@ -53,6 +53,10 @@ extern u32 psx_frame_no;
 #endif
 static u32 *code_buf, *code_end, *code_start, code_size;
 static u32 *cold_base, *cold_ptr, *hot_save;   // zona fría: [cold_base, code_end)
+// Zona caliente (stubs y bloques): [code_buf, hot_end). Normalmente los 3/4 primeros del mismo búfer que la fría;
+// con dyn_hot_area, en otra memoria (la NWRAM de la DSi) y todo el búfer de antes queda de zona fría.
+static u32 *hot_end;
+static int hot_apart;
 // Bloques en orden de dirección ARM (para el perfilador): inicio y PC MIPS; se vacía con la caché
 static u32 *blk_arm, *blk_mips, blk_n, blk_max;
 // Tabla hash de bloques: la entrada apunta al código y la palabra anterior guarda el PC traducido
@@ -150,11 +154,13 @@ static void call_c_inline(const void *fn)
 static u32 h_r32(u32 a), h_r16s(u32 a), h_r16u(u32 a), h_r8s(u32 a), h_r8u(u32 a);
 static void h_w32(u32 a, u32 v), h_w16(u32 a, u32 v), h_w8(u32 a, u32 v);
 static void h_div(s32 n, s32 d), h_divu(u32 n, u32 d);
+void dyn_grp_fail(u32 pc);
 static const void *const tramp_fn[] = {
 	(const void *)cpu_dyn_interp, (const void *)cpu_dyn_exception, (const void *)gte_command, (const void *)gte_read,
 	(const void *)gte_write, (const void *)h_div, (const void *)h_divu, (const void *)dyn_smc,
 	(const void *)h_r32, (const void *)h_r16s, (const void *)h_r16u, (const void *)h_r8s, (const void *)h_r8u,
-	(const void *)h_w32, (const void *)h_w16, (const void *)h_w8,
+	(const void *)h_w32, (const void *)h_w16, (const void *)h_w8, (const void *)gpu_stat, (const void *)gpu_write_gp0,
+	(const void *)dyn_grp_fail,
 };
 #define NTRAMP (int)(sizeof tramp_fn / sizeof tramp_fn[0])
 static u32 *tramp_at[NTRAMP];
@@ -259,7 +265,8 @@ static void emit_stubs(void)
 	a_bx(R2);
 	emit_handlers();
 	code_start = emit_ptr;
-	cold_base = cold_ptr = code_start + (code_end - code_start) * 3 / 4;
+	if (!hot_apart) hot_end = cold_base = code_start + (code_end - code_start) * 3 / 4;
+	cold_ptr = cold_base;
 	p = code_buf;
 	sync_code(p, (u32)((u8 *)emit_ptr - (u8 *)p));
 }
@@ -328,6 +335,21 @@ int dyn_init(int big)
 u32 *dyn_code_base(void) { return code_buf; }
 
 static void flush_all(void);
+
+// La zona caliente pasa a [p, p + size) (en la DSi, la NWRAM: ver main.c) y el búfer de antes entero queda de zona
+// fría (salidas por fin de tiempo, excepciones...: se ejecutan poco). Antes de que se traduzca nada del juego.
+// Los saltos B/BL llegan a ±32 MB: de la NWRAM (037xxxxxh) a la RAM principal y a la ITCM hay menos.
+void dyn_hot_area(void *p, u32 size)
+{
+	cold_base = code_buf;
+	if ((u32 *)p > code_buf && (u32 *)p < code_end) code_end = p;   // dentro del búfer de antes (pruebas): la fría acaba ahí
+	code_buf = p;
+	hot_end = code_buf + size / 4;
+	hot_apart = 1;
+	emit_stubs();
+	flush_all();
+}
+
 void dyn_set_cpu_scale(u32 scale)
 {
 	if (scale == psx_cpu_scale && cyc_tab[1]) return;
@@ -342,6 +364,11 @@ void dyn_set_cpu_scale(u32 scale)
 
 void dyn_cache_use(u32 *used, u32 *size)
 {
+	if (hot_apart) {   // la fría (el búfer grande de antes) no se llena: manda la caliente
+		*used = (u32)(emit_ptr - code_buf) * 4;
+		*size = (u32)(hot_end - code_buf) * 4;
+		return;
+	}
 	*used = (u32)(emit_ptr - code_buf + cold_ptr - cold_base) * 4;
 	*size = code_size;
 }
@@ -508,6 +535,110 @@ static const int host_pool[5] = { R4, R5, R6, R7, R8 };
 #ifndef DYN_POOL
 #define DYN_POOL 5
 #endif
+static u32 stale_mask;   // registros con stale = 1
+
+// Reparto de los registros ARM instrucción a instrucción (con -DDYN_STATIC_RA, el de antes: los 5 más usados del bloque
+// para todo el bloque). Antes de traducir cada instrucción, los registros MIPS que usa toman un registro ARM si se van a
+// volver a usar; si no queda sitio, sale el que más tarde se vuelve a usar (guardándolo si había cambiado). Así los
+// temporales que TR usa en tramos cortos (gp, ra, at, t3...) no van y vienen de la memoria en cada instrucción.
+#define RA_MAX (MAX_BLOCK + 4)
+#define RA_NEVER 10000
+static u32 ra_use[RA_MAX];   // registros que usa cada instrucción del bloque (por posición desde el PC inicial)
+static int ra_n, ra_frozen;  // ra_frozen: dentro de un si-entonces el reparto no cambia (los dos caminos lo ven igual)
+static s8 host_of[16];       // registro MIPS en cada registro ARM del reparto (-1: libre)
+static u8 ra_pool[5], ra_npool;
+
+static u8 ra_nu[RA_MAX + 1][32];   // próxima posición (>= p) en la que se usa cada registro (255: ninguna); ver ra_index
+static int ra_next(int mr, int pos)
+{
+	u32 q = pos < ra_n ? ra_nu[pos][mr] : 255;
+	return q == 255 ? RA_NEVER : (int)q;
+}
+
+// La tabla de próximos usos del bloque, de atrás adelante (una vez por bloque: ra_need la mira en cada instrucción)
+static void ra_index(void)
+{
+	memset(ra_nu[ra_n], 255, 32);
+	for (int p = ra_n - 1; p >= 0; p--) {
+		memcpy(ra_nu[p], ra_nu[p + 1], 32);
+		for (u32 m = ra_use[p]; m; m &= m - 1) ra_nu[p][__builtin_ctz(m)] = (u8)p;
+	}
+}
+
+static void ra_evict(int h)
+{
+	int x = host_of[h];
+	if (rg[x].stale) {
+		if (rg[x].valid) a_str(h, RCPU, OFF_R(x));
+		else {
+			a_movi(R0, rg[x].k);
+			a_str(R0, RCPU, OFF_R(x));
+		}
+		rg[x].stale = 0;
+		stale_mask &= ~(1u << x);
+	}
+	rg[x].host = -1;
+	rg[x].valid = 0;
+	host_of[h] = -1;
+}
+
+// Antes de lo que use los registros need en la posición pos (no emite nada salvo guardar a los que salen; usa r0)
+static void ra_need(u32 need, int pos)
+{
+#ifdef DYN_STATIC_RA
+	return;
+#endif
+	if (ra_frozen) return;
+	need &= ~1u;
+	for (u32 m = need; m; m &= m - 1) {
+		int i = __builtin_ctz(m), best = -1, bdist = -1, mine;
+		if (rg[i].host >= 0) continue;
+		mine = ra_next(i, pos + 1);
+		for (int k = 0; k < ra_npool; k++) {
+			int h = ra_pool[k], x = host_of[h], d;
+			if (x < 0) { best = h; bdist = RA_NEVER + 1; break; }   // libre
+			if (need & (1u << x)) continue;                          // lo usa esta misma instrucción
+			d = ra_next(x, pos);
+			if (d > bdist || (d == bdist && !rg[x].stale)) { best = h; bdist = d; }
+		}
+		if (best < 0 || bdist <= mine) continue;   // los que hay se usan antes que este: que vaya por un temporal
+		if (host_of[best] >= 0) ra_evict(best);
+		host_of[best] = (s8)i;
+		rg[i].host = (s8)best;
+		rg[i].valid = 0;
+	}
+}
+
+static u32 blk_pc;   // PC con el que empieza el bloque que se traduce (las posiciones del reparto son desde aquí)
+static int cur_pos, in_dslot;   // posición de la instrucción que se traduce; si es un delay slot
+static void op_regs(u32 op, u32 *r, u32 *w);
+static void ra_op(u32 op, u32 at)
+{
+	u32 r, w;
+	cur_pos = (int)((at - blk_pc) >> 2);
+	op_regs(op, &r, &w);
+	ra_need(r | w, cur_pos);
+}
+
+// Grupos: accesos seguidos a la memoria por la misma base sin que esta cambie entre medias (TR monta cada primitiva
+// con 13 escrituras por a3). Al llegar al primero se comprueba una vez que la base es de la RAM, que todo el grupo cae
+// dentro de sus 2 MB y, si escribe, que en esas páginas no hay código traducido; la dirección real queda en un
+// registro ARM apartado (grp[g].reg) y cada acceso del grupo es una sola instrucción. Si la comprobación falla, se sale
+// del bloque en esa instrucción y el bloque se traduce otra vez sin grupos (como el atajo de la pila).
+#define GRP_MAX 8
+#ifndef GRP_MIN
+#define GRP_MIN 4   // ahorro mínimo (instrucciones) para que un grupo valga el registro apartado
+#endif
+#ifndef GRP_REGS
+#define GRP_REGS 2   // registros ARM para grupos (dos grupos que se solapan, cada uno el suyo)
+#endif
+static struct { s8 base, reg; u8 nld, nst, live, dead; s16 first, last; s32 lo, hi, slo, shi; } grp[GRP_MAX];
+static int grp_n, grp_rmask;   // registros ARM apartados para los grupos del bloque
+static s8 grp_at[RA_MAX];   // grupo de cada posición (-1: ninguno)
+static s16 grp_adj[RA_MAX];  // lo que se ha movido la base (addiu base, base, n dentro del grupo) al llegar a ese acceso
+static u32 ra_wr[RA_MAX];   // registros que escribe cada instrucción del bloque
+static u32 grp_unsafe[256];
+static int grp_unsafe_n;
 
 // Pila: si un bloque accede a memoria con sp, se comprueba una vez al entrar que sp apunta a la RAM y
 // r8 guarda su dirección real en la DS; así «lw s0, 20(sp)» es una sola instrucción ARM. Si no apunta
@@ -568,7 +699,6 @@ static u32 const_of(int mr) { return mr ? rg[mr].k : 0; }
 // Registro ARM donde calcular el nuevo valor de mr; después, put(mr, ese registro)
 static int dst(int mr, int tmp) { return mr && rg[mr].host >= 0 ? rg[mr].host : tmp; }
 
-static u32 stale_mask;   // registros con stale = 1
 
 static void put(int mr, int r)
 {
@@ -611,6 +741,19 @@ static void flush_regs(void)
 			a_str(R0, RCPU, OFF_R(i));
 		}
 		rg[i].stale = 0;
+	}
+}
+
+// Lo mismo sin darlo por guardado: para un camino que sale del bloque mientras el otro sigue con los registros
+static void flush_keep(void)
+{
+	for (u32 m = stale_mask; m; m &= m - 1) {
+		int i = __builtin_ctz(m);
+		if (rg[i].valid) a_str(rg[i].host, RCPU, OFF_R(i));
+		else {
+			a_movi(R0, rg[i].k);
+			a_str(R0, RCPU, OFF_R(i));
+		}
 	}
 }
 
@@ -691,6 +834,9 @@ static void exit_to(u32 target, int ninstr)
 // rutinas compartidas al principio de la caché, una por tamaño y registro, a las que se llega con BLNE.
 enum { M_W, M_HS, M_HU, M_BS, M_BU };   // tamaño y signo
 static u32 *ld_handler[5][16], *st_handler[5][16], *smc_handler;
+// Las mismas con la dirección en un registro asignado (r4-r8) en vez de r0: «mov r0, rb» y a la de siempre. Así un
+// acceso sin desplazamiento por un registro ya cargado no copia antes la dirección a r0.
+static u32 *ldb_handler[5][16][9], *stb_handler[5][16][9];
 static const int mem_regs[6] = { R2, R4, R5, R6, R7, R8 };   // destinos o valores posibles
 
 // Carga o guarda rd en [rn + off] con la instrucción del tamaño pedido (usa r3 si off no cabe)
@@ -744,6 +890,16 @@ static void emit_handlers(void)
 			// carga: el valor en r
 			ld_handler[sz][r] = emit_ptr;
 			handler_scratch(1, sz, r);
+			if (sz == M_HS || sz == M_HU || sz == M_BS) {
+				// en línea solo van los primeros 2 MB de cada segmento: los otros espejos de la RAM (TR tiene la pila en
+				// 807Fxxxx) se leen aquí, sin ir a C (después de la scratchpad, que es lo más frecuente por aquí)
+				static const int hsh[5] = { 0, 3, 1, 2, 0 };
+				a_dp_imm(C_AL, OP_TST, 1, 0, R0, arm_imm(0x1f800000));
+				a_dp_reg(C_EQ, OP_MOV, 0, R1, 0, R0, SH_LSL, 11);
+				a_dp_reg(C_EQ, OP_MOV, 0, R1, 0, R1, SH_LSR, 11);
+				a_memh_reg(C_EQ, 1, hsh[sz], r, RRAM, R1);
+				a_bx_cond(C_EQ, LR);
+			}
 			call_c_inline(rd_fn[sz]);
 			if (r != R0) a_mov(r, R0);
 			a_bx(LR);
@@ -758,6 +914,18 @@ static void emit_handlers(void)
 			call_c_inline(wr_fn[sz]);
 			a_bx(LR);
 		}
+	for (int sz = 0; sz < 5; sz++)
+		for (int i = 0; i < 6; i++)
+			for (int b = R4; b <= R8; b++) {
+				int r = mem_regs[i];
+				ldb_handler[sz][r][b] = emit_ptr;
+				a_mov(R0, b);
+				a_b(C_AL, 0, ld_handler[sz][r]);
+				if (sz == M_HS || sz == M_BS) continue;
+				stb_handler[sz][r][b] = emit_ptr;
+				a_mov(R0, b);
+				a_b(C_AL, 0, st_handler[sz][r]);
+			}
 }
 
 static int ram_const(u32 a, u32 *off)   // dirección fija en RAM: desplazamiento
@@ -904,6 +1072,74 @@ static void scratch_first(int load, int size, int rs, u32 simm, int r)
 	end_cold();
 }
 
+// ---- grupos (ver grp_find) ----
+static int cur_ninstr;   // instrucciones del bloque hasta la que se traduce (para salir a mitad)
+void dyn_grp_fail(u32 pc);
+
+// Al llegar al primer acceso del grupo g: comprobar la base y dejar su dirección real en grp[g].reg
+static void grp_materialize(int g)
+{
+	u32 *fail[4], k;
+	int nf = 0, x = get(grp[g].base, R0);
+	a_dp_imm(C_AL, OP_TST, 1, 0, x, arm_imm(0x1f800000));   // de la RAM (en cualquier espejo)
+	fail[nf++] = fwd(C_NE);
+	a_dp_reg(C_AL, OP_MOV, 0, R1, 0, x, SH_LSL, 11);      // r1 = (base & 1FFFFF) << 11
+	if (grp[g].lo < 0) {   // base + lo no baja de 0
+		k = (u32)(-grp[g].lo) << 11;
+		if (arm_imm(k) >= 0) a_dp_imm(C_AL, OP_CMP, 1, 0, R1, arm_imm(k));
+		else { a_movi(R2, k); a_dp_reg(C_AL, OP_CMP, 1, 0, R1, R2, SH_LSL, 0); }
+		fail[nf++] = fwd(C_CC);
+	}
+	if (grp[g].hi > 0) {   // base + hi no pasa de los 2 MB: r1 + (hi << 11) cabe en 32 bits (o da justo 2^32)
+		k = (u32)grp[g].hi << 11;
+		if (arm_imm(k) >= 0) a_dp_imm(C_AL, OP_CMN, 1, 0, R1, arm_imm(k));
+		else { a_movi(R2, k); a_dp_reg(C_AL, OP_CMN, 1, 0, R1, R2, SH_LSL, 0); }
+		fail[nf++] = fwd(C_HI);
+	}
+	a_dp_reg(C_AL, OP_ADD, 0, grp[g].reg, RRAM, R1, SH_LSR, 11);
+	if (grp[g].nst) {   // en las páginas que escribe el grupo (dos como mucho) no hay código traducido
+		a_addi(R2, R1, (u32)grp[g].slo << 11, R0);
+		a_mem_regsh(C_AL, 1, 1, R3, RPAGES, R2, SH_LSR, 11 + DYN_PAGE_BITS);
+		a_addi(R2, R1, (u32)(grp[g].shi - 1) << 11, R0);
+		a_mem_regsh(C_AL, 1, 1, R2, RPAGES, R2, SH_LSR, 11 + DYN_PAGE_BITS);
+		a_dp_reg(C_AL, OP_ORR, 1, R3, R3, R2, SH_LSL, 0);
+		fail[nf++] = fwd(C_NE);
+	}
+	begin_cold();   // no vale: salir antes de esta instrucción y que el bloque se traduzca sin grupos
+	for (int i = 0; i < nf; i++) land(fail[i]);
+	flush_keep();
+	set_pc_const(blk_pc + 4 * (u32)cur_pos);
+	emit_cycles(cur_ninstr - 1);
+	a_movi(R0, blk_pc);
+	call((const void *)dyn_grp_fail);
+	a_b(C_AL, 0, stub_exit);
+	end_cold();
+}
+
+// Acceso del grupo de esta posición: una instrucción sobre su registro. 0 si no va por grupo.
+static int scr_derived(int rs, u32 simm, int bytes);
+// Antes de leer nada para el acceso de esta posición (la comprobación usa r0-r3: el valor que se va a escribir aún
+// no está en r2): si es el primero de su grupo, comprobar la base. Solo en el primero, y no dentro de un si-entonces
+// ni en un delay slot (un camino no pasaría por ella), ni si el acceso irá por otro atajo.
+static void grp_pre(int rs, u32 simm)
+{
+	int g = cur_pos >= 0 && cur_pos < RA_MAX ? grp_at[cur_pos] : -1;
+	if (g < 0 || grp[g].base != rs || grp[g].dead || grp[g].live) return;
+	if (cur_pos != grp[g].first || ra_frozen || in_dslot || is_const(rs) || (rs == scr_reg && scr_ok) ||
+	    scr_derived(rs, simm, 1) || scratch_hint(rs, simm)) { grp[g].dead = 1; return; }
+	grp_materialize(g);
+	grp[g].live = 1;
+}
+
+// Acceso del grupo de esta posición: una instrucción sobre su registro. 0 si no va por grupo.
+static int grp_use(int load, int size, int rs, u32 simm, int r)
+{
+	int g = cur_pos >= 0 && cur_pos < RA_MAX ? grp_at[cur_pos] : -1;
+	if (g < 0 || grp[g].base != rs || !grp[g].live) return 0;
+	mem_off(C_AL, load, size, r, grp[g].reg, (s32)simm + grp_adj[cur_pos]);
+	return 1;
+}
+
 // Carga en el registro ARM d (r2 o uno asignado) desde rs + simm
 static void load_to(int size, int rs, u32 simm, int d)
 {
@@ -915,27 +1151,38 @@ static void load_to(int size, int rs, u32 simm, int d)
 		u32 a = const_of(rs) + simm, off;
 		if (ram_const(a, &off)) mem_off(C_AL, 1, size, d, RRAM, (int)off);
 		else if (scratch_const(a, &off)) mem_off(C_AL, 1, size, d, RCPU, off_scr + (int)off);
-		else {
+		else if (size == M_W && a < 0xc0000000 && (a & 0x1fffffff) == 0x1f801814) {   // GPUSTAT: directo, sin el bus
+			call(gpu_stat);
+			if (d != R0) a_mov(d, R0);
+		} else {
 			a_movi(R0, a);
 			call(rd_fn[size]);
 			if (d != R0) a_mov(d, R0);
 		}
 		return;
 	}
+	if (grp_use(1, size, rs, simm, d)) return;
 	if (scratch_hint(rs, simm)) { scratch_first(1, size, rs, simm, d); return; }
-	a_addi(R0, get(rs, R0), simm, R1);
-	a_dp_imm(C_AL, OP_TST, 1, 0, R0, arm_imm(0x1f800000));   // fuera de la RAM (bits 23-28): NE
-	a_dp_reg(C_EQ, OP_MOV, 0, R1, 0, R0, SH_LSL, 11);
-	if (size == M_W || size == M_BU) a_mem_regsh(C_EQ, 1, size == M_BU, d, RRAM, R1, SH_LSR, 11);
-	else {
-		a_dp_reg(C_EQ, OP_MOV, 0, R1, 0, R1, SH_LSR, 11);
-		a_memh_reg(C_EQ, 1, hsh[size], d, RRAM, R1);
+	int x = get(rs, R0), a = R0;
+	u32 *const *h = ld_handler[size];
+	if (simm == 0 && x >= R4 && x <= R8) { a = x; h = NULL; }   // la dirección ya está en un registro asignado
+	else a_addi(R0, x, simm, R1);
+	if (size == M_W || size == M_BU) {
+		a_dp_imm(C_AL, OP_TST, 1, 0, a, arm_imm(0x1f800000));   // fuera de la RAM (bits 23-28): NE
+		a_dp_reg(C_EQ, OP_MOV, 0, R1, 0, a, SH_LSL, 11);
+		a_mem_regsh(C_EQ, 1, size == M_BU, d, RRAM, R1, SH_LSR, 11);
+		a_b(C_NE, 1, h ? h[d] : ldb_handler[size][d][a]);
+	} else {   // LDRH/LDRSH/LDRSB no admiten registro desplazado: los primeros 2 MB de cada segmento en línea
+		a_dp_imm(C_AL, OP_BIC, 0, R1, a, arm_imm(0xe0000000));
+		a_dp_imm(C_AL, OP_CMP, 1, 0, R1, arm_imm(0x200000));
+		a_memh_reg(C_CC, 1, hsh[size], d, RRAM, R1);
+		a_b(C_CS, 1, h ? h[d] : ldb_handler[size][d][a]);
 	}
-	a_b(C_NE, 1, ld_handler[size][d]);
 }
 
 static void emit_load(int size, int rs, int rt, u32 simm)
 {
+	grp_pre(rs, simm);
 	int d = dst(rt, R2);
 	load_to(size, rs, simm, d);
 	put(rt, d);
@@ -963,17 +1210,23 @@ static void store_from(int size, int rs, u32 simm, int v)
 			a_b(C_AL, 0, back);
 			end_cold();
 		} else if (scratch_const(a, &off)) mem_off(C_AL, 0, size, v, RCPU, off_scr + (int)off);
-		else {
+		else if (size == M_W && a < 0xc0000000 && (a & 0x1fffffff) == 0x1f801810) {   // GP0 de la GPU: directo, sin el bus
+			if (v != R0) a_mov(R0, v);
+			call(gpu_write_gp0);
+		} else {
 			a_movi(R0, a);
 			if (v != R1) a_mov(R1, v);
 			call(wr_fn[size]);
 		}
 		return;
 	}
+	if (grp_use(0, size, rs, simm, v)) return;
 	if (scratch_hint(rs, simm)) { scratch_first(0, size, rs, simm, v); return; }
-	a_addi(R0, get(rs, R0), simm, R1);
-	a_dp_imm(C_AL, OP_TST, 1, 0, R0, arm_imm(0x1f800000));
-	a_dp_reg(C_EQ, OP_MOV, 0, R1, 0, R0, SH_LSL, 11);
+	int x = get(rs, R0), a = R0;
+	if (simm == 0 && x >= R4 && x <= R8 && x != v) a = x;   // la dirección ya está en un registro asignado
+	else a_addi(R0, x, simm, R1);
+	a_dp_imm(C_AL, OP_TST, 1, 0, a, arm_imm(0x1f800000));
+	a_dp_reg(C_EQ, OP_MOV, 0, R1, 0, a, SH_LSL, 11);
 	if (size == M_W || size == M_BU) a_mem_regsh(C_EQ, 0, size == M_BU, v, RRAM, R1, SH_LSR, 11);
 	else {
 		a_dp_reg(C_EQ, OP_MOV, 0, R3, 0, R1, SH_LSR, 11);
@@ -981,11 +1234,12 @@ static void store_from(int size, int rs, u32 simm, int v)
 	}
 	a_mem_regsh(C_EQ, 1, 1, R3, RPAGES, R1, SH_LSR, 11 + DYN_PAGE_BITS);   // ¿había código traducido en esa página?
 	a_dp_imm(C_EQ, OP_CMP, 1, 0, R3, 0);
-	a_b(C_NE, 1, st_handler[size][v]);   // E/S o scratchpad (NE del TST) o página con código
+	a_b(C_NE, 1, a == R0 ? st_handler[size][v] : stb_handler[size][v][a]);   // E/S o scratchpad (NE del TST) o página con código
 }
 
 static void emit_store(int size, int rs, int rt, u32 simm)
 {
+	grp_pre(rs, simm);
 	int v = get(rt, R2);
 	store_from(size, rs, simm, v);
 }
@@ -1120,7 +1374,9 @@ static int vsync_poll_call(u32 pc);
 // traduciendo por el camino de no saltar (el de saltar sale enlazado como siempre)
 // Límite del superbloque y no seguir por código que ya tiene su propio bloque: cada destino de salto empieza
 // otro superbloque, y sin esto el mismo camino se traduciría muchas veces (la caché se llenaba)
+#ifndef SB_MAX
 #define SB_MAX 32
+#endif
 static block_fn *slot(u32 pc);
 static int has_block(u32 pc)
 {
@@ -1140,6 +1396,170 @@ static int sb_cont(u32 op, u32 cur, u32 pc)
 	return target != pc && !psyq_vsync(target) && !vsync_poll_call(target);
 }
 
+// Si-entonces corto: un salto condicional hacia delante que solo se salta 1-4 instrucciones sencillas («si a < b, a = b»;
+// el motor de dibujo de Tomb Raider tiene docenas) no corta el bloque: se salta con un salto ARM dentro del mismo
+// bloque. Si cortara, cada vez que se toma habría que volcar registros, contar ciclos y seguir en otro bloque que
+// repite lo de después. Lo de dentro solo puede ser ALU, cargas y escrituras (nada que vuelque registros ni los
+// olvide), sin tocar sp ni la base de la scratchpad (strict = 0: aún no se sabe cuál es; alloc_regs acepta de más).
+#ifndef HK_MAX
+#define HK_MAX 4
+#endif
+static int hk_safe(u32 op, int strict)
+{
+	u32 o = op >> 26, f = op & 0x3f, r, w;
+	if (o == 0) {
+		if (!((f <= 0x07 && f != 0x01 && f != 0x05) || (f >= 0x20 && f <= 0x27) || f == 0x2a || f == 0x2b)) return 0;
+	} else if (!((o >= 0x08 && o <= 0x0f) || o == 0x20 || o == 0x21 || o == 0x23 || o == 0x24 || o == 0x25 ||
+	             o == 0x28 || o == 0x29 || o == 0x2b)) return 0;
+	op_regs(op, &r, &w);
+	return !(w & (1u << 29)) && !(strict && scr_reg && (w & (1u << scr_reg)));
+}
+
+// Instrucciones que se salta el salto en cur (0 si no es un si-entonces); count = instrucciones del bloque con él
+static int hammock_len(u32 op, u32 cur, int count, int strict)
+{
+	u32 o = op >> 26, rs = (op >> 21) & 31, rt = (op >> 16) & 31;
+	u32 target = cur + 4 + ((u32)(s32)(s16)(op & 0xffff) << 2);
+	s32 k = (s32)(target - cur - 8) >> 2;
+	int cond = (o == 0x01 && rs && (rt & 0x1e) != 0x10) || ((o == 0x04 || o == 0x05) && rs != rt) || ((o == 0x06 || o == 0x07) && rs);
+#ifdef DYN_NOHK
+	return 0;
+#endif
+	if (!cond || k < 1 || k > HK_MAX || count + 2 + k > MAX_BLOCK) return 0;
+	for (s32 i = 0; i < k; i++) if (!hk_safe(fetch_op(cur + 8 + 4 * (u32)i), strict)) return 0;
+	if (psyq_vsync(target) || vsync_poll_call(target)) return 0;
+	return (int)k;
+}
+
+// Una constante que solo se conocía al traducir, a su sitio (registro ARM o memoria): los dos caminos del si-entonces
+// tienen que llegar al final igual
+static void hk_unconst(int i)
+{
+	if (!rg[i].isconst) return;
+	if (rg[i].host >= 0) {
+		if (!rg[i].valid) { a_movi(rg[i].host, rg[i].k); rg[i].valid = 1; }
+	} else {
+		a_movi(R0, rg[i].k);
+		a_str(R0, RCPU, OFF_R(i));
+		rg[i].stale = 0;
+		stale_mask &= ~(1u << i);
+	}
+	rg[i].isconst = 0;
+}
+
+// Antes de saltar: cargados los registros ARM que se usan dentro y fuera de las constantes los que se cambian dentro.
+// Devuelve los registros MIPS que cambian dentro.
+static u32 hk_prepare(u32 from, int k)
+{
+	u32 rm = 0, wm = 0, r, w;
+	for (int i = 0; i < k; i++) { op_regs(fetch_op(from + 4 * (u32)i), &r, &w); rm |= r; wm |= w; }
+	ra_need(rm | wm, (int)((from - blk_pc) >> 2));   // registros ARM para lo de dentro antes de saltar, y quietos hasta el final
+	ra_frozen = 1;
+	for (u32 m = (rm | wm) & ~1u; m; m &= m - 1) {
+		int i = __builtin_ctz(m);
+		if (rg[i].host >= 0 && !rg[i].valid) get(i, R0);
+	}
+	for (u32 m = wm & ~1u; m; m &= m - 1) hk_unconst(__builtin_ctz(m));
+	return wm & ~1u;
+}
+
+// Grupos del bloque (ver grp_materialize): por cada registro base, los accesos seguidos hasta que algo lo escribe (un
+// «addiu base, base, n» no lo corta: se apunta lo movido). Los que más ahorran, cada uno en un registro ARM apartado.
+static int grp_size(u32 o) { return o == 0x20 || o == 0x24 || o == 0x28 ? 1 : o == 0x21 || o == 0x25 || o == 0x29 ? 2 : 4; }
+static void grp_find(u32 pc)
+{
+	s8 open[32];
+	int val[GRP_MAX], take[GRP_MAX] = { 0 }, any = 0;
+	memset(open, -1, sizeof open);
+	memset(grp_at, -1, sizeof grp_at);
+	grp_n = 0;
+	grp_rmask = 0;
+#ifdef DYN_NOGRP
+	return;
+#endif
+	if (pc_in(grp_unsafe, pc) || grp_unsafe_n >= 200) return;
+	u32 pv_save[32], ok_save = pv_ok;   // valores probables al ir avanzando (se dejan como estaban al acabar)
+	memcpy(pv_save, pv, sizeof pv);
+	s32 delta[32];   // cuánto se ha movido cada base desde que empezó su grupo
+	u8 in_hk[RA_MAX];   // dentro de un si-entonces (un addiu ahí no se ejecuta en los dos caminos)
+	memset(in_hk, 0, sizeof in_hk);
+	for (int p = 0; p < ra_n; p++) {
+		u32 op = fetch_op(pc + 4 * (u32)p), o = op >> 26, b = (op >> 21) & 31;
+		if (is_branch(op))
+			for (int i = 0, k = hammock_len(op, pc + 4 * (u32)p, p + 1, 1); i < k; i++) if (p + 2 + i < RA_MAX) in_hk[p + 2 + i] = 1;
+		// cargas y escrituras normales (también LWC2/SWC2) con base en un registro que no sea sp (el atajo de la pila)
+		// ni la base de la scratchpad
+		if (((o >= 0x20 && o <= 0x25 && o != 0x22) || o == 0x28 || o == 0x29 || o == 0x2b || o == 0x32 || o == 0x3a) &&
+		    b && b != 29 && (int)b != scr_reg &&
+		    (!(pv_ok & (1u << b)) || !((pv[b] + (u32)(s32)(s16)op) & 0x1f800000))) {   // si se sabe que no es RAM, no
+			int g = open[b];
+			s32 off, sz = grp_size(o);
+			if (g < 0 && grp_n < GRP_MAX) {
+				delta[b] = 0;
+				g = open[b] = (s8)grp_n++;
+				memset(&grp[g], 0, sizeof grp[g]);
+				grp[g].base = (s8)b;
+				grp[g].first = (s16)p;
+				grp[g].lo = (s16)op;
+				grp[g].hi = (s16)op + sz;
+				grp[g].slo = 0x7fffffff;
+				grp[g].shi = -0x7fffffff;
+			}
+			off = (s16)op + (g >= 0 ? delta[b] : 0);   // respecto a la base al empezar el grupo
+			if (g >= 0 && off >= -0x8000 && off < 0x8000) {
+				grp_at[p] = (s8)g;
+				grp_adj[p] = (s16)(g >= 0 ? delta[b] : 0);
+				grp[g].last = (s16)p;
+				if (off < grp[g].lo) grp[g].lo = off;
+				if (off + sz > grp[g].hi) grp[g].hi = off + sz;
+				if (o >= 0x28 && o != 0x32) {
+					grp[g].nst++;
+					if (off < grp[g].slo) grp[g].slo = off;
+					if (off + sz > grp[g].shi) grp[g].shi = off + sz;
+				} else grp[g].nld++;
+			}
+		}
+		for (u32 m = ra_wr[p]; m; m &= m - 1) {   // la base cambia: el grupo se acaba, salvo «addiu base, base, n»
+			int r = __builtin_ctz(m);
+			if (o == 0x09 && (int)b == r && (int)((op >> 16) & 31) == r && open[r] >= 0 && !in_hk[p] && p < RA_MAX) {
+				delta[r] += (s16)op;
+				continue;
+			}
+			open[r] = -1;
+		}
+		pv_after(op);
+	}
+	memcpy(pv, pv_save, sizeof pv);
+	pv_ok = ok_save;
+	// ahorro: una carga normal son ~5 instrucciones y una escritura ~7; en el grupo, 1; la comprobación, ~7 (+6 si escribe)
+	for (int g = 0; g < grp_n; g++) {
+		val[g] = grp[g].nld * 4 + grp[g].nst * 6 - 7 - (grp[g].nst ? 6 : 0);
+		if (grp[g].nst && grp[g].shi - grp[g].slo > (1 << DYN_PAGE_BITS)) val[g] = 0;   // más de dos páginas
+	}
+	// de más a menos ahorro, cada grupo al primer registro libre en su tramo (el segundo, solo si ahorra bastante: se
+	// le quita un registro al reparto)
+	(void)any;
+	for (;;) {
+		int best = -1, slot = -1;
+		for (int g = 0; g < grp_n; g++)
+			if (!take[g] && val[g] > GRP_MIN && (best < 0 || val[g] > val[best])) best = g;
+		if (best < 0) break;
+		for (int s = 0; s < GRP_REGS && slot < 0; s++) {
+			int clash = s > 0 && val[best] <= 12;
+			for (int h = 0; h < grp_n; h++)
+				if (take[h] == s + 1 && grp[h].first <= grp[best].last && grp[best].first <= grp[h].last) clash = 1;
+			if (!clash) slot = s;
+		}
+		take[best] = slot >= 0 ? slot + 1 : -1;
+		if (slot >= 0) {
+			static const int regs[2][2] = { { R8, R7 }, { R7, R6 } };   // sin / con el atajo de la pila (r8)
+			grp[best].reg = (s8)regs[use_hsp ? 1 : 0][slot];
+			grp_rmask |= 1 << grp[best].reg;
+		}
+	}
+	for (int p = 0; p < ra_n && p < RA_MAX; p++) if (grp_at[p] >= 0 && take[grp_at[p]] <= 0) grp_at[p] = -1;
+}
+
 static void alloc_regs(u32 pc)
 {
 	u8 uses[32] = { 0 };
@@ -1152,25 +1572,32 @@ static void alloc_regs(u32 pc)
 	int sp_track = 1;
 	hsp_lo = 0x7fffffff;
 	hsp_hi = -0x7fffffff;
+	memset(ra_use, 0, sizeof ra_use);
+	memset(ra_wr, 0, sizeof ra_wr);
+	ra_n = 0;
 	for (u32 cur = pc;; cur += 4) {
-		u32 op = fetch_op(cur), r, w, m;
+		u32 op = fetch_op(cur), r, w, m, pos = (cur - pc) >> 2;
 		int last = 0;
 		if (++n > MAX_BLOCK || ends_block(op)) last = 1;
 		int cont = 0;
 		if (is_branch(op)) {   // con su delay slot
 			u32 r2, w2, dop = fetch_op(cur + 4);
 			op_regs(dop, &r2, &w2);
+			if (pos + 1 < RA_MAX) { ra_use[pos + 1] = r2 | w2; ra_wr[pos + 1] = w2; ra_n = (int)pos + 2; }
 			sp_ops += sp_mem_op(dop);
 			sp_range(dop, &sp_delta, &sp_track);
 			for (m = r2 | w2; m; m &= m - 1) uses[__builtin_ctz(m)] += 1;
 			seen |= r2 | w2;
-			// superbloque: tras un salto condicional se sigue por el camino de no saltar (igual que compile)
-			if (sb_cont(op, cur, pc) && n + 2 < SB_MAX && !has_block(cur + 8) && !is_branch(dop) && !ends_block(dop)) { cont = 1; n++; wr_before |= w2; }
+			// superbloque: tras un salto condicional se sigue por el camino de no saltar (igual que compile); en un
+			// si-entonces también (lo de dentro y lo de después van en el mismo bloque)
+			if (!is_branch(dop) && !ends_block(dop) &&
+			    (hammock_len(op, cur, n, 0) || (sb_cont(op, cur, pc) && n + 2 < SB_MAX && !has_block(cur + 8)))) { cont = 1; n++; wr_before |= w2; }
 			else last = 1;
 		}
 		sp_ops += sp_mem_op(op);
 		sp_range(op, &sp_delta, &sp_track);
 		op_regs(op, &r, &w);
+		if (pos < RA_MAX) { ra_use[pos] = r | w; ra_wr[pos] = w; if ((int)pos + 1 > ra_n) ra_n = (int)pos + 1; }
 		{   // base de la scratchpad conocida al entrar y aún sin cambiar
 			u32 o = op >> 26, rs = (op >> 21) & 31;
 			if (((o >= 0x20 && o <= 0x2e) || o == 0x32 || o == 0x3a) && rs && !(wr_before & (1u << rs)) &&
@@ -1198,8 +1625,18 @@ static void alloc_regs(u32 pc)
 	scr_reg = 0;
 #endif
 	if (scr_reg) { scr_ok = 1; scr_val = pv[scr_reg]; }
+	ra_index();
+	grp_find(pc);
+	ra_npool = 0;
+	ra_frozen = 0;
+	for (int h = 0; h < 16; h++) host_of[h] = -1;
+	for (int h = 0; h < DYN_POOL; h++) if (!(use_hsp && host_pool[h] == RHSP) && !(grp_rmask & (1 << host_pool[h]))) ra_pool[ra_npool++] = (u8)host_pool[h];
+#ifndef DYN_STATIC_RA
+	(void)uses;
+	return;   // reparto instrucción a instrucción (ra_need)
+#endif
 	for (int h = 0; h < DYN_POOL && seen; h++) {
-		if (use_hsp && host_pool[h] == RHSP) continue;
+		if ((use_hsp && host_pool[h] == RHSP) || (grp_rmask & (1 << host_pool[h]))) continue;
 		int best = 0;
 		for (u32 m = seen; m; m &= m - 1) {
 			int i = __builtin_ctz(m);
@@ -1285,6 +1722,7 @@ static int emit_op(u32 op, u32 pc, int ninstr)
 {
 	u32 rs = (op >> 21) & 31, rt = (op >> 16) & 31, rd = (op >> 11) & 31, sa = (op >> 6) & 31;
 	u32 imm = op & 0xffff, simm = (u32)(s32)(s16)imm;
+	cur_ninstr = ninstr;
 
 	switch (op >> 26) {
 	case 0x00:
@@ -1502,7 +1940,7 @@ static int emit_op(u32 op, u32 pc, int ninstr)
 		if (op & (1 << 25)) {   // comando: su función directa, sin trampolín (la GTE no mira el reloj; r12 se guarda)
 			void (*fn)(u32) = gte_entry(op);
 			s32 d = (s32)((const u8 *)fn - ((const u8 *)emit_ptr + 12));
-			a_movi(R0, op);
+			a_movi(R0, op & 0xfffff);   // la GTE solo mira los bits 0-19: con los altos fuera, NCLIP es un MOV y RTPT dos (antes tres)
 #ifdef DYN_NOGTED
 			call(gte_command);
 			return 1;
@@ -1604,10 +2042,12 @@ static int emit_op(u32 op, u32 pc, int ninstr)
 	case 0x29: emit_store(M_HU, rs, rt, simm); return 1;  // SH
 	case 0x2b: emit_store(M_W, rs, rt, simm); return 1;   // SW
 	case 0x32:   // LWC2
+		grp_pre((int)rs, simm);
 		load_to(M_W, rs, simm, R2);
 		gte_from((int)rt, R2);
 		return 1;
 	case 0x3a:   // SWC2
+		grp_pre((int)rs, simm);
 		gte_to((int)rt, R2);
 		store_from(M_W, rs, simm, R2);
 		return 1;
@@ -1794,14 +2234,18 @@ static block_fn compile_block(u32 pc, block_fn *s)
 	u32 *start, *entry, *cold_start, cur = pc;
 	int n = 0, tot = 0;   // n: instrucciones del tramo actual (para los ciclos); tot: de todo el superbloque
 
-	if (emit_ptr + MAX_BLOCK * 48 + 512 > cold_base || cold_ptr + MAX_BLOCK * 16 + 256 > code_end) flush_all();
+	if (emit_ptr + MAX_BLOCK * 48 + 512 > hot_end || cold_ptr + MAX_BLOCK * 16 + 256 > code_end) flush_all();
 	start = emit_ptr;
 	cold_start = cold_ptr;
 #ifdef PSX_SMCLOG
 	{ static u32 lf; if (lf != psx_frame_no && dyn_cmp_log.n < 8192) { lf = psx_frame_no; dyn_cmp_log.e[dyn_cmp_log.n++] = 0xff000000 | lf; } }
+#ifdef PSX_CMPPC
+	if (psx_frame_no >= 200 && dyn_cmp_log.n < 8192) dyn_cmp_log.e[dyn_cmp_log.n++] = pc;
+#endif
 #endif
 	pv_start();
 	rng_start();
+	blk_pc = pc;
 	alloc_regs(pc);
 	emit(pc);   // cabecera: el PC virtual con el que se tradujo
 	entry = emit_ptr;
@@ -1845,7 +2289,7 @@ static block_fn compile_block(u32 pc, block_fn *s)
 			u32 o = op >> 26, rs = (op >> 21) & 31, rt = (op >> 16) & 31, rd = (op >> 11) & 31;
 			u32 simm = (u32)(s32)(s16)(op & 0xffff), target = cur + 4 + (simm << 2);
 			int dynamic = 0, cond_kind = 0, link_reg = 0, goon = 0;   // cond_kind: 0 = siempre, 1 = condicional, 2 = nunca
-			int late, a, b;
+			int late, a, b, hk;
 			if (is_branch(dop) || ends_block(dop)) {
 				if (tot == 1) { emit_ptr = start; cold_ptr = cold_start; return NULL; }   // que lo haga el intérprete
 				flush_regs();
@@ -1853,6 +2297,7 @@ static block_fn compile_block(u32 pc, block_fn *s)
 				exit_block(n - 1);
 				break;
 			}
+			ra_op(op, cur);
 			op_regs(dop, &dr, &dw);
 			switch (o) {
 			case 0x00:   // JR, JALR
@@ -1874,6 +2319,7 @@ static block_fn compile_block(u32 pc, block_fn *s)
 				cond_kind = rs ? 1 : o == 0x06 ? 0 : 2;
 				break;
 			}
+			hk = cond_kind == 1 && !link_reg ? hammock_len(op, cur, tot, 1) : 0;
 			// los operandos se leen antes del delay slot: si este (o el enlace) los pisa, se guardan antes
 			operands = (1u << rs) | (o == 0x04 || o == 0x05 ? 1u << rt : 0);
 			clobbered = dw | (link_reg ? 1u << link_reg : 0);
@@ -1892,7 +2338,35 @@ static block_fn compile_block(u32 pc, block_fn *s)
 			if (link_reg) put_const(link_reg, cur + 8);
 			n++;
 			tot++;
-			if (dop) emit_op(dop, cur + 4, n);
+			if (dop) { ra_op(dop, cur + 4); in_dslot = 1; emit_op(dop, cur + 4, n); in_dslot = 0; }
+			if (hk) {   // si-entonces corto (ver hammock_len): saltar lo de dentro sin salir del bloque
+				u32 from = cur + 8, wm = hk_prepare(from, hk), *skip;
+				int c;
+				if (late) { branch_operands(op, &a, &b, R2, R3); c = branch_cond(op, a, b); }
+				else { a_ldr(R2, RCPU, off_tmp); a_dp_imm(C_AL, OP_CMP, 1, 0, R2, 0); c = C_NE; }
+				skip = fwd(c);
+				pv_after(op);
+				rng_after(op);
+				pv_after(dop);
+				rng_after(dop);
+				for (int i = 0; i < hk; i++) {
+					u32 sop = fetch_op(from + 4 * (u32)i);
+					n++;
+					tot++;
+					cur_pos = (int)((from + 4 * (u32)i - blk_pc) >> 2);
+					if (sop) emit_op(sop, from + 4 * (u32)i, n);
+					pv_after(sop);
+					rng_after(sop);
+				}
+				for (u32 m = wm; m; m &= m - 1) hk_unconst(__builtin_ctz(m));   // lo que se volvió constante dentro
+				ra_frozen = 0;
+				land(skip);
+				// tras juntarse los caminos, lo cambiado dentro ya no tiene valor ni rango conocido
+				pv_ok &= ~wm;
+				for (u32 m = wm; m; m &= m - 1) rng[__builtin_ctz(m)].kind = RK_NONE;
+				cur = from + 4 * (u32)hk;
+				continue;
+			}
 			flush_regs();
 			if (dynamic) {   // JR/JALR: buscar el bloque con el despachador
 				int t = R2;
@@ -1923,6 +2397,30 @@ static block_fn compile_block(u32 pc, block_fn *s)
 				// operandos listos antes de mirar el tiempo: los dos caminos los usan
 				if (late) branch_operands(op, &a, &b, R2, R3);
 				else { a_ldr(R2, RCPU, off_tmp); a = R2; b = -1; }
+				goon = !idle && sb_cont(op, cur, pc) && tot + 2 < SB_MAX && !has_block(cur + 8);
+#ifndef DYN_SB_CYC_BOTH
+				if (goon) {
+					// superbloque: el camino que sigue no cuenta ciclos ni mira el tiempo aquí (lo hará la próxima salida
+					// con todas las instrucciones juntas); solo el que salta, que sale del bloque
+					if (late) c = branch_cond(op, a, b);
+					else { a_dp_imm(C_AL, OP_CMP, 1, 0, R2, 0); c = C_NE; }
+					not_taken = fwd(c ^ 1);
+					emit_cycles(n);
+					out = fwd(C_PL);
+					link_site(target);
+					land(not_taken);
+					begin_cold();
+					land(out);
+					exit_pc(target);
+					end_cold();
+					pv_after(op);
+					rng_after(op);
+					pv_after(dop);
+					rng_after(dop);
+					cur += 8;
+					continue;
+				}
+#endif
 				emit_cycles(n);
 				out = fwd(C_PL);
 				if (late) c = branch_cond(op, a, b);
@@ -1936,7 +2434,6 @@ static block_fn compile_block(u32 pc, block_fn *s)
 				if (idle) emit_idle(target, psyq_vsync(target) ? (int)(fetch_op(target) & 0xffff) : -1);
 				else link_site(target);
 				land(not_taken);
-				goon = !idle && sb_cont(op, cur, pc) && tot + 2 < SB_MAX && !has_block(cur + 8);
 				if (!goon) link_site(cur + 8);   // si no, el bloque sigue aquí mismo (superbloque)
 				begin_cold();   // sin tiempo: volver a C por el camino que toque
 				land(out);
@@ -1960,6 +2457,7 @@ static block_fn compile_block(u32 pc, block_fn *s)
 			cur += 4;
 			break;
 		}
+		if (op) ra_op(op, cur);
 		if (op && !emit_op(op, cur, n)) break;
 		pv_after(op);
 		rng_after(op);
@@ -2022,6 +2520,19 @@ void dyn_scr_fail(u32 pc)
 	if (scr_unsafe_n < 256) {
 		for (i = (pc >> 2) & 255; scr_unsafe[i] && scr_unsafe[i] != pc; i = (i + 1) & 255) { }
 		if (!scr_unsafe[i]) { scr_unsafe[i] = pc; scr_unsafe_n++; }
+	}
+	if (s && *s && (*s)[-1] == pc) *s = NULL;
+	if (l < 0x200000) unlink_page(l >> DYN_PAGE_BITS, l, l + 4);
+}
+
+// Lo llama la salida de un grupo cuya comprobación falló (ver grp_materialize): el bloque de pc, sin grupos
+void dyn_grp_fail(u32 pc)
+{
+	block_fn *s = slot(pc);
+	u32 l = lin(pc), i;
+	if (grp_unsafe_n < 256) {
+		for (i = (pc >> 2) & 255; grp_unsafe[i] && grp_unsafe[i] != pc; i = (i + 1) & 255) { }
+		if (!grp_unsafe[i]) { grp_unsafe[i] = pc; grp_unsafe_n++; }
 	}
 	if (s && *s && (*s)[-1] == pc) *s = NULL;
 	if (l < 0x200000) unlink_page(l >> DYN_PAGE_BITS, l, l + 4);
@@ -2105,14 +2616,17 @@ void dyn_run(u32 until)
 }
 
 // Para el perfilador: inicio de la caché, trampolines, rutinas de memoria, bloques, zona fría y final
-void dyn_regions(u32 r[6])
+// stubs [0, 1), trampolines [1, 2), rutinas de memoria [2, 3), bloques [3, 4), zona fría [5, 6); r[7] = 0
+void dyn_regions(u32 r[8])
 {
 	r[0] = (u32)(uintptr_t)code_buf;
 	r[1] = (u32)(uintptr_t)tramp_at[0];
 	r[2] = (u32)(uintptr_t)smc_handler;
 	r[3] = (u32)(uintptr_t)code_start;
-	r[4] = (u32)(uintptr_t)cold_base;
-	r[5] = (u32)(uintptr_t)code_end;
+	r[4] = (u32)(uintptr_t)hot_end;
+	r[5] = (u32)(uintptr_t)cold_base;
+	r[6] = (u32)(uintptr_t)code_end;
+	r[7] = 0;
 }
 
 // PC MIPS del bloque que contiene la dirección ARM a (0 si no es de un bloque de la zona caliente)

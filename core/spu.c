@@ -289,7 +289,7 @@ static void tick(void)
 	if (spu_hw && spu_hw->mix) spu_hw->mix(TICK_SAMPLES);
 }
 
-void spu_advance(u32 cycles)
+PSX_ITCM void spu_advance(u32 cycles)   // en la ITCM (1% en la DSi real con Tomb Raider)
 {
 	tick_acc += cycles;
 	while (tick_acc >= TICK_CYCLES) {

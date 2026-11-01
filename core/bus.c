@@ -31,8 +31,14 @@ void irq_update(void)
 	} else cpu.cop0[13] &= ~0x400;
 }
 
+#ifdef DBG_IRQCOUNT
+u32 dbg_irq_count[11], dbg_exc_count;   // depuración: interrupciones levantadas por tipo, excepciones tomadas
+#endif
 void psx_irq(int n)
 {
+#ifdef DBG_IRQCOUNT
+	if (!(irq_stat & (1u << n))) dbg_irq_count[n]++;
+#endif
 	irq_stat |= 1u << n;
 	irq_update();
 }
@@ -84,6 +90,7 @@ static void io_write(u32 p, u32 v, int size)
 #ifdef PSX_TRACE_IO
 	if (trace_n++ < 3000 && p != 0x1f801070 && p != 0x1f801074) printf("W%d %08x = %08x pc=%08x\n", size, p, v, cpu.cur_pc);
 #endif
+	if (off == 0x810) { gpu_write_gp0(v); return; }   // los juegos que mandan los comandos a mano escriben aquí sin parar: va primero
 	if (off < 0x24) { memctrl[off >> 2] = v; return; }
 	if (off >= 0x40 && off < 0x50) { sio_write(off - 0x40, v, size); return; }
 	if (off >= 0x50 && off < 0x60) return;
@@ -103,7 +110,6 @@ static void io_write(u32 p, u32 v, int size)
 	}
 	if (off >= 0x100 && off < 0x130) { timer_write(off - 0x100, v); return; }
 	if (off >= 0x800 && off < 0x804) { cdrom_write(off - 0x800, v & 0xff); return; }
-	if (off == 0x810) { gpu_write_gp0(v); return; }
 	if (off == 0x814) { gpu_write_gp1(v); return; }
 	if (off == 0x820) { mdec_write_cmd(v); return; }
 	if (off == 0x824) { mdec_write_ctrl(v); return; }

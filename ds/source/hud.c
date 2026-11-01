@@ -31,12 +31,12 @@ static const char *const t_name[T_N] = { "CPU PS1", "GPU", "MDEC", "traducir", "
 
 // lo medido en el último segundo
 static struct {
-	int fps10, game10, target, pct[T_N];
+	int fps10, game10, drawn10, target, pct[T_N];   // drawn10: imágenes que se ven (sin las saltadas)
 	u32 worst_ms, best_ms, log_ms;
 	PsxStats st;
 } s;
 
-static char game_name[40], settings_str[48];
+static char game_name[40], settings_str[64];
 #ifndef HUD_PAGE
 #define HUD_PAGE 0
 #endif
@@ -96,7 +96,9 @@ static void draw_page0(void)
 	row(2, "");
 	row(3, "FPS PS1  %s%3d.%d" C_W " / %d   %s%d%%", speed_color(speed), s.fps10 / 10, s.fps10 % 10, s.target,
 	    speed_color(speed), speed);
-	if (s.st.disp_flips) row(4, "FPS juego %3d.%d" C_D "  (dibujados)", s.game10 / 10, s.game10 % 10);
+	if (s.st.disp_flips && s.drawn10 < s.game10)   // con salto de imágenes: las que se ven
+		row(4, "FPS juego %3d.%d" C_D "  vistas %d.%d", s.game10 / 10, s.game10 % 10, s.drawn10 / 10, s.drawn10 % 10);
+	else if (s.st.disp_flips) row(4, "FPS juego %3d.%d" C_D "  (todas vistas)", s.game10 / 10, s.game10 % 10);
 	else row(4, "FPS juego   --" C_D "  (buffer fijo)");
 	row(5, "frame peor %lums  mejor %lums", s.worst_ms, s.best_ms);
 	row(6, "");
@@ -123,7 +125,7 @@ static void draw_page1(void)
 	row(1, C_Y "GPU" C_W "  pixeles %lu mil", s.st.gpu_pixels / 1000);
 	row(2, " comandos %lu  triang. %lu", s.st.gpu_cmds, s.st.gpu_tris);
 	row(3, " rect %lu  lineas %lu  rell. %lu", s.st.gpu_rects, s.st.gpu_lines, s.st.gpu_fills);
-	row(4, " subida VRAM %lu KB  copias %lu", s.st.vram_upload * 2 / 1024, s.st.gpu_copies);
+	row(4, " VRAM %luKB copias %lu tex %lu", s.st.vram_upload * 2 / 1024, s.st.gpu_copies, s.st.tex_bands);
 	row(5, " pantalla %dx%d en (%d,%d)", gpu_disp.width, gpu_disp.height, gpu_disp.disp_x, gpu_disp.disp_y);
 	row(6, C_Y "CD" C_W " sectores %lu (%lu.%lux)", s.st.cd_sectors, s.st.cd_sectors / 75, s.st.cd_sectors * 10 / 75 % 10);
 	row(7, C_Y "MDEC" C_W " macrobloques %lu", s.st.mdec_blocks);
@@ -218,7 +220,7 @@ void hud_start(const char *game, int use_log, const char *settings)
 		fprintf(logf, "\n# SparStation  %04d-%02d-%02d %02d:%02d  juego=%s  cache=%luKB  %s\n", tm->tm_year + 1900, tm->tm_mon + 1,
 		        tm->tm_mday, tm->tm_hour, tm->tm_min, game_name, size / 1024, settings_str);
 		fprintf(logf, "t,fps,fps_juego,cpu%%,gpu%%,mdec%%,trad%%,copia%%,sd%%,otros%%,peor_ms,mejor_ms,cmds,tri,rect,"
-		              "vram_kb,cd_sect,mdec_mb,bloques,interp,pasos,smc,vaciados,cache%%,res,pc,kpx,gte%%,esperas,es_lentas,arm_por_mips,3d_subdesb,3d_tarde,3d_lineas_min,cpu_ps1%%\n");
+		              "vram_kb,cd_sect,mdec_mb,bloques,interp,pasos,smc,vaciados,cache%%,res,pc,kpx,gte%%,esperas,es_lentas,arm_por_mips,3d_subdesb,3d_tarde,3d_lineas_min,cpu_ps1%%,fps_vistas,tex_nuevas,descartes_fb\n");
 		fflush(logf);
 		fsync(fileno(logf));
 	}
@@ -275,6 +277,7 @@ void hud_second(int frames, u32 vblanks)
 	s.target = gpu_disp.pal ? 50 : 60;
 	s.fps10 = frames * 600 / (int)vblanks;
 	s.game10 = (int)(psx_stat.disp_flips * 600 / vblanks);
+	s.drawn10 = (int)(psx_stat.disp_drawn * 600 / vblanks);
 	other = total > p[PROF_CPU] + p[PROF_PRESENT] + p[PROF_DISC] ? total - p[PROF_CPU] - p[PROF_PRESENT] - p[PROF_DISC] : 0;
 	t[T_CPU] = cpu_only > 0 ? (u32)cpu_only : 0;
 	t[T_GPU] = p[PROF_GPU];
@@ -304,7 +307,7 @@ void hud_second(int frames, u32 vblanks)
 	if (logf) {
 		u32 t0 = cpuGetTiming(), used, size;
 		dyn_cache_use(&used, &size);
-		fprintf(logf, "%lu,%d.%d,%d.%d,%d,%d,%d,%d,%d,%d,%d,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%dx%d%s,%08lx,%lu,%lu,%lu,%lu,%lu.%lu,%lu,%lu,%lu,%lu\n",
+		fprintf(logf, "%lu,%d.%d,%d.%d,%d,%d,%d,%d,%d,%d,%d,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%dx%d%s,%08lx,%lu,%lu,%lu,%lu,%lu.%lu,%lu,%lu,%lu,%lu,%d.%d,%lu,%lu\n",
 		        seconds, s.fps10 / 10, s.fps10 % 10, s.game10 / 10, s.game10 % 10, s.pct[T_CPU], s.pct[T_GPU], s.pct[T_MDEC],
 		        s.pct[T_COMPILE], s.pct[T_PRESENT], s.pct[T_DISC], s.pct[T_OTHER], s.worst_ms, s.best_ms, s.st.gpu_cmds,
 		        s.st.gpu_tris, s.st.gpu_rects, s.st.vram_upload * 2 / 1024, s.st.cd_sectors, s.st.mdec_blocks,
@@ -312,7 +315,8 @@ void hud_second(int frames, u32 vblanks)
 		        size ? used * 100 / size : 0, gpu_disp.width, gpu_disp.height, gpu_disp.color24 ? "x24" : "", cpu.pc,
 		        s.st.gpu_pixels / 1000, (u32)((u64)p[PROF_GTE] * 100 / total), s.st.dyn_idle, s.st.io_calls,
 		        s.st.dyn_mips ? s.st.dyn_arm / s.st.dyn_mips : 0, s.st.dyn_mips ? s.st.dyn_arm * 10 / s.st.dyn_mips % 10 : 0,
-		        gx_underflows, gx_late, gx_rdlines_min == 99 ? 0 : gx_rdlines_min, 25600ul / psx_cpu_scale);
+		        gx_underflows, gx_late, gx_rdlines_min == 99 ? 0 : gx_rdlines_min, 25600ul / psx_cpu_scale, s.drawn10 / 10, s.drawn10 % 10,
+		        s.st.tex_bands, s.st.fb_skips);
 		gx_underflows = gx_late = 0;
 		gx_rdlines_min = 99;
 		log_lines++;
