@@ -766,7 +766,7 @@ struct {
 	u32 prof[PROF_N];
 	PsxStats stat;
 } bench = { "SPBENCH" };
-#ifdef PSX_SMCLOG
+#if defined(PSX_SMCLOG) || defined(DYN_STRESS)
 u32 psx_frame_no;
 #endif
 
@@ -938,7 +938,7 @@ static void run_loop(const char *title, int use_log)
 #ifdef GX_HASH
 		{ extern u32 gx_hash; if (bench.frames == GX_HASH) gx_dbg.dyn = gx_hash; }
 #endif
-#ifdef PSX_SMCLOG
+#if defined(PSX_SMCLOG) || defined(DYN_STRESS)
 		{ extern u32 psx_frame_no; psx_frame_no = bench.frames; }
 #endif
 		bench.vblanks = vblanks;

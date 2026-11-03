@@ -2594,6 +2594,9 @@ u32 dyn_where;   // depuración: 1 = despacho, 2 = traducir, 3 = paso interpreta
 
 void dyn_run(u32 until)
 {
+#ifdef DYN_STRESS
+	{ extern u32 psx_frame_no; static u32 lf; if (psx_frame_no - lf >= DYN_STRESS) { lf = psx_frame_no; flush_all(); } }   // pruebas: medir el traductor (todo se retraduce cada DYN_STRESS imágenes)
+#endif
 	psx_run_until = until;
 	dyn_chain = psx_hook_pc ? 0 : psx_tty ? 1 : 2;
 #ifdef DYN_NOCHAIN
