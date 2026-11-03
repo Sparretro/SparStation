@@ -562,22 +562,29 @@ static int ra_n, ra_frozen;  // ra_frozen: dentro de un si-entonces el reparto n
 static s8 host_of[16];       // registro MIPS en cada registro ARM del reparto (-1: libre)
 static u8 ra_pool[5], ra_npool;
 
-static u8 ra_nu[RA_MAX + 1][32];   // próxima posición (>= p) en la que se usa cada registro (255: ninguna); ver ra_index
-static int ra_next(int mr, int pos)
+// Posiciones del bloque en las que se usa cada registro, en bits (ver ra_index). Antes era una tabla de 32 bytes por
+// posición copiada entera de atrás adelante: un 9 % del tiempo de traducir.
+#define RA_W ((RA_MAX + 31) / 32)
+static u32 ra_pos[32][RA_W];
+static inline __attribute__((always_inline)) int ra_next(int mr, int pos)   // próxima posición (>= pos) en la que se usa mr
 {
-	u32 q = pos < ra_n ? ra_nu[pos][mr] : 255;
-	return q == 255 ? RA_NEVER : (int)q;
+	if (pos >= ra_n) return RA_NEVER;
+	for (int w = pos >> 5; w < RA_W; w++) {
+		u32 m = ra_pos[mr][w];
+		if (w == pos >> 5) m &= ~0u << (pos & 31);
+		if (m) { int q = (w << 5) + __builtin_ctz(m); return q < ra_n ? q : RA_NEVER; }
+	}
+	return RA_NEVER;
 }
 
-// La tabla de próximos usos del bloque, de atrás adelante (una vez por bloque: ra_need la mira en cada instrucción)
+// La tabla de usos del bloque (una vez por bloque: ra_need la mira en cada instrucción)
 static void ra_index(void)
 {
-	memset(ra_nu[ra_n], 255, 32);
-	for (int p = ra_n - 1; p >= 0; p--) {
-		memcpy(ra_nu[p], ra_nu[p + 1], 32);
-		for (u32 m = ra_use[p]; m; m &= m - 1) ra_nu[p][__builtin_ctz(m)] = (u8)p;
-	}
+	memset(ra_pos, 0, sizeof ra_pos);
+	for (int p = 0; p < ra_n; p++)
+		for (u32 m = ra_use[p]; m; m &= m - 1) ra_pos[__builtin_ctz(m)][p >> 5] |= 1u << (p & 31);
 }
+
 
 static void ra_evict(int h)
 {
@@ -1341,13 +1348,21 @@ static void op_regs(u32 op, u32 *r, u32 *w)
 static int fetch_mark;
 static void mark_pages(u32 start, u32 end);
 
-static u32 fetch_op(u32 pc)
+__attribute__((noinline)) static void fetch_mark_slow(u32 p)
+{
+	u32 a = p & 0x1fffff, pg = a >> DYN_PAGE_BITS, o = a & ((1u << DYN_PAGE_BITS) - 1);
+	if (code_bits) {   // una palabra: sin el bucle general de mark_pages
+		if (!dyn_pages[pg]) { code_lo[pg] = (u16)(o & ~3u); code_hi[pg] = (u16)((o & ~3u) + 4); dyn_pages[pg] = 1; }
+		else { if (o < code_lo[pg]) code_lo[pg] = (u16)(o & ~3u); if (o + 4 > code_hi[pg]) code_hi[pg] = (u16)((o & ~3u) + 4); }
+		code_bits[a >> 7] |= 1u << ((a >> 2) & 31);
+	} else if (!dyn_pages[pg] || o < code_lo[pg] || o + 4 > code_hi[pg]) mark_pages(p, p);
+}
+
+__attribute__((always_inline)) static inline u32 fetch_op(u32 pc)
 {
 	u32 p = pc & 0x1fffffff;
-	if (fetch_mark && p < 0x800000) {   // lo normal: ya está dentro de lo marcado
-		u32 a = p & 0x1fffff, pg = a >> DYN_PAGE_BITS, o = a & ((1u << DYN_PAGE_BITS) - 1);
-		if (!dyn_pages[pg] || o < code_lo[pg] || o + 4 > code_hi[pg]) mark_pages(p, p);
-	}
+	// lo leído cuenta como código palabra a palabra (con el mapa; sin él, por el rango de la página)
+	if (fetch_mark && p < 0x800000 && (!code_bits || !(code_bits[(p & 0x1fffff) >> 7] >> ((p >> 2) & 31) & 1))) fetch_mark_slow(p);
 	if (p < 0x800000) return *(u32 *)(psx_ram + (p & 0x1ffffc));
 	return *(u32 *)(psx_bios + (p & 0x7fffc));
 }
@@ -2555,7 +2570,6 @@ void dyn_grp_fail(u32 pc)
 	if (l < 0x200000) unlink_page(l >> DYN_PAGE_BITS, l, l + 4);
 }
 
-// PCs que compile() deja al intérprete (un salto con otro salto o un RFE en su delay slot, como el final de
 // las interrupciones de la BIOS): sin esto se intentaba traducirlos cada vez, cientos por segundo
 static u32 interp_only[64];
 static int is_interp_only(u32 pc) { return pc && interp_only[(pc >> 2) & 63] == pc; }
@@ -2589,6 +2603,7 @@ block_fn dyn_link(u32 target, u32 *site)
 	sync_code(site, 4);
 	return f;
 }
+
 
 u32 dyn_where;   // depuración: 1 = despacho, 2 = traducir, 3 = paso interpretado, 4 = bloque, 0 = fuera
 
