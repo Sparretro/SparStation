@@ -46,6 +46,11 @@ typedef u32 *block_fn;   // primera instrucción del bloque; la palabra anterior
 
 u32 *emit_ptr;
 u8 dyn_pages[DYN_NPAGES];
+// Y palabra a palabra: un bit por instrucción traducida. Crash Bandicoot tiene un contador (80034520) entre dos funciones
+// del mismo KB y lo sube en cada imagen: con solo el rango lo/hi, cada escritura borraba y retraducía todo ese KB.
+#define CODE_BITS_BYTES (0x200000 / 4 / 8)
+static u32 *code_bits;   // en el montón (NULL sin memoria: todo cuenta como código, como antes)
+static inline int is_code(u32 a) { return !code_bits || (code_bits[a >> 7] >> ((a >> 2) & 31) & 1); }
 #ifdef PSX_SMCLOG
 struct { char magic[8]; u32 n, e[4096]; } dyn_smc_log = { "SPSMCLOG" };
 struct { char magic[8]; u32 n, e[8192]; } dyn_cmp_log = { "SPCMPLOG" };
@@ -289,6 +294,7 @@ int dyn_init(int big)
 	slots = calloc(nslots, sizeof(block_fn));
 	while (!slots && nslots > 0x2000) slots = calloc(nslots >>= 1, sizeof(block_fn));   // sin sitio: más pequeña
 #endif
+	if (!code_bits) code_bits = calloc(1, CODE_BITS_BYTES);
 	links = malloc(link_max * sizeof(Link));
 	if (big) {
 		code_size = 3 * 1024 * 1024;
@@ -381,6 +387,7 @@ static void flush_all(void)
 	STAT_ADD(dyn_flushes, 1);
 	memset(slots, 0, (slot_mask + 1) * sizeof(block_fn));
 	memset(dyn_pages, 0, sizeof dyn_pages);
+	if (code_bits) memset(code_bits, 0, CODE_BITS_BYTES);
 	memset(link_head, 0xff, sizeof link_head);
 	link_n = 0;
 	gen++;
@@ -428,6 +435,8 @@ static u16 code_lo[DYN_NPAGES], code_hi[DYN_NPAGES];
 static void smc_page(u32 page, u32 off)
 {
 	dyn_pages[page] = 0;
+	if (code_bits)
+		for (u32 w = (page << DYN_PAGE_BITS) >> 7; w < ((page + 1) << DYN_PAGE_BITS) >> 7; w++) code_bits[w] = 0;
 	STAT_ADD(dyn_smc, 1);
 #ifdef PSX_SMCLOG
 	if (dyn_smc_log.n < 4096) dyn_smc_log.e[dyn_smc_log.n++] = (off & 0x1fffff) | (psx_frame_no << 21);
@@ -467,6 +476,7 @@ void dyn_smc(u32 off)
 #endif
 	if (!dyn_pages[page] || o + 4 <= code_lo[page] || o >= code_hi[page]) return;
 #endif
+	if (!is_code(off & 0x1ffffc)) return;   // dato entre funciones: el código no cambió
 	smc_page(page, off);
 }
 
@@ -477,7 +487,11 @@ void dyn_ram_written(u32 off, u32 len)
 	for (u32 a = off; a < end; a = (a | ((1u << DYN_PAGE_BITS) - 1)) + 1) {
 		u32 page = a >> DYN_PAGE_BITS, base = page << DYN_PAGE_BITS;
 		u32 lo = a - base, hi = (end - base < (1u << DYN_PAGE_BITS) ? end - base : 1u << DYN_PAGE_BITS);
-		if (dyn_pages[page] && lo < code_hi[page] && hi > code_lo[page]) smc_page(page, a);
+		if (dyn_pages[page] && lo < code_hi[page] && hi > code_lo[page]) {
+			u32 b;
+			for (b = (base + lo) & ~3u; b < base + hi && !is_code(b); b += 4) { }
+			if (b < base + hi) smc_page(page, a);
+		}
 	}
 }
 
@@ -2193,6 +2207,8 @@ static void mark_pages(u32 start, u32 end)
 		if (lo < code_lo[p]) code_lo[p] = (u16)lo;
 		if (hi > code_hi[p]) code_hi[p] = (u16)hi;
 	}
+	if (code_bits)
+		for (u32 a = a0 & ~3u; a < a1 && a < 0x200000; a += 4) code_bits[a >> 7] |= 1u << ((a >> 2) & 31);
 }
 
 // Compara los operandos de un salto condicional (b < 0: con cero) y devuelve la condición ARM de «se salta»
@@ -2483,7 +2499,8 @@ static block_fn compile_block(u32 pc, block_fn *s)
 		emit(pc);
 		end_cold();
 	}
-	mark_pages(pc, cur + 4);   // y el delay slot del final (fetch_op ya marcó lo que se leyó)
+	mark_pages(pc, cur);   // cur ya es el delay slot del final (antes «cur + 4» marcaba una palabra de más: el contador de
+	                        // Crash que va justo detrás borraba el bloque en cada imagen). fetch_op ya marcó lo leído por delante
 	STAT_ADD(dyn_mips, (cur - pc) / 4 + 1);
 	STAT_ADD(dyn_arm, (u32)(emit_ptr - start));   // solo la zona caliente
 	sync_code(start, (u32)((u8 *)emit_ptr - (u8 *)start));

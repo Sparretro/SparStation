@@ -106,6 +106,9 @@ u32 *dyn_code_base(void);               // principio de la zona caliente
 void dyn_regions(u32 r[8]);   // zonas de la caché de código (para el perfilador)
 u32 dyn_block_of(u32 arm_pc);   // PC MIPS del bloque traducido que contiene esa dirección (0 = ninguno)
 #define DYN_CHECK_WRITE(off) do { if (dyn_pages[((off) & 0x1fffff) >> DYN_PAGE_BITS]) dyn_smc((off) & 0x1fffff); } while (0)
+#elif defined(SMC_STUDY)
+void smc_study_write(u32 off);
+#define DYN_CHECK_WRITE(off) smc_study_write((off) & 0x1fffff)
 #else
 #define DYN_CHECK_WRITE(off) do { } while (0)
 #endif

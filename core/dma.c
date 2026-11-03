@@ -2,6 +2,9 @@
 #include "psx.h"
 #ifdef PSX_DYNAREC
 #define dyn_ram_written_if(o, l) dyn_ram_written(o, l)
+#elif defined(SMC_STUDY)
+void smc_study_dma(u32 off, u32 len);
+#define dyn_ram_written_if(o, l) smc_study_dma(o, l)
 #else
 #define dyn_ram_written_if(o, l) ((void)0)
 #endif

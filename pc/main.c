@@ -562,6 +562,9 @@ int main(int argc, char **argv)
 			u32 a = (u32)strtoul(argv[i + 1], NULL, 16);
 			for (u32 k = 0; k < 48; k++) mips_dis(a + k * 4, bus_read32(a + k * 4));
 		}
+#ifdef SMC_STUDY
+	{ void smc_study_report(void), smc_study_report2(void); smc_study_report2(); smc_study_report(); { void smc_study_report3(void); smc_study_report3(); } }
+#endif
 	return 0;
 }
 u32 gpustat[16];

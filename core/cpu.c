@@ -88,6 +88,9 @@ static inline void branch(u32 target)
 static inline u32 fetch(u32 pc)
 {
 	u32 p = pc & 0x1fffffff;
+#ifdef SMC_STUDY
+	{ void smc_study_exec(u32); if (p < 0x800000) smc_study_exec(p & 0x1ffffc); }
+#endif
 	if (p < 0x800000) return *(u32 *)(psx_ram + (p & 0x1fffff));
 	if (p >= 0x1fc00000 && p < 0x1fc80000) return *(u32 *)(psx_bios + (p & 0x7ffff));
 	return bus_read32(pc);
