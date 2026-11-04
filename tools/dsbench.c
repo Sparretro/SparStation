@@ -100,14 +100,19 @@ static int16_t input(unsigned port, unsigned dev, unsigned idx, unsigned id)
 		{ "b", 0 }, { "y", 1 }, { "select", 2 }, { "start", 3 }, { "up", 4 }, { "down", 5 }, { "left", 6 },
 		{ "right", 7 }, { "a", 8 }, { "x", 9 }, { "l", 10 }, { "r", 11 },
 	};
-	const char *spec = getenv("DSB_PRESS");
+	const char *spec = getenv("DSB_PRESS");   // varias separadas por comas: "a:400:4,down:500:4"
 	char btn[16];
-	int from, len;
+	int from, len, used;
 	(void)idx;
-	if (port || dev != 1 || !spec || sscanf(spec, "%15[a-z]:%d:%d", btn, &from, &len) != 3) return 0;
-	if (cur_frame < from || cur_frame >= from + len) return 0;
-	for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
-		if (!strcmp(btn, names[i].n) && names[i].id == id) return 1;
+	if (port || dev != 1 || !spec) return 0;
+	while (sscanf(spec, "%15[a-z]:%d:%d%n", btn, &from, &len, &used) == 3) {
+		if (cur_frame >= from && cur_frame < from + len)
+			for (size_t i = 0; i < sizeof names / sizeof names[0]; i++)
+				if (!strcmp(btn, names[i].n) && names[i].id == id) return 1;
+		spec += used;
+		if (*spec != ',') break;
+		spec++;
+	}
 	return 0;
 }
 

@@ -11,6 +11,9 @@
 #include "hud.h"
 #include "gx.h"
 #include "snd.h"
+#ifndef PSX_SELFTEST
+#include "pdsx.h"   // intro y menús con el aspecto de la BIOS de la PS1 (PDSX de RocketRobz)
+#endif
 #ifdef SPAR_PROF
 #include "prof.h"
 #endif
@@ -467,6 +470,19 @@ static u32 name_hash(const char *s)   // FNV-1a sin distinguir mayúsculas (FAT 
 	return h;
 }
 
+#ifndef PSX_SELFTEST
+// Abajo, mientras arriba está el menú principal de PDSX
+static void menu_info(int cursor)
+{
+	consoleClear();
+	printf("\x1b[36;1mSparStation v43\x1b[37;1m - PS1 en DSi\nby Spar Retro\n\nIntro y menus: PDSX\nde RocketRobz (licencia MIT)\n\n");
+	if (cursor == 0) printf("Memory Card: las tarjetas de\nmemoria se guardan solas en la\nSD, una por juego (ps1/*.mcr).\n");
+	else printf("CD Player: la lista de juegos\nde la SD (ps1/*.cue).\n");
+	printf("\n\x1b[36;1mA: entrar   arriba/abajo: elegir\x1b[37;1m");
+	fflush(stdout);
+}
+#endif
+
 static int pick_game(char *out, size_t outlen)
 {
 	static char names[MAX_GAMES][128];
@@ -509,6 +525,12 @@ static int pick_game(char *out, size_t outlen)
 	// Cambiar algo con un juego marcado lo apunta para ese juego.
 	int gq = opt_quality, gs = opt_skip, gc = opt_cpu, ghw = opt_hw, gsnd = opt_snd, gnw = opt_nwram, gmin = opt_cpu_min, gtg = opt_target, gvid = opt_video, cur = -1, own = 0;
 	char gpath[300];
+#ifndef PSX_SELFTEST
+	keysSetRepeat(20, 6);
+	pdsx_start();
+	pdsx_intro(menu_info);   // logo de SCE y menú principal (PDSX): «CD Player» lleva a la lista
+#endif
+	int redraw = 1;
 	for (;;) {
 		int keys;
 		if (sel != cur) {
@@ -516,25 +538,31 @@ static int pick_game(char *out, size_t outlen)
 			opt_quality = gq; opt_skip = gs; opt_cpu = gc; opt_hw = ghw; opt_snd = gsnd; opt_nwram = gnw; opt_cpu_min = gmin; opt_target = gtg; opt_video = gvid;
 			game_cfg_path(gpath, sizeof gpath, names[sel]);
 			own = cfg_read(gpath);
+			redraw = 1;
 		}
-		consoleClear();
-		printf("SparStation - elige juego\n(%s)\n\n", GAMES_DIR);
-		{   // caben 11 en pantalla: la ventana sigue a la selección
-			int top = sel < 11 ? 0 : sel - 10;
-			for (int i = top; i < n && i < top + 11; i++) printf("%c %.28s\n", i == sel ? '>' : ' ', names[i]);
-			if (n > 11) printf("\x1b[37m  (%d de %d)\x1b[37;1m\n", sel + 1, n);
+		if (redraw) {   // abajo: el juego marcado y sus ajustes (la lista va arriba, en el «CD Player»)
+			redraw = 0;
+			consoleClear();
+			printf("\x1b[36;1mSparStation v43\x1b[37;1m - CD Player\n\n");
+			printf("%.96s\n", names[sel]);
+			printf("\x1b[37m(%d de %d)\x1b[37;1m\n", sel + 1, n);
+			printf("\x1b[13;0H\x1b[36;1mAjustes %s\x1b[37;1m\n", own ? "de este juego" : "generales");
+			printf("L/R    calidad: %s (GPU sw)\n", quality_name[opt_quality]);
+			printf("SELECT saltar frames: %d\n", opt_skip);
+			printf("Y      CPU PS1: %s\n", cpu_name());
+			printf("X      GPU: %s\n", opt_hw ? "3D de la DS (rapida)" : "software (exacta)");
+			printf("B      sonido: %s\n", opt_snd ? "si" : "no");
+			printf("START  codigo: %s\n", !nwram_ok ? "RAM (sin NWRAM)" : opt_nwram ? "NWRAM (rapido)" : "RAM principal");
+			printf("</>    videos: %s\n", opt_video ? "rapidos" : "nitidos");
+			printf("\x1b[36;1mA: jugar   arriba/abajo: elegir\x1b[37;1m");
+			fflush(stdout);
 		}
-		printf("\x1b[15;0H\x1b[36;1mAjustes %s\x1b[37;1m\n", own ? "de este juego" : "generales");
-		printf("L/R    calidad: %s (GPU sw)\n", quality_name[opt_quality]);
-		printf("SELECT saltar frames: %d\n", opt_skip);
-		printf("Y      CPU PS1: %s\n", cpu_name());
-		printf("X      GPU: %s\n", opt_hw ? "3D de la DS (rapida)" : "software (exacta)");
-		printf("B      sonido: %s\n", opt_snd ? "si" : "no");
-		printf("START  codigo: %s\n", !nwram_ok ? "RAM (sin NWRAM)" : opt_nwram ? "NWRAM (rapido)" : "RAM principal");
-		printf("</>    videos: %s\n", opt_video ? "rapidos" : "nitidos");
-		printf("A: jugar");
-		fflush(stdout);
+#ifndef PSX_SELFTEST
+		pdsx_list_frame((const char (*)[128])names, n, sel);   // una imagen arriba (espera la vblank y lee los botones)
+		keys = keysDown() | (keysDownRepeat() & (KEY_UP | KEY_DOWN));
+#else
 		do { swiWaitForVBlank(); scanKeys(); keys = keysDown(); } while (!keys);
+#endif
 		if (keys & KEY_UP) sel = (sel + n - 1) % n;
 		if (keys & KEY_DOWN) sel = (sel + 1) % n;
 		if (keys & KEY_R) opt_quality = (opt_quality + 1) % 4;
@@ -545,10 +573,16 @@ static int pick_game(char *out, size_t outlen)
 		if (keys & KEY_B) opt_snd ^= 1;
 		if ((keys & KEY_START) && nwram_ok) opt_nwram ^= 1;
 		if (keys & (KEY_LEFT | KEY_RIGHT)) opt_video ^= 1;
-		if (keys & (KEY_R | KEY_L | KEY_SELECT | KEY_Y | KEY_X | KEY_B | KEY_START | KEY_LEFT | KEY_RIGHT)) { cfg_write(gpath); own = 1; }
+		if (keys & (KEY_R | KEY_L | KEY_SELECT | KEY_Y | KEY_X | KEY_B | KEY_START | KEY_LEFT | KEY_RIGHT)) { cfg_write(gpath); own = 1; redraw = 1; }
 		if (keys & KEY_A) break;
 	}
 	save_cfg();   // los del juego elegido pasan a ser los generales (los que ven los juegos sin ajustes propios)
+#ifndef PSX_SELFTEST
+	consoleClear();
+	printf("SparStation v43 - PS1 en DSi\nby Spar Retro\n\nIntro y menus: PDSX de RocketRobz\n\nCargando %.80s...\n", names[sel]);
+	pdsx_boot_logo();   // el logo de PlayStation, como al meter un disco
+	pdsx_stop();
+#endif
 	snprintf(out, outlen, GAMES_DIR "/%s", names[sel]);
 	return 1;
 }
@@ -1035,7 +1069,31 @@ int main(void)
 	fb[1] = fb[0] + 256 * 256;   // banco B, base de mapa 8
 	dmaFillHalfWords(0x8000, fb[0], 2 * 256 * 256 * 2);
 
-	printf("SparStation v42 - PS1 en DSi\nby Spar Retro\n\n");
+	printf("SparStation v43 - PS1 en DSi\nby Spar Retro\n\n");
+#ifdef PDSX_DEMO
+	{   // make DEMO=1: solo la intro y los menús, con nombres de ejemplo (para verlos en melonDS, que no tiene SD)
+		static char demo[6][128] = { "Crash Bandicoot.cue", "Klonoa - Door to Phantomile (USA).cue",
+		                             "Metal Gear Solid (Spain) (Disc 1).cue", "Resident Evil 2 (Disc 1).cue",
+		                             "(PS1) Silent Hill [NTSC-U] [SLUS-00707].cue", "Tomb Raider (USA).cue" };
+		int sel = 0;
+		soundInit(); soundPowerOn(); soundSetMixerVolume(127);
+		keysSetRepeat(20, 6);
+		pdsx_start();
+		pdsx_intro(menu_info);
+		for (;;) {
+			u32 k;
+			pdsx_list_frame((const char (*)[128])demo, 6, sel);
+			k = keysDown() | (keysDownRepeat() & (KEY_UP | KEY_DOWN));
+			if (k & KEY_DOWN) sel = (sel + 1) % 6;
+			if (k & KEY_UP) sel = (sel + 5) % 6;
+			if (k & KEY_A) break;
+		}
+		pdsx_boot_logo();
+		pdsx_stop();
+		printf("Fin de la demo de PDSX\n");
+		for (;;) swiWaitForVBlank();
+	}
+#endif
 #ifdef PSX_SELFTEST
 	if (!nitroFSInit(NULL) || !pak_init() || !load_bios()) {
 		printf("Pruebas: falta nitro:/bios.bin\no el Expansion Pak.\n");

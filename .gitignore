@@ -27,3 +27,4 @@ ds/arm7/*.elf
 tools/*.pdb
 tools/*.exe
 tools/wavgap/*.exe
+ds/build_demo/

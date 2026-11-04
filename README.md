@@ -17,3 +17,5 @@ Copia `SparStation.nds` a la SD y pon tus juegos (`.cue` + `.bin`) en `sd:/ps1/`
 ## Créditos
 
 BIOS: [OpenBIOS](https://github.com/grumpycoders/pcsx-redux) de PCSX-Redux (licencia MIT), incluida en `ds/data/openbios.bin`.
+
+Intro y menús (logo de SCE, menú principal, lista de juegos en el «CD Player» y logo de PlayStation al arrancar): basados en [PDSX](https://github.com/RocketRobz/PDSX) de RocketRobz (licencia MIT, ver `ds/pdsx/LICENSE-PDSX`), con sus gráficos y sonidos. Son solo decoración: la emulación usa OpenBIOS.

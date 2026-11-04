@@ -7,7 +7,7 @@ $(error "Please set DEVKITARM in your environment. export DEVKITARM=<path to>dev
 endif
 
 GAME_TITLE     := SparStation
-GAME_SUBTITLE1 := PlayStation en tu DSi (v42)
+GAME_SUBTITLE1 := PlayStation en tu DSi (v43)
 GAME_SUBTITLE2 := by Spar Retro
 # make SELFTEST=1 [NITRODIR=carpeta] mete esa carpeta como NitroFS (selftest.exe o disco reducido) para probar en modo DS
 ifeq ($(SELFTEST),1)
@@ -19,8 +19,8 @@ include $(DEVKITARM)/ds_rules
 
 TARGET   := SparStation
 BUILD    := build
-SOURCES  := source ../core hot
-INCLUDES := ../core
+SOURCES  := source ../core hot pdsx
+INCLUDES := ../core pdsx
 DATA     := data
 
 ARCH     := -marm -march=armv5te -mtune=arm946e-s
@@ -32,6 +32,7 @@ LIBS     := -lfat -lnds9 -lm
 # de GBA, que deja más memoria para la caché de código. Compila aparte (build_test, SparStation_test.nds).
 ifeq ($(SELFTEST),1)
 CFLAGS   += -DPSX_SELFTEST $(EXTRA)
+SOURCES  := source ../core hot   # sin PDSX (la intro): en las pruebas no hace falta y en el modo DS no cabe
 DATA     :=
 BUILD    := build_test
 TARGET   := SparStation_test
@@ -44,6 +45,12 @@ TARGET   := SparStation_perfil
 endif
 # make NWRAM7=1 (con make -C arm7 antes): el mismo ARM9 con el ARM7 de arm7/, que deja la NWRAM B y C al ARM9
 # (TWiLight Menu++ se la da al ARM7 protegida). Sale SparStation_nwram7.nds; con PERFIL=1, SparStation_perfil_nwram7.
+# make DEMO=1: la intro y los menús de PDSX con juegos de ejemplo, sin emular nada (para verlos en melonDS)
+ifeq ($(DEMO),1)
+CFLAGS   += -DPDSX_DEMO
+BUILD    := build_demo
+TARGET   := SparStation_demo
+endif
 ifeq ($(NWRAM7),1)
 TARGET   := $(TARGET)_nwram7
 _ARM7_ELF := -7 $(dir $(abspath $(firstword $(MAKEFILE_LIST))))arm7/arm7.elf
