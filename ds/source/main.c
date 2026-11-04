@@ -672,6 +672,29 @@ static void flip_in_vblank(void)
 	}
 }
 
+// Firma de cada franja de 16 filas de la zona mostrada (RE2/RE3 suben el fondo entero a la VRAM en cada imagen
+// aunque no cambie: sin esto se volvía a escalar y copiar toda la pantalla, un 25 % del tiempo). Con el 3D el BG3
+// es un único búfer: solo se copian las filas de las franjas que cambiaron de verdad.
+#define BH_N 32
+static u32 bh_sig[BH_N];
+static int bh_valid, bh_x, bh_y, bh_w, bh_h, bh_even;
+static u32 band_sig(int sy0, int rows, int sx, int w)
+{
+	u32 a = 1, b = 0;
+	for (int r = 0; r < rows; r++) {
+		const u16 *p = &psx_vram[((sy0 + r) & 511) * 1024];
+		int x0 = sx & 1023, x1 = x0 + w;
+		if (x1 <= 1024 && !(x0 & 1) && !(w & 1)) {
+			const u32 *q = (const u32 *)(p + x0), *e = (const u32 *)(p + x1);
+			while (q + 4 <= e) { a += q[0]; b += a; a += q[1]; b += a; a += q[2]; b += a; a += q[3]; b += a; q += 4; }
+			while (q < e) { a += *q++; b += a; }
+		} else
+			for (int x = 0; x < w; x++) { a += p[(x0 + x) & 1023]; b += a; }
+		b = (b << 7) | (b >> 25);
+	}
+	return a ^ (b * 2654435761u);
+}
+
 // Copia la zona visible de la VRAM de la PS1 escalándola a 256x192, de dos en dos píxeles
 static void present(void)
 {
@@ -694,6 +717,19 @@ static void present(void)
 			last24 = 1;
 		}
 	}
+	u8 chg[BH_N];
+	int use_bh = single_fb && !gpu_disp.disabled && !gpu_disp.color24 && h <= BH_N * 16;
+	if (use_bh) {   // qué franjas cambiaron de verdad (ver band_sig)
+		int same = bh_valid && bh_x == gpu_disp.disp_x && bh_w == w && bh_h == h && bh_even == even, any = 0;
+		for (int k = 0; k * 16 < h; k++) {
+			u32 s = band_sig(gpu_disp.disp_y + k * 16, h - k * 16 < 16 ? h - k * 16 : 16, gpu_disp.disp_x, w);
+			chg[k] = !same || s != bh_sig[k];
+			bh_sig[k] = s;
+			any |= chg[k];
+		}
+		bh_valid = 1; bh_x = gpu_disp.disp_x; bh_w = w; bh_h = h; bh_even = even;
+		if (!any) return;
+	} else bh_valid = 0;
 	while (flip_to >= 0) { }   // el cambio anterior aún no se ha hecho
 	if (single_fb) back = 0;
 	dst32 = (u32 *)fb[back];
@@ -709,6 +745,7 @@ static void present(void)
 		}
 		for (int y = 0; y < 192; y++, dst32 += 128) {
 			int sy = (gpu_disp.disp_y + ymap[y]) & 511;
+			if (use_bh && !chg[ymap[y] >> 4]) continue;   // esa franja ya está en el BG3
 			if (gpu_disp.color24) {
 				const u8 *line = (const u8 *)&psx_vram[sy * 1024];
 				int bx0 = gpu_disp.disp_x * 2;
@@ -987,7 +1024,7 @@ int main(void)
 	fb[1] = fb[0] + 256 * 256;   // banco B, base de mapa 8
 	dmaFillHalfWords(0x8000, fb[0], 2 * 256 * 256 * 2);
 
-	printf("SparStation v39 - PS1 en DSi\nby Spar Retro\n\n");
+	printf("SparStation v40 - PS1 en DSi\nby Spar Retro\n\n");
 #ifdef PSX_SELFTEST
 	if (!nitroFSInit(NULL) || !pak_init() || !load_bios()) {
 		printf("Pruebas: falta nitro:/bios.bin\no el Expansion Pak.\n");
