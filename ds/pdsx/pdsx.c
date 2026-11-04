@@ -150,6 +150,7 @@ static void fill_black(void) { dmaFillHalfWords(0x8000, bg_vram, 256 * 192 * 2);
 // ---- arranque y final ----
 void pdsx_start(void)
 {
+	consoleClear();   // abajo, en negro: la pantalla de abajo solo se usa dentro de los juegos
 	videoSetMode(MODE_5_3D | DISPLAY_BG3_ACTIVE);
 	vramSetBankA(VRAM_A_MAIN_BG_0x06000000);
 	vramSetBankB(VRAM_B_TEXTURE);

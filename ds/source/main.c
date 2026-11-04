@@ -471,15 +471,11 @@ static u32 name_hash(const char *s)   // FNV-1a sin distinguir mayúsculas (FAT 
 }
 
 #ifndef PSX_SELFTEST
-// Abajo, mientras arriba está el menú principal de PDSX
+// Abajo, mientras arriba está el menú principal de PDSX: nada (la pantalla de abajo solo se usa dentro de los juegos)
 static void menu_info(int cursor)
 {
+	(void)cursor;
 	consoleClear();
-	printf("\x1b[36;1mSparStation v43\x1b[37;1m - PS1 en DSi\nby Spar Retro\n\nIntro y menus: PDSX\nde RocketRobz (licencia MIT)\n\n");
-	if (cursor == 0) printf("Memory Card: las tarjetas de\nmemoria se guardan solas en la\nSD, una por juego (ps1/*.mcr).\n");
-	else printf("CD Player: la lista de juegos\nde la SD (ps1/*.cue).\n");
-	printf("\n\x1b[36;1mA: entrar   arriba/abajo: elegir\x1b[37;1m");
-	fflush(stdout);
 }
 #endif
 
@@ -527,26 +523,32 @@ static int pick_game(char *out, size_t outlen)
 	char gpath[300];
 #ifndef PSX_SELFTEST
 	keysSetRepeat(20, 6);
+	consoleClear();   // la pantalla de abajo, en negro: solo se usa dentro de los juegos
 	pdsx_start();
 	pdsx_intro(menu_info);   // logo de SCE y menú principal (PDSX): «CD Player» lleva a la lista
+	int redraw = 0, shown = 0;   // los ajustes solo aparecen abajo mientras se cambian (y se van solos)
+	u32 hide_at = 0, fr = 0;
+#else
+	int redraw = 1, shown = 1;
+	u32 hide_at = 0, fr = 0;
 #endif
-	int redraw = 1;
 	for (;;) {
 		int keys;
+		fr++;
 		if (sel != cur) {
 			cur = sel;
 			opt_quality = gq; opt_skip = gs; opt_cpu = gc; opt_hw = ghw; opt_snd = gsnd; opt_nwram = gnw; opt_cpu_min = gmin; opt_target = gtg; opt_video = gvid;
 			game_cfg_path(gpath, sizeof gpath, names[sel]);
 			own = cfg_read(gpath);
-			redraw = 1;
+			if (shown) redraw = 1;
 		}
-		if (redraw) {   // abajo: el juego marcado y sus ajustes (la lista va arriba, en el «CD Player»)
+#ifndef PSX_SELFTEST
+		if (shown && fr >= hide_at) { shown = 0; consoleClear(); }
+#endif
+		if (redraw) {   // abajo: los ajustes del juego marcado (la lista va arriba, en el «CD Player»)
 			redraw = 0;
 			consoleClear();
-			printf("\x1b[36;1mSparStation v43\x1b[37;1m - CD Player\n\n");
-			printf("%.96s\n", names[sel]);
-			printf("\x1b[37m(%d de %d)\x1b[37;1m\n", sel + 1, n);
-			printf("\x1b[13;0H\x1b[36;1mAjustes %s\x1b[37;1m\n", own ? "de este juego" : "generales");
+			printf("\x1b[36;1mAjustes %s\x1b[37;1m\n%.64s\n\n", own ? "de este juego" : "generales", names[sel]);
 			printf("L/R    calidad: %s (GPU sw)\n", quality_name[opt_quality]);
 			printf("SELECT saltar frames: %d\n", opt_skip);
 			printf("Y      CPU PS1: %s\n", cpu_name());
@@ -573,13 +575,17 @@ static int pick_game(char *out, size_t outlen)
 		if (keys & KEY_B) opt_snd ^= 1;
 		if ((keys & KEY_START) && nwram_ok) opt_nwram ^= 1;
 		if (keys & (KEY_LEFT | KEY_RIGHT)) opt_video ^= 1;
-		if (keys & (KEY_R | KEY_L | KEY_SELECT | KEY_Y | KEY_X | KEY_B | KEY_START | KEY_LEFT | KEY_RIGHT)) { cfg_write(gpath); own = 1; redraw = 1; }
+		if (keys & (KEY_R | KEY_L | KEY_SELECT | KEY_Y | KEY_X | KEY_B | KEY_START | KEY_LEFT | KEY_RIGHT)) {
+			cfg_write(gpath);
+			own = 1;
+			redraw = shown = 1;
+			hide_at = fr + 240;   // 4 s sin tocar nada: se van
+		}
 		if (keys & KEY_A) break;
 	}
 	save_cfg();   // los del juego elegido pasan a ser los generales (los que ven los juegos sin ajustes propios)
 #ifndef PSX_SELFTEST
 	consoleClear();
-	printf("SparStation v43 - PS1 en DSi\nby Spar Retro\n\nIntro y menus: PDSX de RocketRobz\n\nCargando %.80s...\n", names[sel]);
 	pdsx_boot_logo();   // el logo de PlayStation, como al meter un disco
 	pdsx_stop();
 #endif
