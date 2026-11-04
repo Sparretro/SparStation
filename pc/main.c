@@ -417,6 +417,8 @@ int main(int argc, char **argv)
 			printf("códigos: %d\n", cheat_parse(t));
 			free(t);
 		}
+	if (getenv("HLE_OFF")) psx_hle_off = 1;   // sin las rutinas en nativo (hle.c)
+	if (getenv("MDEC_FAST")) mdec_fast = 1;   // vídeos a un cuarto de resolución
 	t0 = clock();
 	for (int f = 1; f <= frames; f++) {
 		profiling = f > frames - 60;
@@ -448,6 +450,12 @@ int main(int argc, char **argv)
 		dbg_frame_on = getenv("DBG_FRAME") && f == atoi(getenv("DBG_FRAME"));
 #endif
 		psx_run_frame();
+#ifdef PSX_PROFILE
+		if (getenv("STATLOG") && f % 60 == 0) {   // cada 60 frames: bloques del MDEC, sectores y cambios de imagen
+			printf("f%d mdec_blk=%u cd=%u flips=%u\n", f, psx_stat.mdec_blocks, psx_stat.cd_sectors, psx_stat.disp_flips);
+			memset(&psx_stat, 0, sizeof psx_stat);
+		}
+#endif
 #ifdef DBG_GPUCOUNT
 		{   // depuración: comandos de línea y nodos de la lista de la GPU por segundo
 			extern u32 dbg_nodes, dbg_guard, dbg_lines, dbg_linecmd[32], dbg_gp1[64];

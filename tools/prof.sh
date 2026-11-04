@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 name=${1:-prof}; dir=${2:-nitro_shg}
 root=$(pwd -W | tr / '\')
 touch ds/source/main.c
-EXTRA="-DBENCH_QUALITY=2 -DBENCH_SKIP=${SKIP:-0} -DBENCH_CPU=${CPU:-1} -DBENCH_VRAM_PAK -DDYN_DS_RESERVE_KB=160 -DDYN_DS_SLOTS=0x80000 -DDYN_SLOTS_AT=0x09300000 -DSPAR_PROF -DPSX_BLKTAB -DNO_SND $EXTRA" sh tools/bench.sh "$dir" 10 -1 "$name" > /dev/null 2>&1
+EXTRA="-DBENCH_QUALITY=2 -DBENCH_SKIP=${SKIP:-0} -DBENCH_CPU=${CPU:-1} -DBENCH_VRAM_PAK -DDYN_DS_RESERVE_KB=${RESKB:-160} -DDYN_DS_SLOTS=0x80000 -DDYN_SLOTS_AT=0x09300000 -DSPAR_PROF -DPSX_BLKTAB -DNO_SND $EXTRA" sh tools/bench.sh "$dir" 10 -1 "$name" > /dev/null 2>&1
 DSB_PSX=${DSB_PSX:-100:600} DSB_PROF="$root/out/b/$name.prof" tools/dsbench.exe "$root/tools/melonds/melondsds_libretro.dll" "$root/out/b/$name.nds" 9000 "$root/out/b/$name.png" 2>/dev/null | grep -E 'BENCH|ms/frame|DSi'
 /opt/devkitpro/devkitARM/bin/arm-none-eabi-nm -n --defined-only ds/SparStation_test.elf > "out/b/$name.sym"
 tools/profrep.exe "out/b/$name.prof" "out/b/$name.sym" ${TOP:-40}

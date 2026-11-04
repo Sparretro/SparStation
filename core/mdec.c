@@ -49,12 +49,16 @@ static int out_reserve(u32 n)
 
 static inline int s10(u16 v) { return ((s32)((u32)v << 22)) >> 22; }
 
-// Lee un bloque comprimido; devuelve 0 si se acabaron los datos
-static int rl_decode(s16 *blk, const u16 **src, const u16 *end, const u8 *qt)
+// Lee un bloque comprimido; devuelve 0 si se acabaron los datos. *bound: lado del cuadrado de arriba a la
+// izquierda donde están todos los coeficientes (1..8): con 4 o menos la IDCT se salta la mitad del trabajo.
+static u8 zz_side[64];   // max(fila, columna) + 1 de cada posición del zigzag
+static int rl_decode(s16 *blk, const u16 **src, const u16 *end, const u8 *qt, int *bound)
 {
 	const u16 *p = *src;
-	int k, q, val;
+	int k, q, val, side = 1;
 	u16 n;
+	if (!zz_side[63])
+		for (int i = 0; i < 64; i++) { int r = zigzag[i] >> 3, c = zigzag[i] & 7; zz_side[i] = (u8)((r > c ? r : c) + 1); }
 	memset(blk, 0, 64 * sizeof(s16));
 	while (p < end && *p == 0xfe00) p++;
 	if (p >= end) return 0;
@@ -63,11 +67,12 @@ static int rl_decode(s16 *blk, const u16 **src, const u16 *end, const u8 *qt)
 	k = 0;
 	val = s10(n) * qt[0];
 	int ac = 0;
+	if (q == 0) side = 8;   // sin escala los coeficientes no van en zigzag
 	for (;;) {
 		if (q == 0) val = s10(n) * 2;
 		if (val < -0x400) val = -0x400;
 		if (val > 0x3ff) val = 0x3ff;
-		if (q > 0) blk[zigzag[k]] = (s16)val;
+		if (q > 0) { blk[zigzag[k]] = (s16)val; if (val && zz_side[k] > side) side = zz_side[k]; }
 		else blk[k] = (s16)val;
 		if (k) ac |= val;
 		if (k >= 63 || p >= end) break;   // un bloque lleno termina sin código FE00h
@@ -77,6 +82,7 @@ static int rl_decode(s16 *blk, const u16 **src, const u16 *end, const u8 *qt)
 		val = (s10(n) * qt[k] * q + 4) / 8;
 	}
 	*src = p;
+	*bound = side;
 	return ac ? 1 : 2;   // 2: solo el coeficiente de continua (la IDCT es un relleno)
 }
 
@@ -137,6 +143,72 @@ static void idct_fast(s16 *blk)
 	}
 }
 
+// Igual que idct_fast cuando todos los coeficientes caen en el cuadrado 4x4 de arriba a la izquierda (lo normal
+// en los vídeos): las columnas 4-7 dan 0 y las entradas 4-7 de cada fila también, así que sale lo mismo bit a bit
+static void idct_fast4(s16 *blk)
+{
+	s32 ws[32], o[8];
+	for (int c = 0; c < 4; c++) {
+		const s16 *in = blk + c;
+		if (!(in[8] | in[16] | in[24])) {
+			s32 dc = in[0] << P1;
+			for (int r = 0; r < 8; r++) ws[r * 4 + c] = dc;
+			continue;
+		}
+		idct_1d(o, in[0], in[8], in[16], in[24], 0, 0, 0, 0, CB);
+		for (int r = 0; r < 8; r++) ws[r * 4 + c] = DESC(o[r], CB - P1);
+	}
+	for (int r = 0; r < 8; r++) {
+		const s32 *in = ws + r * 4;
+		s16 *out = blk + r * 8;
+		if (!(in[1] | in[2] | in[3])) {
+			s16 v = (s16)DESC(in[0], P1 + 3);
+			u32 vv = (u16)v | (u32)(u16)v << 16, *w = (u32 *)out;
+			w[0] = w[1] = w[2] = w[3] = vv;
+			continue;
+		}
+		idct_1d(o, in[0], in[1], in[2], in[3], 0, 0, 0, 0, CB);
+		for (int c = 0; c < 8; c++) out[c] = (s16)DESC(o[c], CB + P1 + 3);
+	}
+}
+
+// Modo rápido: IDCT de 4 puntos con los coeficientes 0-3, que da el valor en el centro de cada pareja de píxeles
+// (la de 8 puntos en n = 2m + 1/2 es exactamente la de 4 puntos, sin las frecuencias altas). Salida 4x4 en blk[0..15].
+enum { Q13 = 10703, Q05 = 4433 };   // √2·cos(π/8) y √2·cos(3π/8) en 13 bits
+static inline __attribute__((always_inline)) void idct4_1d(s32 *o, s32 x0, s32 x1, s32 x2, s32 x3)
+{
+	s32 e0 = (x0 + x2) << CB, e1 = (x0 - x2) << CB;
+	s32 o0 = x1 * Q13 + x3 * Q05, o1 = x1 * Q05 - x3 * Q13;
+	o[0] = e0 + o0; o[3] = e0 - o0;
+	o[1] = e1 + o1; o[2] = e1 - o1;
+}
+
+static void idct_quarter(s16 *blk)
+{
+	s32 ws[16], o[4];
+	for (int c = 0; c < 4; c++) {
+		const s16 *in = blk + c;
+		if (!(in[8] | in[16] | in[24])) {
+			s32 dc = in[0] << P1;
+			ws[c] = ws[4 + c] = ws[8 + c] = ws[12 + c] = dc;
+			continue;
+		}
+		idct4_1d(o, in[0], in[8], in[16], in[24]);
+		for (int r = 0; r < 4; r++) ws[r * 4 + c] = DESC(o[r], CB - P1);
+	}
+	for (int r = 0; r < 4; r++) {
+		const s32 *in = ws + r * 4;
+		s16 *out = blk + r * 4;
+		if (!(in[1] | in[2] | in[3])) {
+			s16 v = (s16)DESC(in[0], P1 + 3);
+			out[0] = out[1] = out[2] = out[3] = v;
+			continue;
+		}
+		idct4_1d(o, in[0], in[1], in[2], in[3]);
+		for (int c = 0; c < 4; c++) out[c] = (s16)DESC(o[c], CB + P1 + 3);
+	}
+}
+
 // ¿La tabla subida es la estándar de Sony? (32768 * C(u) * cos((2x+1)uπ/16), redondeada)
 static void check_scale(void)
 {
@@ -165,34 +237,84 @@ static void idct(s16 *blk)
 	}
 }
 
-// IDCT con atajo: un bloque con solo la continua es un relleno (la misma cuenta que idct_fast)
-static void idct_dc(s16 *blk, int dc_only)
+// Bloque ya leído -> píxeles: relleno si solo hay continua, IDCT recortada si todo cae en el 4x4, o la entera
+static void idct_blk(s16 *blk, int ok, int bound)
 {
-	if (dc_only && scale_is_standard) {
-		s16 v = (s16)DESC(blk[0] << P1, P1 + 3);
-		u32 vv = (u16)v | (u32)(u16)v << 16, *w = (u32 *)blk;
-		for (int i = 0; i < 32; i++) w[i] = vv;
-		return;
+	if (scale_is_standard) {
+		if (ok == 2) {
+			s16 v = (s16)DESC(blk[0] << P1, P1 + 3);
+			u32 vv = (u16)v | (u32)(u16)v << 16, *w = (u32 *)blk;
+			for (int i = 0; i < 32; i++) w[i] = vv;
+			return;
+		}
+		if (bound <= 4) { idct_fast4(blk); return; }
 	}
 	idct(blk);
 }
 
-static inline int clamp8(int v) { return v < -128 ? -128 : v > 127 ? 127 : v; }
-
-// Un macrobloque de 16x16 en color: escribe 24 o 15 bits por píxel
-static void yuv_block(const s16 *cr, const s16 *cb, const s16 *y, int xx, int yy, u8 *rgb)
+// Modo rápido: 4x4 muestras por bloque en blk[0..15]
+static void idct_blk_quarter(s16 *blk, int ok)
 {
-	// cada muestra de color sirve a 2x2 píxeles: sus términos se calculan una vez (mismas fórmulas que antes)
-	for (int cy = 0; cy < 4; cy++)
-		for (int cx = 0; cx < 4; cx++) {
-			int ci = cx + (xx >> 1) + (cy + (yy >> 1)) * 8, Rc = cr[ci], Bc = cb[ci];
+	if (scale_is_standard) {
+		if (ok == 2) {
+			s16 v = (s16)DESC(blk[0] << P1, P1 + 3);
+			for (int i = 0; i < 16; i++) blk[i] = v;
+		} else idct_quarter(blk);
+		return;
+	}
+	idct(blk);   // tabla rara: la entera y la media de cada 2x2
+	for (int r = 0; r < 4; r++)
+		for (int c = 0; c < 4; c++) {
+			const s16 *p = blk + r * 16 + c * 2;
+			blk[r * 4 + c] = (s16)((p[0] + p[1] + p[8] + p[9] + 2) >> 2);
+		}
+}
+
+static inline int clamp8(int v) { return v < -128 ? -128 : v > 127 ? 127 : v; }
+static inline __attribute__((always_inline)) u32 cl(int v, u32 x) { if ((u32)(v + 128) > 255) v = v < 0 ? -128 : 127; return ((u32)v & 0xff) ^ x; }
+
+int mdec_fast;   // 1 = vídeos a un cuarto de resolución (cada muestra rellena 2x2 píxeles): mucho menos trabajo
+
+// Un píxel (o un 2x2 en el modo rápido) en la salida del macrobloque
+#define PUT24(o, Y) do { (o)[0] = (u8)cl((Y) + R, x); (o)[1] = (u8)cl((Y) + G, x); (o)[2] = (u8)cl((Y) + B, x); } while (0)
+#define PIX15(Y) (u16)((cl((Y) + R, x) >> 3) | ((cl((Y) + G, x) >> 3) << 5) | ((cl((Y) + B, x) >> 3) << 10) | hb)
+
+// Macrobloque de 16x16 en color, ya con sus 6 bloques en píxeles, directo a la salida (24 o 15 bits)
+static void mb_out(s16 (*blk)[64], u8 *dst, int depth, u32 x, u32 hb)
+{
+	for (int cy = 0; cy < 8; cy++)
+		for (int cx = 0; cx < 8; cx++) {
+			int ci = cy * 8 + cx, Rc = blk[0][ci], Bc = blk[1][ci];
 			int G = (-88 * Bc - 183 * Rc + 128) >> 8, R = (359 * Rc + 128) >> 8, B = (454 * Bc + 128) >> 8;
-			for (int d = 0; d < 4; d++) {
-				int px = cx * 2 + (d & 1), py = cy * 2 + (d >> 1), Y = y[px + py * 8];
-				u8 *o = rgb + ((px + xx) + (py + yy) * 16) * 3;
-				o[0] = (u8)clamp8(Y + R);
-				o[1] = (u8)clamp8(Y + G);
-				o[2] = (u8)clamp8(Y + B);
+			int px = cx * 2, py = cy * 2;
+			const s16 *y = blk[2 + (py >> 3) * 2 + (px >> 3)] + (py & 7) * 8 + (px & 7);
+			if (depth == 2) {
+				u8 *o = dst + (py * 16 + px) * 3;
+				PUT24(o, y[0]); PUT24(o + 3, y[1]); PUT24(o + 48, y[8]); PUT24(o + 51, y[9]);
+			} else {
+				u16 *o = (u16 *)(dst + (py * 16 + px) * 2);
+				o[0] = PIX15(y[0]); o[1] = PIX15(y[1]); o[16] = PIX15(y[8]); o[17] = PIX15(y[9]);
+			}
+		}
+}
+
+static void mb_out_quarter(s16 (*blk)[64], u8 *dst, int depth, u32 x, u32 hb)
+{
+	for (int qy = 0; qy < 8; qy++)
+		for (int qx = 0; qx < 8; qx++) {
+			int ci = (qy >> 1) * 4 + (qx >> 1), Rc = blk[0][ci], Bc = blk[1][ci];
+			int G = (-88 * Bc - 183 * Rc + 128) >> 8, R = (359 * Rc + 128) >> 8, B = (454 * Bc + 128) >> 8;
+			int Y = blk[2 + (qy >> 2) * 2 + (qx >> 2)][(qy & 3) * 4 + (qx & 3)];
+			int px = qx * 2, py = qy * 2;
+			if (depth == 2) {
+				u8 *o = dst + (py * 16 + px) * 3;
+				u8 r = (u8)cl(Y + R, x), g = (u8)cl(Y + G, x), b = (u8)cl(Y + B, x);
+				o[0] = o[3] = o[48] = o[51] = r;
+				o[1] = o[4] = o[49] = o[52] = g;
+				o[2] = o[5] = o[50] = o[53] = b;
+			} else {
+				u16 *o = (u16 *)(dst + (py * 16 + px) * 2), c = PIX15(Y);
+				o[0] = o[1] = o[16] = o[17] = c;
 			}
 		}
 }
@@ -201,39 +323,29 @@ static void decode(void)
 {
 	int depth = (cmd >> 27) & 3, sign = (cmd >> 26) & 1, b15 = (cmd >> 25) & 1;
 	const u16 *p = in_buf, *end = in_buf + in_len;
-	s16 blk[6][64];
-	u8 rgb[16 * 16 * 3];
+	s16 blk[6][64] __attribute__((aligned(4)));
+	u32 x = sign ? 0 : 0x80;
 
 	out_len = out_pos = 0;
 	if (depth >= 2) {   // color: Cr, Cb, Y1..Y4
+		u32 mb = depth == 2 ? 768 : 512;
+		int fast = mdec_fast;
 		for (;;) {
-			int ok = 1;
+			int ok = 1, bound;
 			for (int b = 0; b < 6 && ok; b++) {
-				ok = rl_decode(blk[b], &p, end, b < 2 ? qt_c : qt_y);
-				if (ok) idct_dc(blk[b], ok == 2);
+				ok = rl_decode(blk[b], &p, end, b < 2 ? qt_c : qt_y, &bound);
+				if (ok) { if (fast) idct_blk_quarter(blk[b], ok); else idct_blk(blk[b], ok, bound); }
 			}
 			if (!ok) break;
 			STAT_ADD(mdec_blocks, 1);
-			yuv_block(blk[0], blk[1], blk[2], 0, 0, rgb);
-			yuv_block(blk[0], blk[1], blk[3], 8, 0, rgb);
-			yuv_block(blk[0], blk[1], blk[4], 0, 8, rgb);
-			yuv_block(blk[0], blk[1], blk[5], 8, 8, rgb);
-			if (!sign) for (int i = 0; i < 768; i++) rgb[i] ^= 0x80;
-			if (depth == 2) {
-				if (!out_reserve(768)) break;
-				memcpy(out_buf + out_len, rgb, 768);
-				out_len += 768;
-			} else {
-				if (!out_reserve(512)) break;
-				for (int i = 0; i < 256; i++) {
-					u16 c = (u16)((rgb[i * 3] >> 3) | ((rgb[i * 3 + 1] >> 3) << 5) | ((rgb[i * 3 + 2] >> 3) << 10) | (b15 << 15));
-					out_buf[out_len++] = (u8)c;
-					out_buf[out_len++] = (u8)(c >> 8);
-				}
-			}
+			if (!out_reserve(mb)) break;
+			if (fast) mb_out_quarter(blk, out_buf + out_len, depth, x, (u32)b15 << 15);
+			else mb_out(blk, out_buf + out_len, depth, x, (u32)b15 << 15);
+			out_len += mb;
 		}
 	} else {   // monocromo: solo Y
-		while (rl_decode(blk[0], &p, end, qt_y)) {
+		int bound;
+		while (rl_decode(blk[0], &p, end, qt_y, &bound)) {
 			idct(blk[0]);
 			u8 yv[64];
 			for (int i = 0; i < 64; i++) yv[i] = (u8)(clamp8(blk[0][i]) ^ (sign ? 0 : 0x80));

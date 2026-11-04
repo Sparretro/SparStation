@@ -83,6 +83,11 @@ extern PsxCore psx_core;
 #define cpu (psx_core.cpu_)
 extern u32 psx_hook_pc;   // si no es 0, psx_hook() se llama cuando el PC llega aquí
 void psx_hook(void);
+// Rutinas de los juegos hechas en nativo (hle.c): DecDCTvlc de los vídeos
+extern int psx_hle_off;
+int hle_match(u32 pc, u32 (*fetch)(u32));
+u32 hle_call(u32 pc);
+int hle_interp(void);
 void cpu_reset(void);
 void cpu_run(u32 until);
 
@@ -231,6 +236,7 @@ u32 mdec_read_data(void);
 u32 mdec_read_words(u32 *dst, u32 n);   // salida de golpe (palabras enteras); devuelve cuántas
 u32 mdec_status(void);
 int mdec_out_available(void);
+extern int mdec_fast;   // 1 = vídeos a un cuarto de resolución (más rápido, algo más borroso)
 void dma_mdec_kick(void);   // el MDEC tiene datos nuevos: reanuda el DMA de salida
 
 // ---- mandos (SIO0) ----

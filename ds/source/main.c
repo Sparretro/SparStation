@@ -225,6 +225,7 @@ static int opt_quality, opt_skip, opt_cpu;   // calidad 0-3, frames saltados 0-3
 static int opt_hw = 1;                       // GPU: 1 = motor 3D de la DS (gx.c), 0 = por software
 static int opt_snd = 1;                      // sonido (voces de la SPU y audio XA del CD)
 static int opt_nwram = 1;                    // código traducido en la NWRAM de la DSi (si la hay, ver nwram_init)
+static int opt_video = 1;                    // vídeos: 1 = rápidos (MDEC a un cuarto de resolución), 0 = nítidos
 static int cfg_version;                      // versión que escribió el .cfg (ver load_cfg)
 static const char *const quality_name[4] = { "normal", "rapida", "muy rapida", "baja res" };
 static const int cpu_pct[6] = { 0, 100, 85, 70, 50, 35 };
@@ -269,10 +270,12 @@ static int cfg_read(const char *path)
 	if (fscanf(f, " version=%d", &cfg_version) != 1 || cfg_version < 21) opt_skip = 0;
 	if (fscanf(f, " cpu_min=%d", &opt_cpu_min) != 1) opt_cpu_min = CPU_MIN_DEFAULT;   // desde la v26
 	if (fscanf(f, " objetivo=%d", &opt_target) != 1) opt_target = AUTO_TARGET;   // desde la v29
+	if (fscanf(f, " videos=%d", &opt_video) != 1) opt_video = 1;   // desde la v42
 	if (opt_target < 50 || opt_target > 100) opt_target = AUTO_TARGET;
 	if (opt_cpu_min < 10 || opt_cpu_min > 100) opt_cpu_min = CPU_MIN_DEFAULT;
 	opt_hw = opt_hw != 0;
 	opt_snd = opt_snd != 0;
+	opt_video = opt_video != 0;
 	opt_nwram = opt_nwram != 0;
 	fclose(f);
 	if (opt_quality < 0 || opt_quality > 3) opt_quality = 0;
@@ -294,8 +297,8 @@ static void cfg_write(const char *path)
 {
 	FILE *f = fopen(path, "w");
 	if (!f) return;
-	fprintf(f, "calidad=%d saltar=%d cpu=%d\ngpu3d=%d\nsonido=%d\nnwram=%d\nversion=29\ncpu_min=%d\nobjetivo=%d\n", opt_quality, opt_skip,
-	        opt_cpu, opt_hw, opt_snd, opt_nwram, opt_cpu_min, opt_target);
+	fprintf(f, "calidad=%d saltar=%d cpu=%d\ngpu3d=%d\nsonido=%d\nnwram=%d\nversion=29\ncpu_min=%d\nobjetivo=%d\nvideos=%d\n", opt_quality, opt_skip,
+	        opt_cpu, opt_hw, opt_snd, opt_nwram, opt_cpu_min, opt_target, opt_video);
 	fclose(f);
 }
 
@@ -451,6 +454,7 @@ static void apply_cfg(void)
 	gpu_rows_for(opt_quality > 2 ? 2 : opt_quality, 192);
 	gpu_half_x = opt_quality == 3;   // baja res: además, la mitad de los píxeles de cada línea
 	gpu_frameskip = (u8)opt_skip;
+	mdec_fast = opt_video;   // vídeos rápidos: el MDEC a un cuarto de resolución
 	auto_scale = AUTO_MIN;
 	auto_max = 256u * 100 / (u32)opt_cpu_min;
 	dyn_set_cpu_scale(opt_cpu ? 256u * 100 / (u32)cpu_pct[opt_cpu] : auto_scale);
@@ -503,13 +507,13 @@ static int pick_game(char *out, size_t outlen)
 	if (!n) return 0;
 	// Cada juego recuerda sus ajustes (su .cfg al lado): al marcarlo se cargan; si no tiene, los generales.
 	// Cambiar algo con un juego marcado lo apunta para ese juego.
-	int gq = opt_quality, gs = opt_skip, gc = opt_cpu, ghw = opt_hw, gsnd = opt_snd, gnw = opt_nwram, gmin = opt_cpu_min, gtg = opt_target, cur = -1, own = 0;
+	int gq = opt_quality, gs = opt_skip, gc = opt_cpu, ghw = opt_hw, gsnd = opt_snd, gnw = opt_nwram, gmin = opt_cpu_min, gtg = opt_target, gvid = opt_video, cur = -1, own = 0;
 	char gpath[300];
 	for (;;) {
 		int keys;
 		if (sel != cur) {
 			cur = sel;
-			opt_quality = gq; opt_skip = gs; opt_cpu = gc; opt_hw = ghw; opt_snd = gsnd; opt_nwram = gnw; opt_cpu_min = gmin; opt_target = gtg;
+			opt_quality = gq; opt_skip = gs; opt_cpu = gc; opt_hw = ghw; opt_snd = gsnd; opt_nwram = gnw; opt_cpu_min = gmin; opt_target = gtg; opt_video = gvid;
 			game_cfg_path(gpath, sizeof gpath, names[sel]);
 			own = cfg_read(gpath);
 		}
@@ -521,13 +525,13 @@ static int pick_game(char *out, size_t outlen)
 			if (n > 11) printf("\x1b[37m  (%d de %d)\x1b[37;1m\n", sel + 1, n);
 		}
 		printf("\x1b[15;0H\x1b[36;1mAjustes %s\x1b[37;1m\n", own ? "de este juego" : "generales");
-		printf("L/R    calidad: %s\n", quality_name[opt_quality]);
+		printf("L/R    calidad: %s (GPU sw)\n", quality_name[opt_quality]);
 		printf("SELECT saltar frames: %d\n", opt_skip);
 		printf("Y      CPU PS1: %s\n", cpu_name());
 		printf("X      GPU: %s\n", opt_hw ? "3D de la DS (rapida)" : "software (exacta)");
 		printf("B      sonido: %s\n", opt_snd ? "si" : "no");
 		printf("START  codigo: %s\n", !nwram_ok ? "RAM (sin NWRAM)" : opt_nwram ? "NWRAM (rapido)" : "RAM principal");
-		printf("\x1b[37m(calidad: solo GPU software)\x1b[37;1m\n");
+		printf("</>    videos: %s\n", opt_video ? "rapidos" : "nitidos");
 		printf("A: jugar");
 		fflush(stdout);
 		do { swiWaitForVBlank(); scanKeys(); keys = keysDown(); } while (!keys);
@@ -540,7 +544,8 @@ static int pick_game(char *out, size_t outlen)
 		if (keys & KEY_X) opt_hw ^= 1;
 		if (keys & KEY_B) opt_snd ^= 1;
 		if ((keys & KEY_START) && nwram_ok) opt_nwram ^= 1;
-		if (keys & (KEY_R | KEY_L | KEY_SELECT | KEY_Y | KEY_X | KEY_B | KEY_START)) { cfg_write(gpath); own = 1; }
+		if (keys & (KEY_LEFT | KEY_RIGHT)) opt_video ^= 1;
+		if (keys & (KEY_R | KEY_L | KEY_SELECT | KEY_Y | KEY_X | KEY_B | KEY_START | KEY_LEFT | KEY_RIGHT)) { cfg_write(gpath); own = 1; }
 		if (keys & KEY_A) break;
 	}
 	save_cfg();   // los del juego elegido pasan a ser los generales (los que ven los juegos sin ajustes propios)
@@ -1030,7 +1035,7 @@ int main(void)
 	fb[1] = fb[0] + 256 * 256;   // banco B, base de mapa 8
 	dmaFillHalfWords(0x8000, fb[0], 2 * 256 * 256 * 2);
 
-	printf("SparStation v41 - PS1 en DSi\nby Spar Retro\n\n");
+	printf("SparStation v42 - PS1 en DSi\nby Spar Retro\n\n");
 #ifdef PSX_SELFTEST
 	if (!nitroFSInit(NULL) || !pak_init() || !load_bios()) {
 		printf("Pruebas: falta nitro:/bios.bin\no el Expansion Pak.\n");
@@ -1095,6 +1100,9 @@ int main(void)
 				fclose(sf);
 			}
 			load_script("nitro:/press.txt");
+#ifdef BENCH_MDEC_FAST
+			mdec_fast = 1;
+#endif
 #ifdef BENCH_QUALITY
 			opt_quality = BENCH_QUALITY;   // make SELFTEST=1 EXTRA=-DBENCH_QUALITY=n: medir con esa calidad
 #ifdef BENCH_HW

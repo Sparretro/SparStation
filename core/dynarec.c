@@ -165,7 +165,7 @@ static const void *const tramp_fn[] = {
 	(const void *)gte_write, (const void *)h_div, (const void *)h_divu, (const void *)dyn_smc,
 	(const void *)h_r32, (const void *)h_r16s, (const void *)h_r16u, (const void *)h_r8s, (const void *)h_r8u,
 	(const void *)h_w32, (const void *)h_w16, (const void *)h_w8, (const void *)gpu_stat, (const void *)gpu_write_gp0,
-	(const void *)dyn_grp_fail,
+	(const void *)dyn_grp_fail, (const void *)hle_call,
 };
 #define NTRAMP (int)(sizeof tramp_fn / sizeof tramp_fn[0])
 static u32 *tramp_at[NTRAMP];
@@ -2251,6 +2251,7 @@ static void branch_operands(u32 op, int *a, int *b, int tmp1, int tmp2)
 
 // Traduce el bloque que empieza en pc; NULL si no se puede (se interpretará)
 static block_fn compile_block(u32 pc, block_fn *s);
+static u32 fetch_op_fn(u32 pc) { return fetch_op(pc); }
 static block_fn compile(u32 pc, block_fn *s)
 {
 	block_fn f;
@@ -2268,6 +2269,20 @@ static block_fn compile_block(u32 pc, block_fn *s)
 	if (emit_ptr + MAX_BLOCK * 48 + 512 > hot_end || cold_ptr + MAX_BLOCK * 16 + 256 > code_end) flush_all();
 	start = emit_ptr;
 	cold_start = cold_ptr;
+	{ int hn = hle_match(pc, fetch_op_fn); if (hn) {   // rutina hecha en nativo (hle.c): un bloque que solo la llama y vuelve a ra
+		emit(pc);
+		entry = emit_ptr;
+		a_movi(R0, pc);
+		call(hle_call);   // r0 = el PC siguiente (ya en cpu.pc)
+		emit_cycles(1);
+		a_b(C_MI, 0, stub_dispatch);
+		a_b(C_AL, 0, stub_exit);
+		mark_pages(pc, pc + 4 * (u32)(hn - 1));
+		sync_code(start, (u32)((u8 *)emit_ptr - (u8 *)start));
+		if (blk_n < blk_max) { blk_arm[blk_n] = (u32)(uintptr_t)start; blk_mips[blk_n++] = pc; }
+		*s = entry;
+		return entry;
+	} }
 #ifdef PSX_SMCLOG
 	{ static u32 lf; if (lf != psx_frame_no && dyn_cmp_log.n < 8192) { lf = psx_frame_no; dyn_cmp_log.e[dyn_cmp_log.n++] = 0xff000000 | lf; } }
 #ifdef PSX_CMPPC

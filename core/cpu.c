@@ -393,6 +393,9 @@ void cpu_run(u32 until)
 			continue;
 		}
 
+		// DecDCTvlc en nativo (hle.c; deja hecha la carga pendiente del delay slot del jal)
+		if (!cpu.branching && hle_interp()) { cpu.next_pc = cpu.pc + 4; cpu.r[0] = 0; continue; }
+
 		if (cpu.pc & 3) {
 			cpu.cop0[8] = cpu.pc;
 			exception(EX_ADEL);
