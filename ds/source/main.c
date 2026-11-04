@@ -391,7 +391,7 @@ static int nwram_init(void)
 
 // Tarjeta de memoria: una por juego, junto al .cue (Silent Hill.cue -> Silent Hill.mcr). Se guarda en la SD
 // cuando el juego lleva un segundo sin escribir en ella (una partida son decenas de sectores seguidos).
-static char card_path[256];
+static char card_path[256], game_base[256];   // game_base: el .cue sin extensión (estado, ajustes y parches van por disco)
 static u32 card_saved_writes, card_quiet, card_wait;
 
 // Parches GameShark de un archivo de texto (Juego.cht): devuelve cuántos códigos se leyeron
@@ -412,7 +412,13 @@ static void card_open(const char *game)
 {
 	FILE *f;
 	const char *dot = strrchr(game, '.');
-	snprintf(card_path, sizeof card_path, "%.*s.mcr", dot ? (int)(dot - game) : (int)strlen(game), game);
+	snprintf(game_base, sizeof game_base, "%.*s", dot ? (int)(dot - game) : (int)strlen(game), game);
+	{   // juegos de varios discos: «Juego (Disc 2)» usa la tarjeta de «Juego», la misma que el disco 1 (se guarda
+		// al final de uno y se carga en el otro, como en la consola)
+		char *d = strstr(game_base, " (Disc "), *e = d ? strchr(d + 7, ')') : NULL;
+		if (d && e && e > d + 7) snprintf(card_path, sizeof card_path, "%.*s%s.mcr", (int)(d - game_base), game_base, e + 1);
+		else snprintf(card_path, sizeof card_path, "%s.mcr", game_base);
+	}
 	psx_memcard = malloc(128 * 1024);
 	if (!psx_memcard) return;
 	f = fopen(card_path, "rb");
@@ -1024,7 +1030,7 @@ int main(void)
 	fb[1] = fb[0] + 256 * 256;   // banco B, base de mapa 8
 	dmaFillHalfWords(0x8000, fb[0], 2 * 256 * 256 * 2);
 
-	printf("SparStation v40 - PS1 en DSi\nby Spar Retro\n\n");
+	printf("SparStation v41 - PS1 en DSi\nby Spar Retro\n\n");
 #ifdef PSX_SELFTEST
 	if (!nitroFSInit(NULL) || !pak_init() || !load_bios()) {
 		printf("Pruebas: falta nitro:/bios.bin\no el Expansion Pak.\n");
@@ -1126,11 +1132,11 @@ int main(void)
 	}
 	card_open(game);
 	snd_enable(opt_snd);
-	snprintf(state_path, sizeof state_path, "%.*s.sst", (int)(strrchr(card_path, '.') - card_path), card_path);
-	snprintf(game_cfg, sizeof game_cfg, "%.*s.cfg", (int)(strrchr(card_path, '.') - card_path), card_path);
+	snprintf(state_path, sizeof state_path, "%s.sst", game_base);
+	snprintf(game_cfg, sizeof game_cfg, "%s.cfg", game_base);
 	{   // parches GameShark del juego (Juego.cht junto al .cue), si los hay
 		char cht[256];
-		snprintf(cht, sizeof cht, "%.*s.cht", (int)(strrchr(card_path, '.') - card_path), card_path);
+		snprintf(cht, sizeof cht, "%s.cht", game_base);
 		load_cht(cht);
 	}
 	psx_fastboot = 1;   // sin la animación de la BIOS (unos 25 s en la DSi)
