@@ -969,6 +969,7 @@ static void hw_send(const Vtx *v, int n, int tex, int gour, int semi_on, int raw
 	p.gouraud = (u8)(gour != 0);
 	p.semi = semi_on ? (u8)(g.semi + 1) : 0;
 	p.mask = (u8)(g.check_mask && g.set_mask);
+	p.setm = (u8)g.set_mask;
 	p.tpx = (s16)t_px; p.tpy = (s16)t_py; p.cx = (s16)t_cx; p.cy = (s16)t_cy;
 	p.ox = (s16)hw_ox; p.oy = (s16)hw_oy;
 	gpu_hw->poly(hv, n, &p);
@@ -1004,6 +1005,7 @@ static int hw_poly_packet(const u32 *w)
 		r.tex = tex ? (u8)(t_depth > 2 ? 3 : t_depth + 1) : 0;
 		r.semi = semi_on ? (u8)(g.semi + 1) : 0;
 		r.mask = (u8)(g.check_mask && g.set_mask);
+		r.setm = (u8)g.set_mask;
 		r.tpx = (s16)t_px; r.tpy = (s16)t_py; r.cx = (s16)t_cx; r.cy = (s16)t_cy;
 		gpu_hw->poly_raw(w, &r);
 		return 1;
@@ -1033,6 +1035,7 @@ static int hw_poly_packet(const u32 *w)
 	p.gouraud = (u8)(gour != 0);
 	p.semi = semi_on ? (u8)(g.semi + 1) : 0;
 	p.mask = (u8)(g.check_mask && g.set_mask);
+	p.setm = (u8)g.set_mask;
 	p.tpx = (s16)t_px; p.tpy = (s16)t_py; p.cx = (s16)t_cx; p.cy = (s16)t_cy;
 	p.ox = (s16)hw_ox; p.oy = (s16)hw_oy;
 	gpu_hw->poly(hv, nv, &p);
@@ -1118,8 +1121,12 @@ static void polygon(void)
 		}
 	}
 #endif
-	if (hw_screen()) { hw_send(v, nv, tex, gour, semi_on, raw); return; }
-	hw_dirty_area();
+	if (hw_screen()) {
+		hw_send(v, nv, tex, gour, semi_on, raw);
+#ifndef GX_DUAL
+		return;   // con GX_DUAL (pruebas) también por software, para comparar
+#endif
+	} else hw_dirty_area();
 
 	{
 		Vtx a = v[0], b = v[1], c = v[2];
@@ -1187,9 +1194,10 @@ static void rectangle(void)
 			q[k].r = col & 0xff; q[k].g = (col >> 8) & 0xff; q[k].b = (col >> 16) & 0xff;
 		}
 		hw_send(q, 4, tex, 0, semi_on, raw);
+#ifndef GX_DUAL
 		return;
-	}
-	hw_dirty_area();
+#endif
+	} else hw_dirty_area();
 
 	// columnas dentro del área de dibujo
 	lo = g.da_x1 - x0; if (lo < 0) lo = 0;
@@ -1324,7 +1332,12 @@ static void fill(void)
 		if (scr) {
 			pend.on = 1; pend.x = x0; pend.y = y0; pend.w = w; pend.h = h; pend.c = c;
 			gpu_hw->clear(c);
+#ifndef GX_DUAL
 			return;
+#else
+			fill_rect(x0, y0, w, h, c);   // pruebas: la copia por software también se borra
+			return;
+#endif
 		}
 	}
 	fill_rect(x0, y0, w, h, c);
@@ -1421,6 +1434,23 @@ static inline int cmd_len(u32 cmd) { return cmd_len_tab[cmd & 255]; }
 static void execute_cmd(void)
 {
 	u32 cmd = fifo[0] >> 24, v = fifo[0];
+#ifdef PSX_POLYLOG
+	{   // banco del PC: cada comando de dibujo del frame elegido (POLYLOG=frame), con el modo de mezcla de la página
+		extern int polylog_on;
+		extern int printf(const char *, ...);
+		if (polylog_on && cmd >= 0x20 && cmd < 0x80) {
+			printf("GP0 %02x semi=%u tp=%u,%u dep=%u m=%d%d n=%d:", (unsigned)cmd, (unsigned)g.semi, (unsigned)g.tp_x, (unsigned)g.tp_y, (unsigned)g.depth, g.set_mask, g.check_mask, cmd_len(cmd));
+			for (int i = 0; i < cmd_len(cmd) && i < 16; i++) printf(" %08x", (unsigned)fifo[i]);
+			printf("\n");
+			if (cmd & 4) {   // con textura: su paleta (16 colores) y cuáles valen 0 (transparentes en la PS1)
+				u32 cl = fifo[2] >> 16, cx = (cl & 0x3f) * 16, cy = (cl >> 6) & 511;
+				printf("   CLUT %u,%u:", (unsigned)cx, (unsigned)cy);
+				for (int i = 0; i < 16; i++) printf(" %04x", (unsigned)psx_vram[cy * 1024 + cx + i]);
+				printf("\n");
+			}
+		}
+	}
+#endif
 #ifdef PSX_TRACE_IO
 	{ extern u32 gp0_hist[256]; gp0_hist[cmd]++; }
 #endif
@@ -1513,7 +1543,7 @@ PSX_ITCM void gpu_write_gp0_n(const u32 *w, u32 n)   // en la ITCM (2,5% en la D
 			continue;
 		}
 		if (mode != M_CMD || fifo_n || (need = (u32)cmd_len(w[0] >> 24)) > n) { gpu_write_gp0(*w++); n--; continue; }
-#ifndef PSX_GPUSTAT
+#if !defined(PSX_GPUSTAT) && !defined(GX_DUAL)
 		if (gpu_hw && (w[0] >> 29) == 1) {   // polígono (20h-3Fh) con dibujo por hardware: directo
 			u32 cmd = w[0] >> 24;
 			STAT_ADD(gpu_cmds, 1);

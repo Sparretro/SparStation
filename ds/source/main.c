@@ -270,7 +270,7 @@ static int cfg_read(const char *path)
 	if (fscanf(f, " nwram=%d", &opt_nwram) != 1) opt_nwram = 1;
 	// Antes de la v21 se recomendaba saltar 1: con el 3D de la DS la GPU cuesta poco y saltar solo hacía ver
 	// la mitad de las imágenes (Tomb Raider: 20 hechas, 10 vistas). Se vuelve a 0 una vez.
-	if (fscanf(f, " version=%d", &cfg_version) != 1 || cfg_version < 21) opt_skip = 0;
+	if (fscanf(f, " version=%d", &cfg_version) != 1 || cfg_version < 44) opt_skip = 0;   // v44: saltar imágenes con el 3D hacía parpadear cosas; se vuelve a 0 una vez
 	if (fscanf(f, " cpu_min=%d", &opt_cpu_min) != 1) opt_cpu_min = CPU_MIN_DEFAULT;   // desde la v26
 	if (fscanf(f, " objetivo=%d", &opt_target) != 1) opt_target = AUTO_TARGET;   // desde la v29
 	if (fscanf(f, " videos=%d", &opt_video) != 1) opt_video = 1;   // desde la v42
@@ -300,7 +300,7 @@ static void cfg_write(const char *path)
 {
 	FILE *f = fopen(path, "w");
 	if (!f) return;
-	fprintf(f, "calidad=%d saltar=%d cpu=%d\ngpu3d=%d\nsonido=%d\nnwram=%d\nversion=29\ncpu_min=%d\nobjetivo=%d\nvideos=%d\n", opt_quality, opt_skip,
+	fprintf(f, "calidad=%d saltar=%d cpu=%d\ngpu3d=%d\nsonido=%d\nnwram=%d\nversion=44\ncpu_min=%d\nobjetivo=%d\nvideos=%d\n", opt_quality, opt_skip,
 	        opt_cpu, opt_hw, opt_snd, opt_nwram, opt_cpu_min, opt_target, opt_video);
 	fclose(f);
 }
@@ -818,6 +818,37 @@ static void present(void)
 	if (!single_fb) back ^= 1;
 }
 
+#ifdef GX_DUAL
+// Pruebas: abajo, la misma imagen dibujada por software (la VRAM de la PS1) en 8 bits (3-3-2). Lo que sea distinto
+// del 3D de arriba en la misma captura es un fallo del 3D (dsbench guarda las dos pantallas).
+static u8 *dual_fb;
+struct { char tag[8]; u16 px[256 * 192]; } __attribute__((aligned(4), used)) dual_img = { "SPDUALIM" };   // la misma imagen en 15 bits (DSB_MAGIC=SPDUALIM:98304:archivo)
+static void dual_init(void)
+{
+	int b;
+	videoSetModeSub(MODE_5_2D);
+	vramSetBankH(VRAM_H_SUB_BG);
+	vramSetBankI(VRAM_I_SUB_BG_0x06208000);
+	b = bgInitSub(3, BgType_Bmp8, BgSize_B8_256x256, 0, 0);
+	for (int i = 0; i < 256; i++) BG_PALETTE_SUB[i] = RGB15(((i >> 5) & 7) * 31 / 7, ((i >> 2) & 7) * 31 / 7, (i & 3) * 31 / 3);
+	dual_fb = (u8 *)bgGetGfxPtr(b);
+}
+static inline u32 c8(u16 c) { return (((c & 31) >> 2) << 5) | ((((c >> 5) & 31) >> 2) << 2) | (((c >> 10) & 31) >> 3); }
+static void dual_draw(void)
+{
+	int w = gpu_disp.width, h = gpu_disp.height;
+	if (!dual_fb || gpu_disp.color24) return;
+	REG_DISPCNT &= ~DISPLAY_BG3_ACTIVE;   // arriba solo el 3D
+	for (int y = 0; y < 192; y++) {
+		const u16 *src = &psx_vram[((gpu_disp.disp_y + y * h / 192) & 511) * 1024];
+		u16 *d = (u16 *)(dual_fb + y * 256);
+		for (int x = 0; x < 256; x += 2)
+			d[x >> 1] = (u16)(c8(src[(gpu_disp.disp_x + x * w / 256) & 1023]) | c8(src[(gpu_disp.disp_x + (x + 1) * w / 256) & 1023]) << 8);
+		for (int x = 0; x < 256; x++) dual_img.px[y * 256 + x] = src[(gpu_disp.disp_x + x * w / 256) & 1023];
+	}
+}
+#endif
+
 // Reloj de 32 bits a 33,51 MHz con los temporizadores 0 y 1 encadenados (calico no los usa: sus ticks van
 // en el 2 y el 3). cpuGetTiming pasa por los ticks de calico y cuesta mucho más: se llama miles de veces.
 static void fast_timer_start(void)
@@ -990,7 +1021,12 @@ static void run_loop(const char *title, int use_log)
 		else snprintf(nw, sizeof nw, "RAM (sin NWRAM: %s)", nwram_why[0] ? nwram_why : "?");
 		snprintf(info, sizeof info, "%s, salto %d, CPU %s, codigo %s%s", quality_name[opt_quality], opt_skip, cpu_name(), nw,
 		         cheat_count() ? ", parches" : "");
+#ifndef GX_DUAL
 		hud_start(title, use_log, info);
+#else
+		dual_init();
+		title = NULL;   // sin HUD: abajo va la imagen por software
+#endif
 	}
 #ifdef STACK_PROBE
 	stack_paint();   // desde aquí: solo lo que gasta la emulación
@@ -1011,10 +1047,15 @@ static void run_loop(const char *title, int use_log)
 		snd_xa_pump();
 		gx_dbg.stage = 2;
 		{ PROF_BEGIN(); present(); PROF_END(PROF_PRESENT); }
+#ifdef GX_DUAL
+		dual_draw();
+#endif
 		gx_dbg.stage = 3;
 		t0 = fast_ticks() - t0;
 		psx_prof[PROF_FRAME] += t0;
+#ifndef GX_DUAL
 		hud_frame(t0);
+#endif
 		frames++;
 		{   // no ir más rápido que la consola: tiempo en quintos de vblank de la DS (un frame PAL dura 6)
 			static u32 lim_base, lim_t;
@@ -1075,7 +1116,7 @@ int main(void)
 	fb[1] = fb[0] + 256 * 256;   // banco B, base de mapa 8
 	dmaFillHalfWords(0x8000, fb[0], 2 * 256 * 256 * 2);
 
-	printf("SparStation v43 - PS1 en DSi\nby Spar Retro\n\n");
+	printf("SparStation v44 - PS1 en DSi\nby Spar Retro\n\n");
 #ifdef PDSX_DEMO
 	{   // make DEMO=1: solo la intro y los menús, con nombres de ejemplo (para verlos en melonDS, que no tiene SD)
 		static char demo[6][128] = { "Crash Bandicoot.cue", "Klonoa - Door to Phantomile (USA).cue",

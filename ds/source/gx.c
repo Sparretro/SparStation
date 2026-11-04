@@ -30,8 +30,8 @@ u32 gx_hash = 2166136261u;
 #define GXH(v) ((void)0)
 #endif
 
-#ifdef PSX_SELFTEST
-#define MAX_POLYS 1200   // en el modo DS la RAM va justa
+#if defined(PSX_SELFTEST) && !defined(GX_FULL_LIST)
+#define MAX_POLYS 1200   // en el modo DS la RAM va justa (EXTRA=-DGX_FULL_LIST: como en la DSi, para comparar imágenes)
 #else
 #define MAX_POLYS 2000   // el hardware admite 2048 por frame
 #endif
@@ -44,6 +44,12 @@ static u32 list_buf[2][LIST_WORDS + 2] __attribute__((aligned(32)));
 static u32 *list = list_buf[0];
 static int list_cur;
 static int ln, npolys, nverts, semi_id;   // el hardware admite 2048 polígonos y 6144 vértices por frame
+#ifdef GX_STATS
+struct { char tag[8]; u32 frames, full, dropped, maxp, maxv, sump, maxnow, maxocc, evict_now, d[7], bands, ctl, toon0, hlpolys; } gx_stats = { "SPGXSTAT", 0, 0, 0, 0, 0, 0, 0, 0, 0, { 0 }, 0, 0, 0, 0 };   // pruebas: polígonos por frame y los que no caben
+#define GX_DROP() (gx_stats.dropped++)
+#else
+#define GX_DROP() ((void)0)
+#endif
 static u32 frame_no;
 // Fondo BG3 (la VRAM de la PS1 copiada a la pantalla): con el 3D solo hace falta copiarlo si el juego escribió
 // en la zona mostrada (vídeos, imágenes subidas). Por franjas de 16 filas: cambiado desde la última copia, y
@@ -67,8 +73,38 @@ GxDbg gx_dbg = { "SPDBGSTG", 0, 0, 0, 0 };
 
 // ---- paletas: banco E (64 KB) ----
 #define PAL_HASH 2048
-typedef struct { s16 x, y; u16 n, slot; u8 lum; } PalEnt;   // n = 0: libre; slot: hueco de su tamaño (ver pal_get); lum = brillo máximo 0-31
+typedef struct { s16 x, y; u16 n, slot; u8 lum, zx, sw; } PalEnt;   // n = 0: libre; slot: hueco de su tamaño (ver pal_get); lum = brillo máximo 0-31
+// zx = 1: algún color que no es el primero vale 0000h. En la PS1 esos texels son transparentes; en la DS solo puede
+// serlo el índice 0, así que esas texturas se renumeran (clut_remap, profundidades 5 y 6) y usan la paleta con sw = 1
+static u8 pal_zx;   // el de la última pal_get
+#ifdef GX_NO_ZX
+#define ZX_ON 0   // pruebas: sin la renumeración (como antes de la v44)
+#else
+#define ZX_ON 1
+#endif
+#ifdef GX_NO_VEIL
+#define VEIL_ON 0   // pruebas: sin los velos de la máscara (como antes de la v44)
+#else
+#define VEIL_ON 1
+#endif
+#ifdef GX_NO_A3
+#define A3_ON 0   // pruebas: sombras y brillos con un solo alfa por polígono (como antes de la v44)
+#else
+#define A3_ON 1
+#endif
 static PalEnt pal[PAL_HASH];
+
+// Renumeración de una CLUT con 0000h fuera del índice 0: los texels cuyo color es 0000h pasan al índice 0 (el único
+// que la DS deja transparente) y los del índice 0, a z (el primer índice que valía 0000h, que queda libre); la paleta
+// con sw = 1 lleva el color del 0 en z. Así la textura sigue en 4 u 8 bits y ocupa lo mismo. Devuelve z.
+static int clut_remap(int cx, int cy, int n, u8 *map)
+{
+	const u16 *c = &psx_vram[cy * 1024];
+	int z = 0;
+	for (int i = 1; i < n && !z; i++) if (!c[(cx + i) & 1023]) z = i;
+	for (int i = 0; i < n; i++) map[i] = !c[(cx + i) & 1023] ? 0 : i ? (u8)i : (u8)z;
+	return z;
+}
 
 static u16 *bank_lcd(int bank)   // dirección de un banco cuando está en modo LCD
 {
@@ -205,15 +241,23 @@ static u32 pal_off(const PalEnt *e) { return e->n == 16 ? (u32)e->slot * 32 : 0x
 
 // Base de paleta (para PLTT_BASE) con los n colores de la CLUT en (cx, cy). n = 32: los 16 colores
 // llevados a brillo máximo (para A3I5, donde el brillo va en el alfa de cada texel) y 16 negros.
-PSX_ITCM static u32 pal_get(int cx, int cy, int n, int *lum)
+static u32 pal_load(PalEnt *e, u32 h, int cx, int cy, int n, int sw, int *lum);
+PSX_ITCM static u32 pal_get(int cx, int cy, int n, int sw, int *lum)
 {
 	STAGE(30);
-	u32 h = ((u32)cy * 64 + (u32)cx / 16 + (n == 256 ? 0x9e37 : n == 32 ? 0x4f1b : 0)) & (PAL_HASH - 1), off;
+	u32 h = ((u32)cy * 64 + (u32)cx / 16 + (n == 256 ? 0x9e37 : n == 32 ? 0x4f1b : 0) + (sw ? 0x2d07 : 0)) & (PAL_HASH - 1);
 	PalEnt *e = &pal[h];
+	if (e->n == n && e->x == cx && e->y == cy && e->sw == sw) { pal_mark_used(e); *lum = e->lum; pal_zx = e->zx; return pal_off(e) >> 4; }
+	return pal_load(e, h, cx, cy, n, sw, lum);
+}
+
+// Paleta nueva (pocas por frame): fuera de la ITCM
+static __attribute__((noinline)) u32 pal_load(PalEnt *e, u32 h, int cx, int cy, int n, int sw, int *lum)
+{
+	u32 off;
 	u16 *dst;
 	u32 sum = 0, now = frame_no + 1;
 	int small = n == 16, slot = 0;
-	if (e->n == n && e->x == cx && e->y == cy) { pal_mark_used(e); *lum = e->lum; return pal_off(e) >> 4; }
 	tc.ok = 0;   // una paleta nueva puede quedarse el hueco de la del último polígono
 	// hueco: el siguiente que no se haya usado en este frame (vuelta circular = aproximadamente el más viejo)
 	if (small) {
@@ -234,26 +278,34 @@ PSX_ITCM static u32 pal_get(int cx, int cy, int n, int *lum)
 	if (e->n) {   // la entrada tenía otra CLUT: su hueco queda libre
 		if (e->n == 16) p16_owner[e->slot] = -1; else p256_owner[e->slot] = -1;
 	}
-	e->x = (s16)cx; e->y = (s16)cy; e->n = (u16)(small ? 16 : n); e->slot = (u16)slot;
+	e->x = (s16)cx; e->y = (s16)cy; e->n = (u16)(small ? 16 : n); e->slot = (u16)slot; e->sw = (u8)sw;
 	if (small) { p16_owner[slot] = (s16)h; p16_used[slot] = now; }
 	else { p256_owner[slot] = (s16)h; p256_used[slot] = now; }
 	e->n = (u16)n;
 	off = small ? (u32)slot * 32 : 0x8000 + (u32)slot * 512;
 	if (sh_pal) { sh_mark(GX_PAL, off, off + (u32)n * 2); dst = sh_pal + off / 2; }
 	else { vramSetBankE(VRAM_E_LCD); dst = bank_lcd(3) + off / 2; }
+	e->zx = 0;
+	int z = 0;   // sw: el índice que se queda el color del 0 (ver clut_remap)
+	if (sw) { u8 m[256]; z = clut_remap(cx, cy, n, m); }
 	for (int i = 0; i < n; i++) {
-		u16 c = i < (n == 32 ? 16 : n) ? psx_vram[cy * 1024 + ((cx + i) & 1023)] : 0;
+		int si = sw && i == z && z ? 0 : i;   // sw: en z va el color del índice 0; el 0 queda transparente
+		u16 c = i < (n == 32 ? 16 : n) && !(sw && i == 0) ? psx_vram[cy * 1024 + ((cx + si) & 1023)] : 0;
 		int r = c & 31, g = (c >> 5) & 31, b = (c >> 10) & 31, m = r > g ? (r > b ? r : b) : (g > b ? g : b);
 		if (n == 32 && m) { r = r * 31 / m; g = g * 31 / m; b = b * 31 / m; }
 		dst[i] = (u16)(r | (g << 5) | (b << 10));
 		if (c && (u32)m > sum) sum = (u32)m;   // brillo máximo de la CLUT
+		if (!sw && !c && i && i < (n == 32 ? 16 : n)) e->zx = 1;
 	}
+	if (sw) e->zx = 1;
 	if (!sh_pal) vramSetBankE(VRAM_E_TEX_PALETTE);
 	e->lum = (u8)sum;
 	*lum = e->lum;
+	pal_zx = e->zx;
 	return off >> 4;
 }
 
+static void tex_clut_dirty(int x, int y, int w, int h);
 static void pal_dirty(int x, int y, int w, int h)
 {
 	tc.ok = 0;
@@ -264,6 +316,7 @@ static void pal_dirty(int x, int y, int w, int h)
 			e->n = 0;
 		}
 	}
+	tex_clut_dirty(x, y, w, h);
 }
 
 // ---- texturas: 384 huecos de 1 KB (banco B = huecos 0-127, D = 128-255, C = 256-383; el 352 es de la rampa) ----
@@ -272,6 +325,9 @@ static void pal_dirty(int x, int y, int w, int h)
 // hasta unas 20 páginas por frame y con páginas enteras de 32 KB se echaban unas a otras sin parar).
 // depth 1/2/3 = página de 4/8/15 bits tal cual; 4 = página de 4 bits como A3I5 (8 bits por texel con alfa
 // por texel sacado del brillo de su color en la CLUT cx, cy: para las capas aditivas)
+// 5 = página de 4 bits como A3I5 con alfa 0 donde la CLUT cx, cy vale 0000h y 7 en lo demás; 6 = página de 8 bits
+// pasada por su CLUT a color directo (bit 15 = 0: transparente). Son las texturas cuya CLUT tiene 0000h en otro
+// índice que el 0 (zx): la PS1 no pinta esos texels y la DS solo sabe dejar transparente el índice 0.
 #define NSUB 384
 #define SUB_BYTES 1024
 #define RAMP_SUB (0x58000 / SUB_BYTES)   // la rampa está en el byte 0x58000
@@ -297,8 +353,18 @@ static void tex_unlink(int k)   // quita la entrada k de la lista de su página
 	if (*pp == k) *pp = tex[k].next;
 }
 
-static int src_w(int depth) { return depth == 1 || depth == 4 ? 64 : depth == 2 ? 128 : 256; }   // medias palabras por fila
-static int dst_row(int depth) { return depth == 1 ? 128 : depth == 3 ? 512 : 256; }              // bytes por fila
+static int src_w(int depth) { return depth == 1 || depth == 4 || depth == 5 ? 64 : depth == 2 || depth == 6 ? 128 : 256; }   // medias palabras por fila
+static int dst_row(int depth) { return depth == 1 || depth == 5 ? 128 : depth == 3 ? 512 : 256; }                         // bytes por fila
+
+// Cambió la VRAM donde hay CLUTs: las bandas de profundidad 5 y 6 llevan su CLUT dentro, hay que volver a copiarlas
+static void tex_clut_dirty(int x, int y, int w, int h)
+{
+	for (int i = 0; i < NSUB; i++) {
+		TexEnt *t = &tex[i];
+		if (t->used && t->depth >= 5 && t->cy >= y && t->cy < y + h && t->cx < x + w && t->cx + (t->depth == 5 ? 16 : 256) > x)
+			memset(t->rows, 0, sizeof t->rows);
+	}
+}
 
 static void tex_dirty(int x, int y, int w, int h)
 {
@@ -344,6 +410,11 @@ static void tex_upload(const TexEnt *t, int u, int row0, int row1)
 		}
 		for (int i = 0; i < 16; i++) b[i] = (u8)(i | (((m[i] * 7 + mmax / 2) / mmax) << 5));
 		for (int k = 0; k < 256; k++) lut[k] = (u16)(b[k & 15] | (b[k >> 4] << 8));
+	} else if (t->depth == 5 || t->depth == 6) {   // índices renumerados (ver clut_remap): un byte de origen -> un byte
+		u8 m[256];
+		int nc = t->depth == 5 ? 16 : 256;
+		clut_remap(t->cx, t->cy, nc, m);
+		for (int k = 0; k < 256; k++) lut[k] = t->depth == 5 ? (u16)(m[k & 15] | (m[k >> 4] << 4)) : m[k];
 	}
 	if (sh_tex) sh_mark_bytes(base + (u32)(row0 - t->start) * (u32)rb, base + (u32)(row1 - t->start) * (u32)rb);
 	else { vramSetBankB(VRAM_B_LCD); vramSetBankD(VRAM_D_LCD); vramSetBankC(VRAM_C_LCD); }
@@ -355,6 +426,11 @@ static void tex_upload(const TexEnt *t, int u, int row0, int row1)
 			for (int k = 0; k < tw; k++) {
 				u16 c = src[(t->x + k) & 1023];
 				dst[k] = c ? (c | 0x8000) : 0;
+			}
+		} else if (t->depth == 5 || t->depth == 6) {
+			for (int k = 0; k < tw; k++) {
+				u16 s = src[(t->x + k) & 1023];
+				dst[k] = (u16)(lut[s & 0xff] | (lut[s >> 8] << 8));
 			}
 		} else if (t->depth == 4) {
 			for (int k = 0; k < tw; k++) {
@@ -394,9 +470,10 @@ PSX_ITCM static void tex_ensure(TexEnt *t, int u, int v0, int v1)
 	}
 }
 
-static int tex_has(const TexEnt *t, int x, int y, int depth, int v0, int v1)
+static int tex_has(const TexEnt *t, int x, int y, int depth, int cx, int cy, int v0, int v1)
 {
-	return t->used && t->x == x && t->y == y && t->depth == depth && v0 >= t->start && v1 < t->start + t->h;
+	return t->used == 1 && t->x == x && t->y == y && t->depth == depth && v0 >= t->start && v1 < t->start + t->h &&
+	       (depth < 5 || (t->cx == cx && t->cy == cy));   // 5 y 6 llevan su CLUT dentro
 }
 
 // Hueco donde está (o se carga) la banda con las filas [v0, v1] de la página; devuelve el primero. Solo se
@@ -416,6 +493,18 @@ static __attribute__((noinline)) int tex_new(int x, int y, int depth, int cx, in
 	// usan nunca pasan de sus filas (tex_has). Antes la altura era potencia de 2 y la banda iba alineada a su tamaño:
 	// una de 191 filas ocupaba 256 y en Pepsiman la memoria se llenaba y dos bandas se echaban una a otra en cada frame.
 	tc.ok = 0;   // puede echar la banda del último polígono
+	// Las bandas de la misma página que se solapan o casi se tocan se juntan en una: si no, las mismas filas iban
+	// copiadas varias veces y en Pepsiman la memoria de texturas se llenaba dentro del frame (y se pisaban bandas
+	// que el 3D aún tenía que dibujar). Las viejas quedan sustituidas (used = 2): no se vuelven a usar y su sitio se
+	// libera en cuanto haga falta (en este frame aún las usan polígonos ya mandados, así que no se tocan).
+	for (int i = page_head[page_key(x, y, depth)]; i >= 0; i = tex[i].next) {
+		TexEnt *t = &tex[i];
+		if (t->used != 1 || t->x != x || t->y != y || t->depth != depth || (depth >= 5 && (t->cx != cx || t->cy != cy))) continue;
+		if (t->start > v1 + 16 || t->start + t->h + 16 < v0) continue;   // lejos: cada una por su lado
+		if (t->start < v0) v0 = t->start;
+		if (t->start + t->h - 1 > v1) v1 = t->start + t->h - 1;
+		t->used = 2;
+	}
 	{
 		int rb = dst_row(depth), per = SUB_BYTES / rb;   // filas por hueco (2, 4 u 8)
 		start = v0 & ~3;
@@ -452,6 +541,9 @@ static __attribute__((noinline)) int tex_new(int x, int y, int depth, int cx, in
 	for (int s = best; s < best + units; s++) {   // fuera lo que ocupaba esos huecos
 		int k = sub_owner[s];
 		if (k >= 0 && tex[k].used) {
+#ifdef GX_STATS
+			if (tex[k].stamp == frame_no) gx_stats.evict_now++;   // pruebas: se pisó una banda de este mismo frame
+#endif
 			for (int q = k; q < k + tex[k].units; q++) sub_owner[q] = -1;
 			tex_unlink(k);
 			tex[k].used = 0;
@@ -477,13 +569,13 @@ static __attribute__((noinline)) int tex_new(int x, int y, int depth, int cx, in
 PSX_ITCM static int tex_get(int x, int y, int depth, int cx, int cy, int v0, int v1)
 {
 	int last = tex_last;
-	if (tex_has(&tex[last], x, y, depth, v0, v1)) {
+	if (tex_has(&tex[last], x, y, depth, cx, cy, v0, v1)) {
 		tex[last].stamp = frame_no;
 		tex_ensure(&tex[last], last, v0, v1);
 		return last;
 	}
 	for (int i = page_head[page_key(x, y, depth)]; i >= 0; i = tex[i].next)
-		if (tex_has(&tex[i], x, y, depth, v0, v1)) {
+		if (tex_has(&tex[i], x, y, depth, cx, cy, v0, v1)) {
 			tex[i].stamp = frame_no;
 			tex_ensure(&tex[i], i, v0, v1);
 			tex_last = i;
@@ -510,6 +602,41 @@ static void ramp_init(void)
 
 // ---- polígonos ----
 static inline u32 rgb5(int r, int g, int b) { return (u32)(r >> 3) | ((u32)(g >> 3) << 5) | ((u32)(b >> 3) << 10); }
+
+// Parejas de Silent Hill: cada trozo de suelo es un polígono opaco con el color de la niebla y luego el mismo (mismos
+// vértices) con la textura en modo suma (B+F). La DS no suma, pero su modo «highlight» da textura x rojo del vértice +
+// tabla_toon[rojo del vértice]. En estas parejas la niebla de cada vértice va de la mano del brillo de la textura (cerca:
+// poca niebla y textura brillante; lejos, al revés), así que la tabla se llena en cada frame con lo que traen las
+// parejas: para cada brillo (0-31), el color medio del fondo en esos vértices. Sale lo mismo que la suma de la PS1.
+static int pair_next = -1, pair_n;   // pair_next: npolys del siguiente polígono si el último fue opaco sin textura
+static u32 pair_xy[4], pair_vc[4];   // vértices y colores del opaco
+static u32 hl_acc[32][3], hl_cnt[32], hl_any;
+static void hl_add(int idx, u32 c)   // un vértice: brillo idx (el rojo que va a la DS) con fondo c (0xBBGGRR)
+{
+	hl_acc[idx][0] += c & 0xff;
+	hl_acc[idx][1] += (c >> 8) & 0xff;
+	hl_acc[idx][2] += (c >> 16) & 0xff;
+	hl_cnt[idx]++;
+	hl_any = 1;
+}
+static void hl_write(void)   // al cerrar el frame: la tabla toon con lo de este frame (los huecos, del vecino más cercano)
+{
+	u32 t[32];
+	int last = -1;
+	if (!hl_any) return;
+	for (int i = 0; i < 32; i++)
+		if (hl_cnt[i]) {
+			u32 n = hl_cnt[i];
+			t[i] = (hl_acc[i][0] / n >> 3) | (hl_acc[i][1] / n >> 3) << 5 | (hl_acc[i][2] / n >> 3) << 10;
+			for (int k = last + 1; k < i; k++) t[k] = last < 0 || k - last > i - k ? t[i] : t[last];
+			last = i;
+		}
+	for (int k = last + 1; k < 32; k++) t[k] = t[last];
+	for (int i = 0; i < 16; i++) ((vu32 *)0x04000380)[i] = t[2 * i] | t[2 * i + 1] << 16;
+	memset(hl_acc, 0, sizeof hl_acc);
+	memset(hl_cnt, 0, sizeof hl_cnt);
+	hl_any = 0;
+}
 static inline int mod5(int c) { c >>= 2; return c > 31 ? 31 : c; }   // color de modulación: 128 = 1.0
 static u32 inv255[256];   // inv255[m] = 255 * 65536 / m redondeado hacia arriba: (r * inv255[m]) >> 16 == r * 255 / m
 static u8 mod5t[256];     // color de modulación (128 = 1.0) a 5 bits, saturado
@@ -538,13 +665,30 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 	// B+F, B-F y B+F/4 no existen en la DS: B+F ~ «pantalla» (B*(1-a) + C*a con a = brillo de F), B-F ~
 	// negro con a = brillo de F. Con textura de 4 bits, el brillo de cada texel va en su alfa (A3I5) y el
 	// del color de los vértices en el alfa del polígono.
-	int addlike = p->semi >= 2, a3 = 0, vb = 0, ramp = 0;   // a3 (A3I5 por página) desactivado: llenaba la caché
-	if (npolys >= MAX_POLYS || nverts + n > 6144) return;
+	int addlike = p->semi >= 2, a3 = addlike && p->tex == 1 && A3_ON, vb = 0, ramp = 0;   // a3: A3I5 (alfa por texel) en las capas que suman o restan con textura de 4 bits (sombras, brillos)
+	if (npolys >= MAX_POLYS || nverts + n > 6144) { GX_DROP(); return; }
 	scale_update();
 	// Con el bit de máscara (comprobar y poner) la PS1 solo pinta sobre lo que no lo tiene: en Silent Hill son
-	// velos de niebla que tiñen solo al personaje (el fondo y la niebla ya tienen la marca). La DS no puede
-	// limitarlos así y saldrían como un recuadro: mejor no dibujarlos.
-	if (p->mask && p->semi) return;
+	// velos de niebla que tiñen solo al personaje y a los objetos (el fondo y el suelo ya tienen la marca). En la DS
+	// van como sombras: ver «veil» más abajo.
+	int veil = p->mask && p->semi && VEIL_ON;   // velo: solo pinta donde no está la marca (ver la pasada 0 más abajo)
+	if (p->mask && p->semi && (!VEIL_ON || npolys + 1 >= MAX_POLYS)) return;
+	int hl = 0;   // pareja de suma sobre el polígono opaco de antes (ver pair_*)
+	if (p->semi == 2 && p->tex && pair_next == npolys && pair_n == n) {
+		hl = 1;
+		for (int k = 0; k < n; k++) if (((u32)(u16)v[k].x | (u32)(u16)v[k].y << 16) != pair_xy[k]) hl = 0;
+		if (hl) { addlike = 0; a3 = 0; for (int k = 0; k < n; k++) hl_add(mod5t[v[k].r], pair_vc[k]);
+#ifdef GX_STATS
+			gx_stats.hlpolys++;
+#endif
+		}
+	}
+	if (!p->semi && !p->tex) {
+		pair_next = npolys + 1;
+		pair_n = n;
+		for (int k = 0; k < n; k++) pair_vc[k] = (u32)v[k].r | (u32)v[k].g << 8 | (u32)v[k].b << 16;
+		for (int k = 0; k < n; k++) pair_xy[k] = (u32)(u16)v[k].x | (u32)(u16)v[k].y << 16;
+	} else pair_next = -1;
 	if (addlike) {
 		for (int k = 0; k < n; k++) vb += (v[k].r > v[k].g ? (v[k].r > v[k].b ? v[k].r : v[k].b) : (v[k].g > v[k].b ? v[k].g : v[k].b));
 		vb = p->raw && p->tex ? 128 : n == 4 ? vb >> 2 : (vb * 21846) >> 16;   // vb / n sin dividir (n = 3 o 4)
@@ -553,17 +697,23 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 		int vmin = v[0].v, vmax = v[0].v, u, fmt;
 		for (int k = 1; k < n; k++) { if (v[k].v < vmin) vmin = v[k].v; if (v[k].v > vmax) vmax = v[k].v; }
 		if (vmin < 0 || vmax > 255) { vmin = 0; vmax = 255; }   // se sale de la página (repite): todas
-		u = tex_get(p->tpx, p->tpy, a3 ? 4 : p->tex, p->cx, p->cy, vmin, vmax);
-		fmt = a3 ? 1 : p->tex == 1 ? 3 : p->tex == 2 ? 4 : 7;
-		int c0 = 0;
-		if (p->tex < 3) {
-			pltt = pal_get(p->cx, p->cy, a3 ? 32 : p->tex == 1 ? 16 : 256, &lum);
+		int c0 = 0, depth = a3 ? 4 : p->tex;
+		if (p->tex < 3) {   // la paleta primero: según tenga 0000h fuera del índice 0, la textura va en otro formato
+			pltt = pal_get(p->cx, p->cy, a3 ? 32 : p->tex == 1 ? 16 : 256, 0, &lum);
 			c0 = psx_vram[p->cy * 1024 + p->cx] == 0;   // índice 0 transparente si su color es 0
+			if (!a3 && pal_zx && ZX_ON) {   // 0000h fuera del índice 0: índices renumerados y la paleta que va con ellos
+				int l2;
+				depth = p->tex == 1 ? 5 : 6;
+				pltt = pal_get(p->cx, p->cy, p->tex == 1 ? 16 : 256, 1, &l2);
+				c0 = 1;
+			}
 		}
+		u = tex_get(p->tpx, p->tpy, depth, p->cx, p->cy, vmin, vmax);
+		fmt = depth == 4 ? 1 : depth == 3 ? 7 : depth == 1 || depth == 5 ? 3 : 4;
 		vbase = tex[u].start;
 		teximg = ((u32)u * (SUB_BYTES / 8)) | (1u << 16) | (1u << 17) | (5u << 20) | ((u32)(tex[u].hl - 3) << 23) | ((u32)fmt << 26) | ((u32)c0 << 29);
 	}
-	alpha = alpha_of[p->semi];
+	alpha = alpha_of[hl ? 0 : p->semi];
 	if (addlike) {
 		int f = !p->tex ? vb >> 3 : lum * vb / 128;   // 0-31; con A3I5 el reparto entre texels va en la textura
 		if (p->semi == 4) f >>= 2;
@@ -575,19 +725,33 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 		}
 		if (p->semi == 3) black = 1; else white = 1;
 	}
+	if (veil && ramp) {   // la sombra de la DS va sin la rampa: alfa de todo el polígono
+		int f = vb >> 3;
+		if (p->semi == 4) f >>= 2;
+		ramp = 0;
+		teximg = 0;
+		alpha = f < 1 ? 1 : f > 30 ? 30 : f;
+	}
 	attr = (3u << 6) | (1u << 12) | (1u << 13) | ((u32)alpha << 16);
 	// ID: el hardware no pinta un semitransparente sobre otro con el mismo ID. Distintos para que se mezclen;
 	// el mismo (62) para los que usan el bit de máscara de la PS1, que solo dejan pintar cada píxel una vez
-	if (p->semi) attr |= (u32)(p->mask ? 62 : (semi_id = semi_id >= 61 ? 1 : semi_id + 1)) << 24;
+	if (p->semi && !hl && !veil) attr |= (u32)(p->mask ? 62 : (semi_id = semi_id >= 61 ? 1 : semi_id + 1)) << 24;
+	if (hl) attr |= 2u << 4;   // highlight (ver hl_write)
+	if (hl || (!p->semi && p->setm)) attr |= 63u << 24;   // opaco que deja la marca de la PS1 (ver veil); la suma de las parejas también (sus texels la ponen)
+	for (int pass = veil ? 0 : 1; pass < 2; pass++) {
+		// Velos (veil): pintan solo donde no hay marca. Con las sombras de la DS: pasada 0, la plantilla (sombra con
+		// ID 0 al fondo del todo: marca todo lo que tiene delante); pasada 1, el velo como sombra con ID 63, que no
+		// pinta donde el opaco de debajo tiene ese ID (los que dejaron la marca, y el fondo vacío)
+		u32 pattr = !veil ? attr : pass == 0 ? (3u << 6) | (3u << 4) | (30u << 16) : (attr & ~(63u << 24)) | (3u << 4) | (63u << 24);
 	o = &list[ln];
 	*o++ = 0x29 | (0x2a << 8) | (0x2b << 16) | (0x40 << 24);   // POLY_FORMAT, TEXIMAGE_PARAM, PLTT_BASE, BEGIN_VTXS
-	*o++ = attr;
+	*o++ = pattr;
 	*o++ = teximg;
 	*o++ = pltt;
 	*o++ = n == 4 ? 1 : 0;
 	blk_attr = ~0u;   // estos vértices van con VTX_16: el siguiente de gx_poly_raw empieza bloque propio
-	z = (u32)(4000 - npolys * 3) & 0xffff;
-	GXH(attr); GXH(teximg); GXH(pltt); GXH(n == 4); GXH(z);
+	z = veil && pass == 0 ? 4095u : (u32)(4000 - npolys * 3) & 0xffff;
+	GXH(pattr); GXH(teximg); GXH(pltt); GXH(n == 4); GXH(z);
 	{
 		// color de cada vértice: constante, normalizado (aditivos), RGB tal cual o modulación de textura
 		enum { CM_CONST, CM_NORM, CM_RGB, CM_MOD } cm;
@@ -638,6 +802,7 @@ static void gx_poly(const GpuHwVtx *v, int n, const GpuHwPoly *p)
 	ln = (int)(o - list);
 	npolys++;
 	nverts += n;
+	}
 }
 
 static inline int sx11(u32 v) { return ((s32)(v << 21)) >> 21; }
@@ -693,13 +858,39 @@ PSX_ITCM static void gx_poly_raw(const u32 *w, const GpuHwRaw *r)
 	int n = cmd & 8 ? 4 : 3, gour = (cmd & 0x10) != 0, textured = (cmd & 4) != 0, td = r->tex, semi = r->semi;
 	int raw = textured && (cmd & 1), lum = 24, alpha, white = 0, black = 0, vbase = 0, addlike = semi >= 2, vb = 0, ramp = 0;
 	STAGE(41);
-	if (npolys >= MAX_POLYS || nverts + n > 6144) return;
-	if (r->mask && semi) return;   // ver gx_poly
+	if (npolys >= MAX_POLYS || nverts + n > 6144) { GX_DROP(); return; }
+	if (r->mask && semi && !VEIL_ON) return;   // ver gx_poly
 	scale_update();
 	{
 		const u32 *q = w + 1;
 		for (int j = 0; j < n; j++) { q += j && gour; vp[j] = q; q += textured ? 2 : 1; }
 	}
+	if (r->mask && semi) {   // velo (unos 20 por frame en Silent Hill): por gx_poly, que sabe hacerlo con las sombras de la DS
+		GpuHwVtx hv[4];
+		GpuHwPoly p;
+		for (int j = 0; j < n; j++) {
+			u32 c = j && gour ? vp[j][-1] : w[0], xy = vp[j][0];
+			hv[j].x = (s16)(sx11(xy) + r->dx); hv[j].y = (s16)(sx11(xy >> 16) + r->dy);
+			hv[j].r = (u8)c; hv[j].g = (u8)(c >> 8); hv[j].b = (u8)(c >> 16);
+			hv[j].u = textured ? (s16)(vp[j][1] & 0xff) : 0; hv[j].v = textured ? (s16)((vp[j][1] >> 8) & 0xff) : 0;
+		}
+		p.tex = (u8)td; p.raw = (u8)raw; p.gouraud = (u8)gour; p.semi = (u8)semi; p.mask = 1; p.setm = r->setm;
+		p.tpx = r->tpx; p.tpy = r->tpy; p.cx = r->cx; p.cy = r->cy; p.ox = 0; p.oy = 0;
+		gx_poly(hv, n, &p);
+		return;
+	}
+	int hl = 0;   // suma de la PS1 sobre el polígono opaco de justo antes (ver pair_*)
+	if (semi == 2 && textured && pair_next == npolys && pair_n == n) {
+		hl = 1;
+		for (int j = 0; j < n; j++) if (vp[j][0] != pair_xy[j]) hl = 0;
+		if (hl) { semi = 0; addlike = 0; for (int j = 0; j < n; j++) hl_add(mod5t[(j && gour ? vp[j][-1] : w[0]) & 0xff], pair_vc[j]); }
+	}
+	if (!semi && !textured) {   // opaco sin textura: puede ser el fondo de una pareja
+		pair_next = npolys + 1;
+		pair_n = n;
+		for (int j = 0; j < n; j++) pair_vc[j] = (j && gour ? vp[j][-1] : w[0]) & 0xffffff;
+		for (int j = 0; j < n; j++) pair_xy[j] = vp[j][0];
+	} else pair_next = -1;
 	if (addlike) {
 		for (int j = 0; j < n; j++) {
 			u32 c = j && gour ? vp[j][-1] : w[0];
@@ -710,23 +901,27 @@ PSX_ITCM static void gx_poly_raw(const u32 *w, const GpuHwRaw *r)
 	}
 	if (td) {
 		int vmin = (vp[0][1] >> 8) & 0xff, vmax = vmin, u, fmt, c0 = 0;
+		int tdk = addlike && td == 1 && A3_ON ? 4 : td;   // 4: A3I5 con alfa por texel (sombras y brillos, ver gx_poly)
 		for (int j = 1; j < n; j++) { int v = (vp[j][1] >> 8) & 0xff; if (v < vmin) vmin = v; if (v > vmax) vmax = v; }
-		if (TC_ON && tc.ok && tc.frame == frame_no && tc.tpx == r->tpx && tc.tpy == r->tpy && tc.td == td && tc.cx == r->cx && tc.cy == r->cy &&
+		if (TC_ON && tc.ok && tc.frame == frame_no && tc.tpx == r->tpx && tc.tpy == r->tpy && tc.td == tdk && tc.cx == r->cx && tc.cy == r->cy &&
 		    vmin >= tc.v0 && vmax <= tc.v1) {   // la misma textura que el anterior y filas ya cargadas
 			teximg = tc.teximg;
 			pltt = tc.pltt;
 			lum = tc.lum;
 			vbase = tc.vbase;
 		} else {
-			u = tex_get(r->tpx, r->tpy, td, r->cx, r->cy, vmin, vmax);
-			fmt = td == 1 ? 3 : td == 2 ? 4 : 7;
-			if (td < 3) {
-				pltt = pal_get(r->cx, r->cy, td == 1 ? 16 : 256, &lum);
+			int depth = tdk;
+			if (tdk == 4) pltt = pal_get(r->cx, r->cy, 32, 0, &lum);   // A3I5 (ver gx_poly)
+			else if (td < 3) {   // la paleta primero (ver gx_poly)
+				pltt = pal_get(r->cx, r->cy, td == 1 ? 16 : 256, 0, &lum);
 				c0 = psx_vram[r->cy * 1024 + r->cx] == 0;
+				if (pal_zx && ZX_ON) { int l2; depth = td == 1 ? 5 : 6; pltt = pal_get(r->cx, r->cy, td == 1 ? 16 : 256, 1, &l2); c0 = 1; }   // ver gx_poly
 			}
+			u = tex_get(r->tpx, r->tpy, depth, r->cx, r->cy, vmin, vmax);
+			fmt = depth == 4 ? 1 : depth == 3 ? 7 : depth == 1 || depth == 5 ? 3 : 4;
 			vbase = tex[u].start;
 			teximg = ((u32)u * (SUB_BYTES / 8)) | (1u << 16) | (1u << 17) | (5u << 20) | ((u32)(tex[u].hl - 3) << 23) | ((u32)fmt << 26) | ((u32)c0 << 29);
-			tc.tpx = r->tpx; tc.tpy = r->tpy; tc.cx = r->cx; tc.cy = r->cy; tc.td = (u8)td;
+			tc.tpx = r->tpx; tc.tpy = r->tpy; tc.cx = r->cx; tc.cy = r->cy; tc.td = (u8)tdk;
 			tc.v0 = (s16)vmin; tc.v1 = (s16)vmax;
 			tc.teximg = teximg; tc.pltt = pltt; tc.lum = lum; tc.vbase = vbase;
 			tc.frame = frame_no;
@@ -743,6 +938,8 @@ PSX_ITCM static void gx_poly_raw(const u32 *w, const GpuHwRaw *r)
 	}
 	attr = (3u << 6) | (1u << 12) | (1u << 13) | ((u32)alpha << 16);
 	if (semi) attr |= (u32)(r->mask ? 62 : (semi_id = semi_id >= 61 ? 1 : semi_id + 1)) << 24;
+	if (hl) attr |= 2u << 4;   // highlight: textura x color + el color de la tabla (el del polígono de fondo)
+	if (hl || (!r->semi && r->setm)) attr |= 63u << 24;   // la marca de la PS1 (ver el velo en gx_poly)
 	o = &list[ln];
 	if (attr != blk_attr || teximg != blk_teximg || pltt != blk_pltt || (u32)(n == 4) != blk_quad) {
 		*o++ = 0x29 | (0x2a << 8) | (0x2b << 16) | (0x40 << 24);   // POLY_FORMAT, TEXIMAGE_PARAM, PLTT_BASE, BEGIN_VTXS
@@ -840,6 +1037,7 @@ static void gx_flip(int drawn)
 	clear_next = 0;
 	STAGE(11);
 	while (commit_on) { }   // lo del frame anterior aún no ha llegado a la VRAM (dos frames en una vblank)
+	hl_write();
 	list[ln++] = 0x50;   // SWAP_BUFFERS (orden manual de los semitransparentes): el buffer cambia en la próxima vblank
 	list[ln++] = 1;
 	DC_FlushRange(list, (u32)ln * 4);   // la DMA lee la RAM, no la caché
@@ -866,7 +1064,12 @@ static void gx_flip(int drawn)
 		}
 		commit_on = any;
 	}
+#ifdef GX_STATS
+	gx_stats.frames++; gx_stats.ctl = GFX_CONTROL; gx_stats.toon0 = GFX_TOON_TABLE[0]; if (gx_stats.frames == 60) { gx_stats.evict_now = gx_stats.maxnow = 0; }   /* lo de la carga no cuenta */ gx_stats.sump += (u32)npolys; if ((u32)npolys > gx_stats.maxp) gx_stats.maxp = (u32)npolys; if ((u32)nverts > gx_stats.maxv) gx_stats.maxv = (u32)nverts; if (npolys >= MAX_POLYS - 1) gx_stats.full++;
+	{ u32 now = 0, occ = 0; for (int i = 0; i < NSUB; i++) if (tex[i].used) { occ += tex[i].units; if (tex[i].stamp == frame_no) { now += tex[i].units; gx_stats.d[tex[i].depth] += tex[i].units; gx_stats.bands++; } } if (now > gx_stats.maxnow) gx_stats.maxnow = now; if (occ > gx_stats.maxocc) gx_stats.maxocc = occ; }
+#endif
 	ln = npolys = nverts = 0;
+	pair_next = -1;
 	blk_attr = ~0u;   // lista nueva: sin bloque abierto
 #ifdef GX_TEXLOG
 	{   // marca de fin de frame: huecos ocupados por bandas usadas en este frame y ocupados en total
@@ -897,6 +1100,7 @@ void gx_init(void)
 	vramSetBankC(VRAM_C_TEXTURE_SLOT2);
 	vramSetBankE(VRAM_E_TEX_PALETTE);
 	glEnable(GL_TEXTURE_2D | GL_BLEND);
+	GFX_CONTROL |= 1u << 1;   // «highlight» en vez de toon (ver hl_write)
 	GFX_CLEAR_COLOR = 63u << 24;   // negro con alfa 0 (se ve el fondo) e ID 63
 	GFX_CLEAR_DEPTH = 0x7fff;
 	glViewport(0, 0, 255, 191);
@@ -923,6 +1127,7 @@ void gx_init(void)
 	pal_reset();
 	ramp_init();
 	ln = npolys = nverts = 0;
+	pair_next = -1;
 	blk_attr = ~0u;
 	GFX_FLUSH = 1;
 }

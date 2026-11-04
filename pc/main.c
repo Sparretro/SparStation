@@ -449,6 +449,9 @@ int main(int argc, char **argv)
 #ifdef DBG_GPUCOUNT
 		dbg_frame_on = getenv("DBG_FRAME") && f == atoi(getenv("DBG_FRAME"));
 #endif
+#ifdef PSX_POLYLOG
+		{ extern int polylog_on; polylog_on = getenv("POLYLOG") && f == atoi(getenv("POLYLOG")); }
+#endif
 		psx_run_frame();
 #ifdef PSX_PROFILE
 		if (getenv("STATLOG") && f % 60 == 0) {   // cada 60 frames: bloques del MDEC, sectores y cambios de imagen

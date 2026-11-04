@@ -151,6 +151,7 @@ typedef struct {
 	u8 tex;                  // 0 = sin textura; 1/2/3 = 4/8/15 bits
 	u8 raw, gouraud, semi;   // raw: textura sin modular; semi: 0 = opaco, si no modo de mezcla + 1
 	u8 mask;                 // no pinta sobre píxeles con el bit de máscara (y lo pone): cada píxel una sola vez
+	u8 setm;                 // lo que pinta queda con el bit de máscara puesto
 	s16 tpx, tpy, cx, cy;    // página de textura y paleta en la VRAM
 	s16 ox, oy;              // origen del área de dibujo (esquina del buffer)
 } GpuHwPoly;
@@ -158,7 +159,7 @@ typedef struct {
 typedef struct {
 	u32 cmd;
 	s16 dx, dy;              // a sumar a x, y del paquete: desplazamiento de dibujo menos el origen del buffer
-	u8 tex, semi, mask;      // como en GpuHwPoly
+	u8 tex, semi, mask, setm;   // como en GpuHwPoly
 	s16 tpx, tpy, cx, cy;
 } GpuHwRaw;
 typedef struct {
