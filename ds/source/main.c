@@ -303,7 +303,10 @@ static void load_cfg(void) { cfg_read(CFG_PATH); }
 // Ajustes recomendados (START en la lista): por juego, lo que mejor fue en las pruebas (melonDS y la DSi). Con el 3D
 // saltar imágenes hace parpadear cosas (v44), así que siempre 0; la CPU automática deja ir a su velocidad a los que
 // miden el tiempo en vblanks. El nombre se busca dentro del del .cue, sin mayúsculas.
-typedef struct { const char *name; s8 quality, skip, cpu_opt, hw, snd, video, cpu_min, target; } Recommended;
+// floor: CPU mínima que el juego aguanta (se aplica siempre, también a la automática y a los % fijos): Castlevania
+// con la CPU por debajo del 30% ve el CD y los temporizadores demasiado rápidos y lee de una dirección mala (801b4078,
+// excepción AdEL y pánico de OpenBIOS): la CPU automática lo bajaba al 20-30% y se quedaba colgado a los 10 s
+typedef struct { const char *name; s8 quality, skip, cpu_opt, hw, snd, video, cpu_min, target, floor; } Recommended;
 static const Recommended recommended[] = {
 	{ "silent hill",    2, 0, 0, 1, 1, 1, 20, 92 },   // 3D lleno de niebla: con el 3D de la DS y la CPU automática ~24 img/s
 	{ "tomb raider",    2, 0, 0, 1, 1, 1, 20, 92 },   // mide en vblanks: tope 20% = 95% de velocidad (v29)
@@ -312,14 +315,16 @@ static const Recommended recommended[] = {
 	{ "resident evil",  2, 0, 0, 1, 1, 1, 20, 92 },   // RE3: el MDEC pesa (12%), vídeos rápidos
 	{ "metal gear",     2, 0, 0, 1, 1, 1, 20, 92 },
 	{ "pepsiman",       2, 0, 0, 1, 1, 1, 20, 92 },   // cuenta vblanks: la CPU automática va bien
-	{ "castlevania",    2, 0, 1, 1, 1, 1, 20, 92 },   // 2D, va casi a velocidad completa: CPU al 100% (sin tirones de la automática)
+	{ "castlevania",    2, 0, 0, 1, 1, 1, 40, 92, 40 },   // 2D, va a velocidad completa; nunca por debajo del 40% (ver arriba)
 	{ "dino crisis",    2, 0, 0, 1, 1, 1, 20, 92 },
 	{ "gran turismo",   2, 0, 0, 1, 1, 1, 20, 92 },
 	{ NULL,             2, 0, 0, 1, 1, 1, CPU_MIN_DEFAULT, AUTO_TARGET },   // los demás
 };
 
 // 1 = el juego está en la tabla (si no, se ponen los generales)
-static int apply_recommended(const char *game)
+static int cpu_floor;   // la del juego en marcha (0 = ninguna)
+
+static const Recommended *find_recommended(const char *game)
 {
 	char low[128];
 	const Recommended *r = recommended;
@@ -327,6 +332,12 @@ static int apply_recommended(const char *game)
 	for (i = 0; game[i] && i < (int)sizeof low - 1; i++) low[i] = (char)(game[i] >= 'A' && game[i] <= 'Z' ? game[i] + 32 : game[i]);
 	low[i] = 0;
 	while (r->name && !strstr(low, r->name)) r++;
+	return r;
+}
+
+static int apply_recommended(const char *game)
+{
+	const Recommended *r = find_recommended(game);
 	opt_quality = r->quality; opt_skip = r->skip; opt_cpu = r->cpu_opt; opt_hw = r->hw; opt_snd = r->snd; opt_video = r->video;
 	opt_cpu_min = r->cpu_min; opt_target = r->target;
 	return r->name != NULL;
@@ -517,7 +528,12 @@ static void apply_cfg(void)
 	mdec_fast = opt_video;   // vídeos rápidos: el MDEC a un cuarto de resolución
 	auto_scale = AUTO_MIN;
 	auto_max = 256u * 100 / (u32)opt_cpu_min;
-	dyn_set_cpu_scale(opt_cpu ? 256u * 100 / (u32)cpu_pct[opt_cpu] : auto_scale);
+	if (cpu_floor && opt_cpu_min < cpu_floor) auto_max = 256u * 100 / (u32)cpu_floor;
+	{
+		int pct = opt_cpu ? cpu_pct[opt_cpu] : 0;
+		if (pct && pct < cpu_floor) pct = cpu_floor;
+		dyn_set_cpu_scale(pct ? 256u * 100 / (u32)pct : auto_scale);
+	}
 }
 
 static u32 name_hash(const char *s)   // FNV-1a sin distinguir mayúsculas (FAT tampoco las distingue)
@@ -1230,7 +1246,7 @@ int main(void)
 	fb[1] = fb[0] + 256 * 256;   // banco B, base de mapa 8
 	dmaFillHalfWords(0x8000, fb[0], 2 * 256 * 256 * 2);
 
-	printf("SparStation v45 - PS1 en DSi\nby Spar Retro\n\n");
+	printf("SparStation v46 - PS1 en DSi\nby Spar Retro\n\n");
 #ifdef PDSX_DEMO
 	{   // make DEMO=1: solo la intro y los menús, con nombres de ejemplo (para verlos en melonDS, que no tiene SD)
 		static char demo[6][128] = { "Crash Bandicoot.cue", "Klonoa - Door to Phantomile (USA).cue",
@@ -1359,6 +1375,7 @@ int main(void)
 		for (;;) swiWaitForVBlank();
 	}
 	card_open(game);
+	cpu_floor = find_recommended(strrchr(game, '/') ? strrchr(game, '/') + 1 : game)->floor;
 	snd_enable(opt_snd);
 	snprintf(state_path, sizeof state_path, "%s.sst", game_base);
 	snprintf(game_cfg, sizeof game_cfg, "%s.cfg", game_base);

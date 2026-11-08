@@ -1,8 +1,13 @@
 // SIO0: mando digital en el puerto 1 y tarjeta de memoria en la ranura 1 (128 KB que da el frontend en
-// psx_memcard; NULL = sin tarjeta). El puerto 2 está vacío.
+// psx_memcard; NULL = sin tarjeta). En el puerto 2, solo una tarjeta (psx_memcard2, NULL = vacío): con la ranura
+// vacía OpenBIOS no da el error de «no hay tarjeta» y algunos juegos (Harvest Moon: Back to Nature) se quedaban
+// buscándola para siempre.
 // Respeta los tiempos del hardware: el byte tarda en transmitirse, luego llega la respuesta y después
 // el pulso de ACK del mando (con su interrupción). Algunas librerías de mando fallan si todo es instantáneo.
 #include "psx.h"
+#ifdef MC_LOG
+#include <stdio.h>
+#endif
 #ifdef PSX_TRACE_IO
 #include <stdio.h>
 #define SIO_LOG(...) do { if (psx_pad_buttons != 0xffff) printf(__VA_ARGS__); } while (0)
@@ -12,12 +17,14 @@ u32 sio_polls;   // consultas al mando (comando 0x42) desde el arranque
 #endif
 
 u16 psx_pad_buttons = 0xffff;
-u8 *psx_memcard;
-u32 psx_memcard_writes;
+u8 *psx_memcard, *psx_memcard2;
+u32 psx_memcard_writes, psx_memcard2_writes;
+static u8 *mc_card;     // la tarjeta de la conversación en curso
+static u32 *mc_writes;
 
 // Tarjeta: comando en curso ('R', 'W', 'S'), paso dentro de él, sector y suma de comprobación.
 // No va en los estados guardados (una transferencia dura milisegundos y el juego reintenta).
-static u8 mc_cmd, mc_flag = 0x08, mc_msb, mc_lsb, mc_chk, mc_prev;
+static u8 mc_cmd, mc_flags[2] = { 0x08, 0x08 }, mc_flag = 0x08, mc_port, mc_msb, mc_lsb, mc_chk, mc_prev;
 static int mc_step;
 static u8 mc_buf[128];
 
@@ -42,7 +49,7 @@ void sio_reset(void)
 	mc_step = 0;
 }
 
-void sio_memcard_reset(void) { mc_flag = 0x08; mc_step = 0; }
+void sio_memcard_reset(void) { mc_flag = mc_flags[0] = mc_flags[1] = 0x08; mc_step = 0; }
 
 // Tarjeta vacía formateada: cabecera «MC», 15 bloques libres, sin sectores rotos
 void psx_memcard_format(u8 *card)
@@ -67,7 +74,7 @@ static u8 memcard_byte(u8 v, int *ack)
 	*ack = 1;
 	if (st == 0) {   // comando
 		mc_cmd = v;
-		if (v != 'R' && v != 'W' && v != 'S') { *ack = 0; return 0xff; }
+		if (v != 'R' && v != 'W' && v != 'S') { *ack = 0; return mc_flag; }   // desconocido (58h de la PocketStation...): el estado y sin ACK, como una tarjeta normal
 		return mc_flag;
 	}
 	if (st == 1) return 0x5a;
@@ -88,7 +95,7 @@ static u8 memcard_byte(u8 v, int *ack)
 		case 8: if (bad) *ack = 0; return bad ? 0xff : mc_lsb;
 		}
 		if (st < 9 + 128) {
-			u8 d = psx_memcard[sector * 128 + st - 9];
+			u8 d = mc_card[sector * 128 + st - 9];
 			mc_chk ^= d;
 			return d;
 		}
@@ -109,11 +116,12 @@ static u8 memcard_byte(u8 v, int *ack)
 		if (addr > 0x3ff) mc_prev = 0xff;
 		else if (v != mc_chk) mc_prev = 0x4e;
 		else {
-			for (int i = 0; i < 128; i++) psx_memcard[sector * 128 + i] = mc_buf[i];
-			psx_memcard_writes++;
+			for (int i = 0; i < 128; i++) mc_card[sector * 128 + i] = mc_buf[i];
+			(*mc_writes)++;
 			mc_prev = 0x47;
 		}
 		mc_flag &= ~0x08;
+		mc_flags[mc_port] = mc_flag;
 		return r;
 	}
 	if (st == 6 + 128) return 0x5c;
@@ -137,14 +145,28 @@ static void transfer(u8 v)
 	if (seq == 1 && v == 0x42) sio_polls++;
 #endif
 	SIO_LOG("SIO tx %02x ctrl=%04x seq=%d (t=%u)\n", v, ctrl, seq, psx_cycles);
-	if (!(ctrl & 2) || (ctrl & 0x2000)) {   // sin seleccionar, o puerto 2 (vacío)
+	if (!(ctrl & 2)) {   // sin seleccionar
 		seq = 0;
 	} else switch (seq) {
-	case 0:
-		if (v == 0x01) { will_ack = 1; seq = 1; }
-		else if (v == 0x81 && psx_memcard) { will_ack = 1; seq = 10; mc_step = 0; }
+	case 0: {
+		int port = (ctrl & 0x2000) != 0;
+		u8 *card = port ? psx_memcard2 : psx_memcard;
+#ifdef MC_LOG
+		if (v == 0x81) fprintf(stderr, "MC t%u 81h puerto %d %s\n", psx_cycles / 564480, port + 1, card ? "" : "(vacío)");
+#endif
+		if (v == 0x01 && !port) { will_ack = 1; seq = 1; }   // el mando, solo en el puerto 1
+		else if (v == 0x81 && card) {
+			will_ack = 1; seq = 10; mc_step = 0;
+			mc_port = (u8)port; mc_card = card; mc_writes = port ? &psx_memcard2_writes : &psx_memcard_writes;
+			mc_flag = mc_flags[port];
+		}
 		break;
-	case 10: resp = memcard_byte(v, &will_ack); if (!will_ack) seq = 0; break;
+	}
+	case 10: resp = memcard_byte(v, &will_ack); if (!will_ack) seq = 0;
+#ifdef MC_LOG
+		{ if (mc_step == 1 || !will_ack) fprintf(stderr, "MC t%u pc=%08x p%d st%d cmd=%c sec=%03x %s\n", psx_cycles / 564480, cpu.cur_pc, mc_port, mc_step, mc_cmd ? mc_cmd : '?', ((u32)mc_msb << 8 | mc_lsb) & 0x3ff, will_ack ? "" : "fin"); }
+#endif
+		break;
 	case 1: if (v == 0x42) { resp = 0x41; will_ack = 1; seq = 2; } else seq = 0; break;
 	case 2: resp = 0x5a; will_ack = 1; seq = 3; break;
 	case 3: resp = psx_pad_buttons & 0xff; will_ack = 1; seq = 4; break;

@@ -1,6 +1,7 @@
 // CPU R3000A (MIPS I) por intérprete. Respeta el delay slot de los saltos y el de las cargas,
 // que muchos juegos y la BIOS dan por hecho.
 #include "psx.h"
+u32 cpu_step = 2;   // ciclos por instrucción del intérprete (banco del PC: CPU_PCT=n la hace más lenta, como la CPU automática)
 
 PSX_FAST PsxCore psx_core;   // registros de la GTE y de la CPU (ver psx.h)
 u32 psx_hook_pc;
@@ -460,7 +461,7 @@ void cpu_run(u32 until)
 			blk_len = 0;
 		}
 #else
-		psx_cycles += 2;
+		psx_cycles += cpu_step;
 #endif
 	}
 }

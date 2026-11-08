@@ -250,6 +250,8 @@ int cheat_count(void);
 void cheat_apply(void);
 extern u8 *psx_memcard;           // tarjeta de memoria de la ranura 1 (128 KB) o NULL
 extern u32 psx_memcard_writes;    // sectores escritos desde el arranque (el frontend guarda al ver cambios)
+extern u8 *psx_memcard2;          // la de la ranura 2 o NULL (vacía)
+extern u32 psx_memcard2_writes;
 void sio_memcard_reset(void);     // tarjeta recién puesta (bandera de «nueva»)
 void psx_memcard_format(u8 *card);   // tarjeta vacía formateada
 void sio_reset(void);

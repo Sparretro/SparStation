@@ -401,6 +401,13 @@ int main(int argc, char **argv)
 			if (!cf || fread(psx_memcard, 1, 128 * 1024, cf) != 128 * 1024) psx_memcard_format(psx_memcard);
 			if (cf) fclose(cf);
 		}
+	for (int i = 1; i + 1 < argc; i++)   // --card2 archivo: tarjeta en la ranura 2 (solo se lee; formateada si no existe)
+		if (!strcmp(argv[i], "--card2")) {
+			FILE *cf = fopen(argv[i + 1], "rb");
+			psx_memcard2 = malloc(128 * 1024);
+			if (!cf || fread(psx_memcard2, 1, 128 * 1024, cf) != 128 * 1024) psx_memcard_format(psx_memcard2);
+			if (cf) fclose(cf);
+		}
 	for (int i = 1; i + 1 < argc; i++)   // --load archivo: empieza desde un estado guardado
 		if (!strcmp(argv[i], "--load")) {
 			FILE *sf = fopen(argv[i + 1], "rb");
@@ -417,6 +424,11 @@ int main(int argc, char **argv)
 			printf("códigos: %d\n", cheat_parse(t));
 			free(t);
 		}
+	if (getenv("CPU_PCT")) {   // CPU de la PS1 al n%: cada instrucción cuesta más tiempo (como la CPU automática de la DS)
+		extern u32 cpu_step;
+		int pct = atoi(getenv("CPU_PCT"));
+		if (pct > 0) { cpu_step = (u32)(200 / pct); psx_cpu_scale = (u16)(256 * 100 / pct); }
+	}
 	if (getenv("HLE_OFF")) psx_hle_off = 1;   // sin las rutinas en nativo (hle.c)
 	if (getenv("MDEC_FAST")) mdec_fast = 1;   // vídeos a un cuarto de resolución
 	t0 = clock();
@@ -481,6 +493,12 @@ int main(int argc, char **argv)
 				printf("estado %s: %s\n", sname, sf && psx_state_save(state_write, sf) ? "guardado" : "ERROR");
 				if (sf) fclose(sf);
 			}
+			// --loadat F:archivo carga un estado tras el frame F (como el menú de pausa de la DS, en plena partida)
+			if (!strcmp(argv[i], "--loadat") && sscanf(argv[i + 1], "%d:%511s", &at, sname) == 2 && at == f) {
+				FILE *sf = fopen(sname, "rb");
+				printf("estado %s: %s\n", sname, sf && psx_state_load(state_read, sf) ? "cargado" : "ERROR");
+				if (sf) fclose(sf);
+			}
 		}
 #ifdef PSX_TRACE_IO
 		if (f % 120 == 0) { extern u32 sio_polls; printf("frame %d: %u lecturas del mando\n", f, sio_polls); }
@@ -504,6 +522,8 @@ int main(int argc, char **argv)
 		printf("\n[%d frames en %.2f s = %.1f fps; pc=%08x disp %dx%d en (%d,%d)%s]\n", frames, secs, frames / secs,
 		       cpu.pc, gpu_disp.width, gpu_disp.height, gpu_disp.disp_x, gpu_disp.disp_y, gpu_disp.disabled ? " APAGADA" : "");
 	}
+	if ((cpu.pc & 0x1ff00000) == 0x1fc00000)   // acabó dentro de la BIOS (¿pánico de OpenBIOS?): la última excepción
+		printf("COP0: cause=%08x epc=%08x badvaddr=%08x sr=%08x ra=%08x sp=%08x\n", cpu.cop0[13], cpu.cop0[14], cpu.cop0[8], cpu.cop0[12], cpu.r[31], cpu.r[29]);
 #ifdef PSX_TRACE_IO
 	{ extern u32 gp0_hist[256]; for (int i = 0; i < 256; i++) if (gp0_hist[i]) printf("GP0 %02x x%u\n", i, gp0_hist[i]); }
 #endif
