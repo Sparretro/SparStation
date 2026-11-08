@@ -10,6 +10,7 @@
 #include "psx.h"
 #include "hud.h"
 #include "gx.h"
+#include "lang.h"
 
 #define LOG_PATH "sd:/ps1/sparstation_log.txt"
 #ifdef SPAR_PROF
@@ -27,7 +28,35 @@
 #define C_D "\x1b[37m"
 
 enum { T_CPU, T_GPU, T_MDEC, T_COMPILE, T_PRESENT, T_DISC, T_OTHER, T_N };
-static const char *const t_name[T_N] = { "CPU PS1", "GPU", "MDEC", "traducir", "copia", "disco SD", "otros" };
+static const char *t_name(int i)
+{
+	switch (i) {
+	case T_CPU: return T("CPU PS1", "PS1 CPU", "ЦП PS1");
+	case T_GPU: return "GPU";
+	case T_MDEC: return "MDEC";
+	case T_COMPILE: return T("traducir", "compile", "трансл.");
+	case T_PRESENT: return T("copia", "copy", "копия");
+	case T_DISC: return T("disco SD", "SD disc", "диск SD");
+	}
+	return T("otros", "other", "прочее");
+}
+
+// Letras (no bytes) de un texto UTF-8
+static int u8len(const char *p)
+{
+	int n = 0;
+	for (; *p; p++) n += ((u8)*p & 0xc0) != 0x80;
+	return n;
+}
+
+// Corta un texto UTF-8 a max letras
+static void u8cut(char *p, int max)
+{
+	int n = 0;
+	for (char *q = p; *q; q++) {
+		if (((u8)*q & 0xc0) != 0x80 && n++ == max) { *q = 0; return; }
+	}
+}
 
 // lo medido en el último segundo
 static struct {
@@ -36,7 +65,7 @@ static struct {
 	PsxStats st;
 } s;
 
-static char game_name[40], settings_str[64];
+static char game_name[128], settings_str[128];
 #ifndef HUD_PAGE
 #define HUD_PAGE 0
 #endif
@@ -59,7 +88,7 @@ static void row(int y, const char *fmt, ...)
 	va_end(ap);
 	for (const char *p = buf; *p; p++) {
 		if (*p == 0x1b) { while (*p && *p != 'm') p++; if (!*p) break; continue; }
-		vis++;
+		vis += ((u8)*p & 0xc0) != 0x80;   // UTF-8: una letra son 1-3 bytes
 	}
 	printf("\x1b[%d;0H%s" C_W, y, buf);
 	while (vis++ < (y < 23 ? 32 : 31)) putchar(' ');   // en la última fila, 32 haría subir la pantalla
@@ -84,35 +113,40 @@ static void clock_str(char *out, u32 secs) { sprintf(out, "%02lu:%02lu", secs / 
 
 static void draw_buttons(void)
 {
-	row(23, C_C "< PAGINA %d/3  " C_Y "MENU" C_C "   MARCA >", page + 1);
+	// las tres zonas que se tocan: izquierda, centro y derecha (hud_input)
+	row(23, C_C "%s %d/3  " C_Y "%s" C_C "   %s", T("< PÁGINA", "< PAGE  ", "< СТР.  "), page + 1, T("MENÚ", "MENU", "МЕНЮ"),
+	    T("MARCA >", "MARK >", "МЕТКА >"));
 }
 
 static void draw_page0(void)
 {
 	char b[64];
 	int speed = s.target ? s.fps10 * 10 / s.target : 0, worst = 0;
-	row(0, C_C "SparStation  rendimiento");
-	row(1, C_D "%.30s", game_name);
+	row(0, C_C "SparStation  %s", T("rendimiento", "performance", "скорость"));
+	row(1, C_D "%s", game_name);
 	row(2, "");
 	row(3, "FPS PS1  %s%3d.%d" C_W " / %d   %s%d%%", speed_color(speed), s.fps10 / 10, s.fps10 % 10, s.target,
 	    speed_color(speed), speed);
 	if (s.st.disp_flips && s.drawn10 < s.game10)   // con salto de imágenes: las que se ven
-		row(4, "FPS juego %3d.%d" C_D "  vistas %d.%d", s.game10 / 10, s.game10 % 10, s.drawn10 / 10, s.drawn10 % 10);
-	else if (s.st.disp_flips) row(4, "FPS juego %3d.%d" C_D "  (todas vistas)", s.game10 / 10, s.game10 % 10);
-	else row(4, "FPS juego   --" C_D "  (buffer fijo)");
-	row(5, "frame peor %lums  mejor %lums", s.worst_ms, s.best_ms);
+		row(4, "%s %3d.%d" C_D "  %s %d.%d", T("FPS juego", "game FPS ", "FPS игры"), s.game10 / 10, s.game10 % 10,
+		    T("vistas", "shown", "видно"), s.drawn10 / 10, s.drawn10 % 10);
+	else if (s.st.disp_flips) row(4, "%s %3d.%d" C_D "  %s", T("FPS juego", "game FPS ", "FPS игры"), s.game10 / 10, s.game10 % 10,
+	                              T("(todas vistas)", "(all shown)", "(все видно)"));
+	else row(4, "%s   --" C_D "  %s", T("FPS juego", "game FPS ", "FPS игры"), T("(buffer fijo)", "(fixed buffer)", "(один буфер)"));
+	row(5, T("imagen peor %lums  mejor %lums", "worst frame %lums  best %lums", "кадр: худш. %lums лучш. %lums"), s.worst_ms, s.best_ms);
 	row(6, "");
-	row(7, C_C "Tiempo de la DS:");
+	row(7, C_C "%s", T("Tiempo de la DS:", "DS time:", "Время DS:"));
 	for (int i = 0; i < T_N; i++) {
+		const char *nm = t_name(i);
 		bar(b, s.pct[i]);
-		row(8 + i, "%-9s%s" C_W " %3d%%", t_name[i], b, s.pct[i]);
+		row(8 + i, "%s%*s%s" C_W " %3d%%", nm, 9 - u8len(nm), "", b, s.pct[i]);
 		if (s.pct[i] > s.pct[worst]) worst = i;
 	}
-	row(15, "CPU PS1 emulada: %lu%%", 25600ul / psx_cpu_scale);
-	row(16, "Freno principal: " C_Y "%s", t_name[worst]);
-	row(18, C_D "%.31s", settings_str);
+	row(15, "%s: %lu%%", T("CPU PS1 emulada", "emulated PS1 CPU", "эмул. ЦП PS1"), 25600ul / psx_cpu_scale);
+	row(16, "%s: " C_Y "%s", T("Freno principal", "Main bottleneck", "Тормозит"), t_name(worst));
+	row(18, C_D "%s", settings_str);
 	row(17, C_D "%dx%d%s%s %s", gpu_disp.width, gpu_disp.height, gpu_disp.color24 ? " 24bit" : " 15bit",
-	    gpu_disp.interlace ? " entrel." : "", gpu_disp.pal ? "PAL" : "NTSC");
+	    gpu_disp.interlace ? T(" entrel.", " interl.", " черезстр.") : "", gpu_disp.pal ? "PAL" : "NTSC");
 }
 
 static void draw_page1(void)
@@ -121,24 +155,32 @@ static void draw_page1(void)
 	struct mallinfo mi = mallinfo();
 	unsigned bat = getBatteryLevel();
 	dyn_cache_use(&used, &size);
-	row(0, C_C "SparStation  detalle (por seg.)");
-	row(1, C_Y "GPU" C_W "  pixeles %lu mil", s.st.gpu_pixels / 1000);
-	row(2, " comandos %lu  triang. %lu", s.st.gpu_cmds, s.st.gpu_tris);
-	row(3, " rect %lu  lineas %lu  rell. %lu", s.st.gpu_rects, s.st.gpu_lines, s.st.gpu_fills);
-	row(4, " VRAM %luKB copias %lu tex %lu", s.st.vram_upload * 2 / 1024, s.st.gpu_copies, s.st.tex_bands);
-	row(5, " pantalla %dx%d en (%d,%d)", gpu_disp.width, gpu_disp.height, gpu_disp.disp_x, gpu_disp.disp_y);
-	row(6, C_Y "CD" C_W " sectores %lu (%lu.%lux)", s.st.cd_sectors, s.st.cd_sectors / 75, s.st.cd_sectors * 10 / 75 % 10);
-	row(7, C_Y "MDEC" C_W " macrobloques %lu", s.st.mdec_blocks);
+	row(0, C_C "SparStation  %s", T("detalle (por seg.)", "details (per sec.)", "детали (в сек.)"));
+	row(1, C_Y "GPU" C_W "  %s %lu %s", T("píxeles", "pixels", "пикс."), s.st.gpu_pixels / 1000, T("mil", "k", "тыс."));
+	row(2, T(" comandos %lu  triáng. %lu", " commands %lu  tris %lu", " команд %lu  треуг. %lu"), s.st.gpu_cmds, s.st.gpu_tris);
+	row(3, T(" rect %lu  líneas %lu  rell. %lu", " rect %lu  lines %lu  fills %lu", " прям. %lu  лин. %lu  зал. %lu"),
+	    s.st.gpu_rects, s.st.gpu_lines, s.st.gpu_fills);
+	row(4, T(" VRAM %luKB copias %lu tex %lu", " VRAM %luKB copies %lu tex %lu", " VRAM %luKB коп. %lu текс. %lu"),
+	    s.st.vram_upload * 2 / 1024, s.st.gpu_copies, s.st.tex_bands);
+	row(5, T(" pantalla %dx%d en (%d,%d)", " screen %dx%d at (%d,%d)", " экран %dx%d в (%d,%d)"), gpu_disp.width, gpu_disp.height,
+	    gpu_disp.disp_x, gpu_disp.disp_y);
+	row(6, C_Y "CD" C_W " %s %lu (%lu.%lux)", T("sectores", "sectors", "секторов"), s.st.cd_sectors, s.st.cd_sectors / 75,
+	    s.st.cd_sectors * 10 / 75 % 10);
+	row(7, C_Y "MDEC" C_W " %s %lu", T("macrobloques", "macroblocks", "макроблоков"), s.st.mdec_blocks);
 	row(8, C_Y "DYNAREC");
-	row(9, " bloques nuevos %lu", s.st.dyn_compiled);
-	row(10, " instr. via interprete %lu", s.st.dyn_interp_ops);
-	row(11, " pasos interp. %lu  esperas %lu", s.st.dyn_interp_steps, s.st.dyn_idle);
-	row(12, " SMC %lu   vaciados %lu", s.st.dyn_smc, s.st.dyn_flushes);
-	row(13, " cache codigo %lu%% de %lu KB", size ? used * 100 / size : 0, size / 1024);
+	row(9, " %s %lu", T("bloques nuevos", "new blocks", "новых блоков"), s.st.dyn_compiled);
+	row(10, " %s %lu", T("instr. vía intérprete", "instr. via interpreter", "инстр. интерпрет."), s.st.dyn_interp_ops);
+	row(11, T(" pasos interp. %lu  esperas %lu", " interp. steps %lu  idle %lu", " шагов инт. %lu  ожид. %lu"),
+	    s.st.dyn_interp_steps, s.st.dyn_idle);
+	row(12, T(" SMC %lu   vaciados %lu", " SMC %lu   flushes %lu", " SMC %lu   сбросов %lu"), s.st.dyn_smc, s.st.dyn_flushes);
+	row(13, T(" caché código %lu%% de %lu KB", " code cache %lu%% of %lu KB", " кэш кода %lu%% из %lu KB"),
+	    size ? used * 100 / size : 0, size / 1024);
 	row(14, C_Y "DS");
-	row(15, " memoria usada %d.%d MB", mi.uordblks / (1024 * 1024), mi.uordblks % (1024 * 1024) * 10 / (1024 * 1024));
-	row(16, " bateria %u/15%s", PM_BATT_LEVEL(bat), (bat & PM_BATT_CHARGING) ? " (cargando)" : "");
-	row(17, " escribir log %lums", s.log_ms);
+	row(15, T(" memoria usada %d.%d MB", " memory used %d.%d MB", " занято памяти %d.%d MB"), mi.uordblks / (1024 * 1024),
+	    mi.uordblks % (1024 * 1024) * 10 / (1024 * 1024));
+	row(16, " %s %u/15%s", T("batería", "battery", "батарея"), PM_BATT_LEVEL(bat),
+	    (bat & PM_BATT_CHARGING) ? T(" (cargando)", " (charging)", " (зарядка)") : "");
+	row(17, " %s %lums", T("escribir log", "log write", "запись лога"), s.log_ms);
 	row(18, C_D " pc=%08lx", cpu.pc);
 }
 
@@ -149,14 +191,14 @@ static void draw_page2(void)
 	for (int i = 0; i < HIST; i++) if (hist[i] > top) top = hist[i];
 	top = (top + 4) / 5 * 5;
 	clock_str(t, seconds);
-	row(0, C_C "SparStation  sesion");
-	row(1, "tiempo %s   frames %lu", t, total_frames);
+	row(0, C_C "SparStation  %s", T("sesión", "session", "сеанс"));
+	row(1, T("tiempo %s   imágenes %lu", "time %s   frames %lu", "время %s   кадров %lu"), t, total_frames);
 	if (fps_n)
-		row(2, "media %lu.%lu  min %d.%d  max %d.%d", fps_sum10 / fps_n / 10, fps_sum10 / fps_n % 10,
+		row(2, T("media %lu.%lu  mín %d.%d  máx %d.%d", "avg %lu.%lu  min %d.%d  max %d.%d", "сред. %lu.%lu мин %d.%d макс %d.%d"), fps_sum10 / fps_n / 10, fps_sum10 / fps_n % 10,
 		    fps_min10 / 10, fps_min10 % 10, fps_max10 / 10, fps_max10 % 10);
 	else row(2, "");
-	row(3, "marcas %lu", marks);
-	row(4, C_Y "FPS ultimos %d s (arriba = %d)", HIST, top);
+	row(3, "%s %lu", T("marcas", "marks", "меток"), marks);
+	row(4, C_Y "%s %d s (%s = %d)", T("FPS últimos", "FPS last", "FPS за"), HIST, T("arriba", "top", "верх"), top);
 	for (int r = 0; r < 8; r++) {
 		char line[HIST + 1];
 		int level = top * (8 - r) / 8;   // la fila se llena si el valor llega a su altura
@@ -164,18 +206,21 @@ static void draw_page2(void)
 		line[HIST] = 0;
 		row(5 + r, C_G "%s", line);
 	}
-	row(13, C_D "-%ds%*s", HIST, HIST - 3, "ahora");
+	{
+		const char *now = T("ahora", "now", "сейчас");
+		row(13, C_D "-%ds%*s%s", HIST, HIST - 3 - u8len(now), "", now);
+	}
 	row(14, "");
 	if (logf) {
-		row(15, "log: " C_G "%lu lineas" C_W " en la SD", log_lines);
+		row(15, "log: " C_G "%lu %s" C_W " %s", log_lines, T("líneas", "lines", "строк"), T("en la SD", "on the SD", "на SD"));
 		row(16, C_D "sd:/ps1/sparstation_log.txt");
 	} else {
-		row(15, "log: " C_R "sin SD" C_W " (modo DS)");
+		row(15, "log: " C_R "%s" C_W " %s", T("sin SD", "no SD", "нет SD"), T("(modo DS)", "(DS mode)", "(режим DS)"));
 		row(16, "");
 	}
-	row(17, C_D "A=O B=X X=Tri Y=Cuad L/R=L1/R1");
+	row(17, C_D "%s", T("A=O B=X X=Tri Y=Cuad L/R=L1/R1", "A=O B=X X=Tri Y=Sqr L/R=L1/R1", "A=O B=X X=Тр. Y=Кв. L/R=L1/R1"));
 	row(18, C_D "SELECT+L/R = L2/R2");
-	row(19, C_D "MARCA apunta el momento en log");
+	row(19, C_D "%s", T("MARCA apunta el momento en log", "MARK notes the moment in the log", "МЕТКА отмечает момент в логе"));
 }
 
 static void draw(void)
@@ -190,7 +235,7 @@ static void draw(void)
 	if (mark_shown) {
 		char t[16];
 		clock_str(t, seconds);
-		row(20, C_Y "MARCA %lu guardada (%s)", marks, t);
+		row(20, C_Y "%s %lu %s (%s)", T("MARCA", "MARK", "МЕТКА"), marks, T("guardada", "saved", "записана"), t);
 	}
 	draw_buttons();
 	fflush(stdout);   // la consola guarda el texto hasta un salto de línea: sin esto se ve a trozos
@@ -200,14 +245,16 @@ void hud_start(const char *game, int use_log, const char *settings)
 {
 	snprintf(game_name, sizeof game_name, "%s", game);
 	snprintf(settings_str, sizeof settings_str, "%s", settings);
+	u8cut(game_name, 30);
+	u8cut(settings_str, 31);
 	consoleClear();
-	row(0, C_C "SparStation  medidor");
-	row(1, C_D "%.30s", game_name);
-	row(3, "Midiendo el primer segundo...");
-	row(5, C_D "A=O B=X X=Tri Y=Cuad L/R=L1/R1");
+	row(0, C_C "SparStation  %s", T("medidor", "meter", "измеритель"));
+	row(1, C_D "%s", game_name);
+	row(3, "%s", T("Midiendo el primer segundo...", "Measuring the first second...", "Замер первой секунды..."));
+	row(5, C_D "%s", T("A=O B=X X=Tri Y=Cuad L/R=L1/R1", "A=O B=X X=Tri Y=Sqr L/R=L1/R1", "A=O B=X X=Тр. Y=Кв. L/R=L1/R1"));
 	row(6, C_D "SELECT+L/R = L2/R2");
-	row(8, C_D "Toca abajo: izquierda = pagina,");
-	row(9, C_D "derecha = MARCA en el log.");
+	row(8, C_D "%s", T("Toca abajo: izquierda = página,", "Touch: left = page,", "Касание: слева = страница,"));
+	row(9, C_D "%s", T("derecha = MARCA en el log.", "right = MARK in the log.", "справа = МЕТКА в логе."));
 	draw_buttons();
 	fflush(stdout);
 	if (!use_log) return;

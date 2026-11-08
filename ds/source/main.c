@@ -5,12 +5,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <dirent.h>
 #include <sys/stat.h>
 #include "psx.h"
 #include "hud.h"
 #include "gx.h"
 #include "snd.h"
+#include "lang.h"
 #ifndef PSX_SELFTEST
 #include "pdsx.h"   // intro y menús con el aspecto de la BIOS de la PS1 (PDSX de RocketRobz)
 #endif
@@ -230,7 +232,16 @@ static int opt_snd = 1;                      // sonido (voces de la SPU y audio 
 static int opt_nwram = 1;                    // código traducido en la NWRAM de la DSi (si la hay, ver nwram_init)
 static int opt_video = 1;                    // vídeos: 1 = rápidos (MDEC a un cuarto de resolución), 0 = nítidos
 static int cfg_version;                      // versión que escribió el .cfg (ver load_cfg)
-static const char *const quality_name[4] = { "normal", "rapida", "muy rapida", "baja res" };
+static int opt_intro = 1;                    // logo de SCE al encender (1) o directo al menú (0); de la consola, no del juego
+static const char *quality_name(int q)
+{
+	switch (q) {
+	case 1: return T("rápida", "fast", "быстрое");
+	case 2: return T("muy rápida", "very fast", "оч. быстрое");
+	case 3: return T("baja res.", "low res", "низкое разр.");
+	}
+	return T("normal", "normal", "обычное");
+}
 static const int cpu_pct[6] = { 0, 100, 85, 70, 50, 35 };
 #define CPU_OPTS 6
 // CPU automática: la PS1 corre con los ciclos justos para que el juego vaya a la velocidad real. Los juegos que
@@ -289,6 +300,52 @@ static int cfg_read(const char *path)
 
 static void load_cfg(void) { cfg_read(CFG_PATH); }
 
+// Ajustes recomendados (START en la lista): por juego, lo que mejor fue en las pruebas (melonDS y la DSi). Con el 3D
+// saltar imágenes hace parpadear cosas (v44), así que siempre 0; la CPU automática deja ir a su velocidad a los que
+// miden el tiempo en vblanks. El nombre se busca dentro del del .cue, sin mayúsculas.
+typedef struct { const char *name; s8 quality, skip, cpu_opt, hw, snd, video, cpu_min, target; } Recommended;
+static const Recommended recommended[] = {
+	{ "silent hill",    2, 0, 0, 1, 1, 1, 20, 92 },   // 3D lleno de niebla: con el 3D de la DS y la CPU automática ~24 img/s
+	{ "tomb raider",    2, 0, 0, 1, 1, 1, 20, 92 },   // mide en vblanks: tope 20% = 95% de velocidad (v29)
+	{ "klonoa",         2, 0, 0, 1, 1, 1, 20, 92 },   // vídeos rápidos: 2,96 -> 3,73 img/s
+	{ "crash",          2, 0, 0, 1, 1, 1, 20, 92 },
+	{ "resident evil",  2, 0, 0, 1, 1, 1, 20, 92 },   // RE3: el MDEC pesa (12%), vídeos rápidos
+	{ "metal gear",     2, 0, 0, 1, 1, 1, 20, 92 },
+	{ "pepsiman",       2, 0, 0, 1, 1, 1, 20, 92 },   // cuenta vblanks: la CPU automática va bien
+	{ "castlevania",    2, 0, 1, 1, 1, 1, 20, 92 },   // 2D, va casi a velocidad completa: CPU al 100% (sin tirones de la automática)
+	{ "dino crisis",    2, 0, 0, 1, 1, 1, 20, 92 },
+	{ "gran turismo",   2, 0, 0, 1, 1, 1, 20, 92 },
+	{ NULL,             2, 0, 0, 1, 1, 1, CPU_MIN_DEFAULT, AUTO_TARGET },   // los demás
+};
+
+// 1 = el juego está en la tabla (si no, se ponen los generales)
+static int apply_recommended(const char *game)
+{
+	char low[128];
+	const Recommended *r = recommended;
+	int i;
+	for (i = 0; game[i] && i < (int)sizeof low - 1; i++) low[i] = (char)(game[i] >= 'A' && game[i] <= 'Z' ? game[i] + 32 : game[i]);
+	low[i] = 0;
+	while (r->name && !strstr(low, r->name)) r++;
+	opt_quality = r->quality; opt_skip = r->skip; opt_cpu = r->cpu_opt; opt_hw = r->hw; opt_snd = r->snd; opt_video = r->video;
+	opt_cpu_min = r->cpu_min; opt_target = r->target;
+	return r->name != NULL;
+}
+
+// Lo que es de la consola y no de cada juego (idioma, intro): solo del archivo general
+static void sys_cfg_load(void)
+{
+	char buf[512], *p;
+	FILE *f = fopen(CFG_PATH, "r");
+	size_t n;
+	if (!f) return;
+	n = fread(buf, 1, sizeof buf - 1, f);
+	fclose(f);
+	buf[n] = 0;
+	if ((p = strstr(buf, "idioma=")) && p[7] >= '0' && p[7] < '0' + LANG_N) lang = p[7] - '0';
+	if ((p = strstr(buf, "intro="))) opt_intro = p[6] != '0';
+}
+
 // Ajustes propios de un juego, junto a él y con su nombre (Silent Hill.cue -> Silent Hill.cfg)
 static void game_cfg_path(char *buf, size_t n, const char *name)
 {
@@ -300,8 +357,8 @@ static void cfg_write(const char *path)
 {
 	FILE *f = fopen(path, "w");
 	if (!f) return;
-	fprintf(f, "calidad=%d saltar=%d cpu=%d\ngpu3d=%d\nsonido=%d\nnwram=%d\nversion=44\ncpu_min=%d\nobjetivo=%d\nvideos=%d\n", opt_quality, opt_skip,
-	        opt_cpu, opt_hw, opt_snd, opt_nwram, opt_cpu_min, opt_target, opt_video);
+	fprintf(f, "calidad=%d saltar=%d cpu=%d\ngpu3d=%d\nsonido=%d\nnwram=%d\nversion=45\ncpu_min=%d\nobjetivo=%d\nvideos=%d\nidioma=%d\nintro=%d\n", opt_quality, opt_skip,
+	        opt_cpu, opt_hw, opt_snd, opt_nwram, opt_cpu_min, opt_target, opt_video, lang, opt_intro);
 	fclose(f);
 }
 
@@ -477,7 +534,51 @@ static void menu_info(int cursor)
 	(void)cursor;
 	consoleClear();
 }
+
+// «Memory Card» del menú principal: los ajustes de la consola (no de cada juego). Se guardan en sparstation.cfg.
+static void system_menu(void)
+{
+	int sel = 0, n = nwram_ok ? 4 : 3;
+	keysSetRepeat(20, 6);
+	for (;;) {
+		static char l[4][64];
+		const char *lines[4] = { l[0], l[1], l[2], l[3] };
+		u32 k;
+		snprintf(l[0], 64, "%s: < %s >", T("Idioma", "Language", "Язык"), lang_name(lang));
+		snprintf(l[1], 64, "%s: %s", T("Logo al encender", "Startup logo", "Логотип при старте"), opt_intro ? T("sí", "on", "да") : T("no", "off", "нет"));
+		if (nwram_ok)
+			snprintf(l[2], 64, "%s: %s", T("Código", "Code", "Код"), opt_nwram ? T("NWRAM (rápido)", "NWRAM (fast)", "NWRAM (быстро)")
+			                                                                   : T("RAM principal", "main RAM", "основная RAM"));
+		snprintf(l[n - 1], 64, "%s", T("Volver", "Back", "Назад"));
+		pdsx_options_frame(T("Ajustes", "Settings", "Настройки"), lines, n, sel,
+		                   T("A/◀/▶: cambiar   B: volver", "A/◀/▶: change   B: back", "A/◀/▶: изменить  B: назад"));
+		k = keysDown() | (keysDownRepeat() & (KEY_UP | KEY_DOWN));
+		if (k & KEY_UP) sel = (sel + n - 1) % n;
+		if (k & KEY_DOWN) sel = (sel + 1) % n;
+		if ((k & KEY_B) || ((k & KEY_A) && sel == n - 1)) break;
+		if (k & (KEY_A | KEY_LEFT | KEY_RIGHT)) {
+			int back = (k & KEY_LEFT) != 0;
+			if (sel == 0) lang = (lang + (back ? LANG_N - 1 : 1)) % LANG_N;
+			else if (sel == 1) opt_intro ^= 1;
+			else if (sel == 2 && nwram_ok) opt_nwram ^= 1;
+			save_cfg();
+		}
+	}
+}
 #endif
+
+// Orden de la lista: sin mayúsculas y sin etiquetas delante como «(PS1) » (Silent Hill va con la S)
+static const char *sort_key(const char *s)
+{
+	while (*s == '(' || *s == '[') {
+		const char *e = strchr(s, *s == '(' ? ')' : ']');
+		if (!e) break;
+		s = e + 1;
+		while (*s == ' ') s++;
+	}
+	return s;
+}
+static int name_cmp(const void *a, const void *b) { return strcasecmp(sort_key(a), sort_key(b)); }
 
 static int pick_game(char *out, size_t outlen)
 {
@@ -517,6 +618,7 @@ static int pick_game(char *out, size_t outlen)
 	}
 	closedir(d);
 	if (!n) return 0;
+	qsort(names, (size_t)n, sizeof names[0], name_cmp);   // por orden alfabético (la FAT los da como se copiaron)
 	// Cada juego recuerda sus ajustes (su .cfg al lado): al marcarlo se cargan; si no tiene, los generales.
 	// Cambiar algo con un juego marcado lo apunta para ese juego.
 	int gq = opt_quality, gs = opt_skip, gc = opt_cpu, ghw = opt_hw, gsnd = opt_snd, gnw = opt_nwram, gmin = opt_cpu_min, gtg = opt_target, gvid = opt_video, cur = -1, own = 0;
@@ -525,11 +627,12 @@ static int pick_game(char *out, size_t outlen)
 	keysSetRepeat(20, 6);
 	consoleClear();   // la pantalla de abajo, en negro: solo se usa dentro de los juegos
 	pdsx_start();
-	pdsx_intro(menu_info);   // logo de SCE y menú principal (PDSX): «CD Player» lleva a la lista
-	int redraw = 0, shown = 0;   // los ajustes solo aparecen abajo mientras se cambian (y se van solos)
+	pdsx_intro(menu_info, system_menu, opt_intro);   // logo de SCE y menú principal (PDSX): «CD Player» lleva a la lista
+	gnw = opt_nwram;   // el código (NWRAM) es de la consola: se cambia en «Memory Card»
+	int redraw = 0, shown = 0, rec_shown = 0;   // los ajustes solo aparecen abajo mientras se cambian (y se van solos)
 	u32 hide_at = 0, fr = 0;
 #else
-	int redraw = 1, shown = 1;
+	int redraw = 1, shown = 1, rec_shown = 0;
 	u32 hide_at = 0, fr = 0;
 #endif
 	for (;;) {
@@ -540,6 +643,7 @@ static int pick_game(char *out, size_t outlen)
 			opt_quality = gq; opt_skip = gs; opt_cpu = gc; opt_hw = ghw; opt_snd = gsnd; opt_nwram = gnw; opt_cpu_min = gmin; opt_target = gtg; opt_video = gvid;
 			game_cfg_path(gpath, sizeof gpath, names[sel]);
 			own = cfg_read(gpath);
+			opt_nwram = gnw;
 			if (shown) redraw = 1;
 		}
 #ifndef PSX_SELFTEST
@@ -548,15 +652,20 @@ static int pick_game(char *out, size_t outlen)
 		if (redraw) {   // abajo: los ajustes del juego marcado (la lista va arriba, en el «CD Player»)
 			redraw = 0;
 			consoleClear();
-			printf("\x1b[36;1mAjustes %s\x1b[37;1m\n%.64s\n\n", own ? "de este juego" : "generales", names[sel]);
-			printf("L/R    calidad: %s (GPU sw)\n", quality_name[opt_quality]);
-			printf("SELECT saltar frames: %d\n", opt_skip);
-			printf("Y      CPU PS1: %s\n", cpu_name());
-			printf("X      GPU: %s\n", opt_hw ? "3D de la DS (rapida)" : "software (exacta)");
-			printf("B      sonido: %s\n", opt_snd ? "si" : "no");
-			printf("START  codigo: %s\n", !nwram_ok ? "RAM (sin NWRAM)" : opt_nwram ? "NWRAM (rapido)" : "RAM principal");
-			printf("</>    videos: %s\n", opt_video ? "rapidos" : "nitidos");
-			printf("\x1b[36;1mA: jugar   arriba/abajo: elegir\x1b[37;1m");
+			printf("\x1b[36;1m%s\x1b[37;1m\n%.64s\n\n", own ? T("Ajustes de este juego", "Settings for this game", "Настройки этой игры")
+			                                            : T("Ajustes generales", "General settings", "Общие настройки"), names[sel]);
+			printf("L/R    %s: %s %s\n", T("calidad", "quality", "качество"), quality_name(opt_quality), T("(GPU sw)", "(sw GPU)", "(прогр.)"));
+			printf("SELECT %s: %d\n", T("saltar imágenes", "frameskip", "пропуск кадров"), opt_skip);
+			printf("Y      %s: %s\n", T("CPU PS1", "PS1 CPU", "ЦП PS1"), cpu_name());
+			printf("X      GPU: %s\n", opt_hw ? T("3D de la DS (rápida)", "DS 3D (fast)", "3D DS (быстро)")
+			                               : T("software (exacta)", "software (accurate)", "програм. (точно)"));
+			printf("B      %s: %s\n", T("sonido", "sound", "звук"), opt_snd ? T("sí", "on", "вкл") : T("no", "off", "выкл"));
+			printf("</>    %s: %s\n", T("vídeos", "videos", "видео"), opt_video ? T("rápidos", "fast", "быстрые") : T("nítidos", "sharp", "чёткие"));
+			printf("START  %s\n", T("ajustes recomendados", "recommended settings", "рекомендуемые"));
+			if (rec_shown == 1) printf("\x1b[32;1m%s\x1b[37;1m\n", T("Puestos los recomendados\npara este juego.", "Recommended settings for\nthis game applied.", "Применены настройки,\nлучшие для этой игры."));
+			else if (rec_shown == 2) printf("\x1b[33;1m%s\x1b[37;1m\n", T("Juego sin probar: puestos\nlos recomendados generales.", "Untested game: general\nrecommended settings applied.", "Игра не проверена: общие\nрекомендуемые настройки."));
+			else printf("\n");
+			printf("\x1b[36;1m%s\x1b[37;1m", T("A: jugar   arriba/abajo: elegir", "A: play   up/down: choose", "A: играть  вверх/вниз: выбор"));
 			fflush(stdout);
 		}
 #ifndef PSX_SELFTEST
@@ -573,7 +682,8 @@ static int pick_game(char *out, size_t outlen)
 		if (keys & KEY_Y) opt_cpu = (opt_cpu + 1) % CPU_OPTS;
 		if (keys & KEY_X) opt_hw ^= 1;
 		if (keys & KEY_B) opt_snd ^= 1;
-		if ((keys & KEY_START) && nwram_ok) opt_nwram ^= 1;
+		rec_shown = 0;
+		if (keys & KEY_START) rec_shown = apply_recommended(names[sel]) ? 1 : 2;
 		if (keys & (KEY_LEFT | KEY_RIGHT)) opt_video ^= 1;
 		if (keys & (KEY_R | KEY_L | KEY_SELECT | KEY_Y | KEY_X | KEY_B | KEY_START | KEY_LEFT | KEY_RIGHT)) {
 			cfg_write(gpath);
@@ -908,7 +1018,8 @@ static __attribute__((noinline)) u32 mb_sum(const u32 *p, int reps)
 	return s;
 }
 
-static __attribute__((noinline, section(".itcm"))) u32 mb_sum_itcm(const u32 *p, int reps)
+static __attribute__((noinline)) u32 mb_sum_itcm   // ya no cabe en la ITCM (v45)
+(const u32 *p, int reps)
 {
 	u32 s = 0;
 	for (int r = 0; r < reps; r++)
@@ -952,13 +1063,15 @@ static void pause_menu(void)
 	for (;;) {
 		int k;
 		consoleClear();
-		printf("\x1b[36;1mSparStation - PAUSA\x1b[37;1m\n\n");
-		printf("A      seguir jugando\n\n");
-		printf("X      guardar estado\n\n");
-		printf("Y      cargar estado%s\n\n", has_state ? "" : " (no hay)");
-		printf("SELECT saltar frames: %d\n", opt_skip);
-		printf("R      CPU PS1: %s\n\n", cpu_name());
-		printf("\x1b[37mEl estado guarda el momento\nexacto (en la SD, junto al\njuego). Las partidas del juego\nvan a la tarjeta de memoria\n(.mcr), que se guarda sola.\x1b[37;1m\n");
+		printf("\x1b[36;1mSparStation - %s\x1b[37;1m\n\n", T("PAUSA", "PAUSED", "ПАУЗА"));
+		printf("A      %s\n\n", T("seguir jugando", "resume", "продолжить"));
+		printf("X      %s\n\n", T("guardar estado", "save state", "сохранить состояние"));
+		printf("Y      %s%s\n\n", T("cargar estado", "load state", "загрузить состояние"), has_state ? "" : T(" (no hay)", " (none)", " (нет)"));
+		printf("SELECT %s: %d\n", T("saltar imágenes", "frameskip", "пропуск кадров"), opt_skip);
+		printf("R      %s: %s\n\n", T("CPU PS1", "PS1 CPU", "ЦП PS1"), cpu_name());
+		printf("\x1b[37m%s\x1b[37;1m\n", T("El estado guarda el momento\nexacto (en la SD, junto al\njuego). Las partidas del juego\nvan a la tarjeta de memoria\n(.mcr), que se guarda sola.",
+		                                     "A state saves the exact moment\n(on the SD, next to the game).\nIn-game saves go to the memory\ncard (.mcr), saved by itself.",
+		                                     "Состояние хранит точный\nмомент (на SD, рядом с игрой).\nСохранения самой игры идут\nна карту памяти (.mcr),\nона пишется сама."));
 		fflush(stdout);
 		do { swiWaitForVBlank(); scanKeys(); k = keysDown(); } while (!k);
 		if (k & (KEY_A | KEY_B | KEY_START)) break;
@@ -972,13 +1085,13 @@ static void pause_menu(void)
 		if (k & KEY_X) {
 			FILE *f = fopen(state_path, "wb");
 			int ok;
-			printf("\x1b[20;0HGuardando...");
+			printf("\x1b[20;0H%s", T("Guardando...", "Saving...", "Сохранение..."));
 			fflush(stdout);
 			if (f) setvbuf(f, NULL, _IOFBF, 64 * 1024);
 			ok = f && psx_state_save(state_write, f);
 			if (f && fclose(f)) ok = 0;
 			if (ok) has_state = 1;
-			printf("\x1b[20;0H%s", ok ? "Estado guardado.   " : "ERROR al guardar.  ");
+			printf("\x1b[20;0H%-30s", ok ? T("Estado guardado.", "State saved.", "Состояние сохранено.") : T("ERROR al guardar.", "ERROR while saving.", "ОШИБКА сохранения."));
 			fflush(stdout);
 			for (int i = 0; i < 60; i++) swiWaitForVBlank();
 			if (ok) break;
@@ -986,14 +1099,14 @@ static void pause_menu(void)
 		if ((k & KEY_Y) && has_state) {
 			FILE *f = fopen(state_path, "rb");
 			int ok;
-			printf("\x1b[20;0HCargando...");
+			printf("\x1b[20;0H%s", T("Cargando...", "Loading...", "Загрузка..."));
 			fflush(stdout);
 			if (f) setvbuf(f, NULL, _IOFBF, 64 * 1024);
 			ok = f && psx_state_load(state_read, f);
 			if (f) fclose(f);
 			if (!ok) {   // a medias: la máquina queda inconsistente, mejor empezar de cero
 				psx_reset();
-				printf("\x1b[20;0HERROR: estado no valido.\nSe reinicia el juego.");
+				printf("\x1b[20;0H%s", T("ERROR: estado no válido.\nSe reinicia el juego.", "ERROR: invalid state.\nRestarting the game.", "ОШИБКА: плохое состояние.\nИгра перезапускается."));
 				fflush(stdout);
 				for (int i = 0; i < 120; i++) swiWaitForVBlank();
 			}
@@ -1018,9 +1131,9 @@ static void run_loop(const char *title, int use_log)
 	if (title) {
 		char info[96], nw[24];
 		if (nwram_ok) snprintf(nw, sizeof nw, "%s", opt_nwram ? "NWRAM" : "RAM");
-		else snprintf(nw, sizeof nw, "RAM (sin NWRAM: %s)", nwram_why[0] ? nwram_why : "?");
-		snprintf(info, sizeof info, "%s, salto %d, CPU %s, codigo %s%s", quality_name[opt_quality], opt_skip, cpu_name(), nw,
-		         cheat_count() ? ", parches" : "");
+		else snprintf(nw, sizeof nw, "RAM (%s NWRAM: %s)", T("sin", "no", "нет"), nwram_why[0] ? nwram_why : "?");
+		snprintf(info, sizeof info, "%s, %s %d, CPU %s, %s %s%s", quality_name(opt_quality), T("salto", "skip", "пропуск"), opt_skip,
+		         cpu_name(), T("código", "code", "код"), nw, cheat_count() ? T(", parches", ", cheats", ", читы") : "");
 #ifndef GX_DUAL
 		hud_start(title, use_log, info);
 #else
@@ -1111,12 +1224,13 @@ int main(void)
 	// consola de abajo en el banco H (32 KB): el C queda libre para texturas del 3D (gx.c)
 	vramSetBankH(VRAM_H_SUB_BG);
 	consoleInit(NULL, 0, BgType_Text4bpp, BgSize_T_256x256, 15, 0, false, true);
+	lang_console_init();   // fuente con tildes y cirílico; los printf en UTF-8
 	bg = bgInit(3, BgType_Bmp16, BgSize_B16_256x256, 0, 0);
 	fb[0] = bgGetGfxPtr(bg);
 	fb[1] = fb[0] + 256 * 256;   // banco B, base de mapa 8
 	dmaFillHalfWords(0x8000, fb[0], 2 * 256 * 256 * 2);
 
-	printf("SparStation v44 - PS1 en DSi\nby Spar Retro\n\n");
+	printf("SparStation v45 - PS1 en DSi\nby Spar Retro\n\n");
 #ifdef PDSX_DEMO
 	{   // make DEMO=1: solo la intro y los menús, con nombres de ejemplo (para verlos en melonDS, que no tiene SD)
 		static char demo[6][128] = { "Crash Bandicoot.cue", "Klonoa - Door to Phantomile (USA).cue",
@@ -1126,7 +1240,7 @@ int main(void)
 		soundInit(); soundPowerOn(); soundSetMixerVolume(127);
 		keysSetRepeat(20, 6);
 		pdsx_start();
-		pdsx_intro(menu_info);
+		pdsx_intro(menu_info, system_menu, opt_intro);
 		for (;;) {
 			u32 k;
 			pdsx_list_frame((const char (*)[128])demo, 6, sel);
@@ -1230,17 +1344,18 @@ int main(void)
 	}
 	setCpuClock(true);
 	if (!fatInitDefault()) {
-		printf("No puedo leer la tarjeta SD.\n");
+		printf("No puedo leer la tarjeta SD.\nCan't read the SD card.\nНе читается карта SD.\n");
 		for (;;) swiWaitForVBlank();
 	}
+	sys_cfg_load();
 	nwram_ok = nwram_init();
 	if (!pick_game(game, sizeof game)) {
-		printf("No hay juegos en %s\n(.cue + .bin)\n", GAMES_DIR);
+		printf(T("No hay juegos en %s\n(.cue + .bin)\n", "No games in %s\n(.cue + .bin)\n", "Нет игр в %s\n(.cue + .bin)\n"), GAMES_DIR);
 		for (;;) swiWaitForVBlank();
 	}
 	if (nwram_ok && opt_nwram) dyn_hot_area((void *)NWRAM_BASE, NWRAM_SIZE);   // aún no se ha traducido nada
 	if (!open_disc(game)) {
-		printf("No puedo abrir\n%s\n", game);
+		printf("%s\n%s\n", T("No puedo abrir", "Can't open", "Не открывается"), game);
 		for (;;) swiWaitForVBlank();
 	}
 	card_open(game);

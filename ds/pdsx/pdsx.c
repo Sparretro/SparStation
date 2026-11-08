@@ -12,6 +12,7 @@
 #include <string.h>
 #include <strings.h>
 #include "pdsx.h"
+#include "lang.h"
 
 #include "logo_sce.h"
 #include "logo_scetm.h"
@@ -28,7 +29,7 @@
 #include "pdsx_bgblue_bin.h"
 
 static glImage sce_img[4], scetm_img[1], ps_img[1], playstation_img[2], scea_img[1];
-static glImage balls_img[2], mainmenu_img[1], button_img[1], memcd_img[4], cursor_img[1], font_img[128];
+static glImage balls_img[2], mainmenu_img[1], button_img[1], memcd_img[4], cursor_img[1], font_img[256];
 static u16 *blue_bg[2];   // fondo del menú: dos tramados que se alternan en cada imagen (como en PDSX)
 static int frame_no, bg_mode;   // bg_mode: 0 = negro, 1 = azul
 static u16 *bg_vram;
@@ -66,43 +67,35 @@ static void load_textures(void)
 	              GL_TEXTURE_WRAP_S | GL_TEXTURE_WRAP_T | TEXGEN_OFF | GL_TEXTURE_COLOR0_TRANSPARENT, 16, (u16 *)text_memandcdPal, (u8 *)text_memandcdBitmap);
 	glLoadTileSet(cursor_img, 16, 16, 16, 16, GL_RGB16, TEXTURE_SIZE_16, TEXTURE_SIZE_16,
 	              GL_TEXTURE_WRAP_S | GL_TEXTURE_WRAP_T | TEXGEN_OFF | GL_TEXTURE_COLOR0_TRANSPARENT, 16, (u16 *)cursor_psxPal, (u8 *)cursor_psxBitmap);
-	{   // fuente: la de la consola de libnds (8x8), en una textura de 128x64 con los caracteres 0-127
-		static u8 tex[128 * 64 / 2] __attribute__((aligned(4)));
+	{   // fuente: la de la consola (font.c: página 437 con tildes y el cirílico), en una textura de 128x128 con las 256
+		extern const u8 spar_font[2048];
+		static u8 tex[128 * 128 / 2] __attribute__((aligned(4)));
 		static const u16 pal[16] = { 0, 0x7fff, 0x7fff, 0x7fff, 0x7fff, 0x7fff, 0x7fff, 0x7fff,
 		                             0x7fff, 0x7fff, 0x7fff, 0x7fff, 0x7fff, 0x7fff, 0x7fff, 0x7fff };
-		const ConsoleFont *f = &consoleGetDefault()->font;
-		const u8 *g = (const u8 *)f->gfx;
 		memset(tex, 0, sizeof tex);
-		for (int c = 0; c < 128; c++) {
-			int k = c - f->asciiOffset;
-			if (!g || k < 0 || k >= f->numChars) continue;
+		for (int c = 0; c < 256; c++)
 			for (int y = 0; y < 8; y++)
-				for (int x = 0; x < 8; x++) {
-					int on;
-					if (f->bpp == 8) on = g[k * 64 + y * 8 + x] != 0;
-					else if (f->bpp == 1) on = (g[k * 8 + y] >> x) & 1;
-					else on = (g[k * 32 + y * 4 + x / 2] >> ((x & 1) * 4)) & 15;
-					if (on) {
+				for (int x = 0; x < 8; x++)
+					if ((spar_font[c * 8 + y] >> x) & 1) {
 						int tx = (c & 15) * 8 + x, ty = (c >> 4) * 8 + y, i = ty * 128 + tx;
 						tex[i >> 1] |= (u8)(1 << ((i & 1) * 4));
 					}
-				}
-		}
-		glLoadTileSet(font_img, 8, 8, 128, 64, GL_RGB16, TEXTURE_SIZE_128, TEXTURE_SIZE_64,
+		glLoadTileSet(font_img, 8, 8, 128, 128, GL_RGB16, TEXTURE_SIZE_128, TEXTURE_SIZE_128,
 		              GL_TEXTURE_WRAP_S | GL_TEXTURE_WRAP_T | TEXGEN_OFF | GL_TEXTURE_COLOR0_TRANSPARENT, 16, (u16 *)pal, tex);
 	}
 }
 
-// Texto con la fuente de 8x8 (escala en 1/4096), con sombra
-static void text(int x, int y, const char *s, int max, u16 color, int scale)
+// Texto UTF-8 con la fuente de 8x8 (escala en 1/4096), con sombra
+static void text(int x, int y, const char *s8, int max, u16 color, int scale)
 {
+	char s[128];
 	int step = (8 * scale) >> 12;
+	lang_to_font(s8, s, sizeof s);
 	for (int pass = 0; pass < 2; pass++) {
 		int cx = x + (pass ? 0 : 1), cy = y + (pass ? 0 : 1);
 		glColor(pass ? color : RGB15(2, 2, 6));
 		for (int i = 0; s[i] && i < max; i++, cx += step) {
 			unsigned char c = (unsigned char)s[i];
-			if (c >= 128) c = '?';
 			if (c == ' ') continue;
 			if (scale == 4096) glSprite(cx, cy, GL_FLIP_NONE, &font_img[c]);
 			else glSpriteScale(cx, cy, scale, GL_FLIP_NONE, &font_img[c]);
@@ -240,8 +233,8 @@ static void sce_splash(void)
 	}
 }
 
-// ---- menú principal (psxMenu de PDSX): 0 = Memory Card, 1 = CD Player ----
-static int main_menu(void (*info)(int))
+// ---- menú principal (psxMenu de PDSX): 0 = Memory Card (ajustes de la consola), 1 = CD Player ----
+static int main_menu(void (*info)(int), void (*system)(void))
 {
 	int cursor = 1, fading = 0, fadec = 255, shown = -1;
 	bg_mode = 1;
@@ -254,9 +247,10 @@ static int main_menu(void (*info)(int))
 				fadec = 255;
 				fading = 0;
 				if (cursor == 1) return 1;
+				if (system) { system(); bg_mode = 1; shown = -1; i = 0; }   // «Memory Card»: ajustes de la consola, y de vuelta
 			}
 		} else {
-			u32 k = keysDown();
+			u32 k = i < 12 ? 0 : keysDown();   // la A que saltó el logo de SCE no cuenta aquí (antes entraba sola al «CD Player»)
 			if ((k & KEY_UP) && cursor > 0) cursor--;
 			if ((k & KEY_DOWN) && cursor < 1) cursor++;
 			if (k & KEY_A) fading = 1;
@@ -285,10 +279,33 @@ static int main_menu(void (*info)(int))
 	}
 }
 
-void pdsx_intro(void (*info)(int))
+void pdsx_intro(void (*info)(int), void (*system)(void), int splash)
 {
-	sce_splash();
-	main_menu(info);
+	if (splash) sce_splash();
+	main_menu(info, system);
+}
+
+// ---- ajustes de la consola (desde «Memory Card»): título y una franja por opción, como la lista de juegos ----
+void pdsx_options_frame(const char *title, const char *const *lines, int n, int sel, const char *hint)
+{
+	enum { Y0 = 40, DY = 30 };
+	bg_mode = 1;
+	glBegin2D();
+	glSprite(39, 6, GL_FLIP_NONE, &balls_img[0]);
+	glSprite(150, 128, GL_FLIP_NONE, &balls_img[1]);
+	glSprite(8, 10, GL_FLIP_NONE, &memcd_img[0]);   // «Memory Card» de título
+	text(248 - 8 * 12, 14, title, 12, RGB15(20, 24, 31), 4096);
+	for (int i = 0; i < n; i++) {
+		int y = Y0 + i * DY;
+		glPolyFmt(POLY_ALPHA(i == sel ? 20 : 12) | POLY_CULL_NONE | POLY_ID(2 + i));
+		glBoxFilled(22, y + 2, 250, y + 25, i == sel ? RGB15(4, 6, 16) : RGB15(1, 2, 8));
+		glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1));
+		text(30, y + 10, lines[i], 27, i == sel ? RGB15(31, 31, 31) : RGB15(18, 20, 26), 4096);
+		if (i == sel) glSprite(2 + ((frame_no >> 3) & 1), y + 6, GL_FLIP_NONE, cursor_img);
+	}
+	if (hint) text(8, 180, hint, 31, RGB15(20, 24, 31), 4096);
+	glColor(RGB15(31, 31, 31));
+	frame_end();
 }
 
 // Nombre para enseñar: sin la extensión ni las etiquetas de región ([NTSC-U], (USA), (PS1)...), pero con el disco
@@ -336,8 +353,13 @@ void pdsx_list_frame(const char (*names)[128], int n, int sel)
 		int i = top + r, y = Y0 + r * DY, len;
 		char name[64];
 		clean_name(names[i], name, sizeof name);
-		len = (int)strlen(name);
-		if (len > MAXC) { name[MAXC - 2] = '.'; name[MAXC - 1] = '.'; name[MAXC] = 0; }
+		len = 0;   // en letras (UTF-8: tildes y cirílico son 2 bytes)
+		for (char *q = name; *q; q++)
+			if (((u8)*q & 0xc0) != 0x80 && ++len == MAXC - 1 && strlen(q) > 1) {
+				int more = 0;
+				for (char *t = q + 1; *t; t++) more += ((u8)*t & 0xc0) != 0x80;
+				if (more > 1) { strcpy(q, ".."); break; }
+			}
 		glPolyFmt(POLY_ALPHA(i == sel ? 20 : 12) | POLY_CULL_NONE | POLY_ID(2 + r));   // franja translúcida
 		glBoxFilled(22, y + 4, 250, y + 27, i == sel ? RGB15(4, 6, 16) : RGB15(1, 2, 8));
 		glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1));
